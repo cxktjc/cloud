@@ -68,7 +68,7 @@ def completed_positions_block(trades: Iterable[Mapping[str, Any]]) -> list[str]:
 
 
 class TerminalView:
-    def __init__(self, view_config: cfg.ViewConfig = cfg.ViewConfig()):
+    def __init__(self, view_config: cfg.ViewConfig = cfg.SignalViewConfig()):
         self.view = view_config
         self.last_content = ''
         self.last_render = float('-inf')

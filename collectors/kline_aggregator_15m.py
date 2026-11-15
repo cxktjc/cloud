@@ -2,16 +2,11 @@
 """
 Build klines_15m from local klines_3m.
 
-This version is scheduled by 15m candle boundaries:
-
-1. Check the latest 3m/15m synthesis status every --check-interval seconds.
-2. Compute the next 15m window from the latest fully-covered klines_15m
-   timestamp.
-3. When that window is due, wait until the latest closed 3m reaches the
-   window's final 3m candle.
-4. Then check per-symbol coverage; if incomplete, REST-repair missing 3m rows
-   immediately and retry.
-5. Once complete, aggregate that window and then wait for the next one.
+Startup backfill is scheduled newest-first within the retention window, so
+recent 3m warmup history is repaired before older history. Incomplete windows
+yield and retry later. Newly completed live windows take priority between
+attempts. OHLC aggregation retains chronological child order, and publication
+of the latest aggregate status never goes backwards during older backfill.
 """
 
 from __future__ import annotations
@@ -47,7 +42,7 @@ from .kline_startup_manager import (
     load_3m_columns,
     upsert_3m_rows,
 )
-from .kline_status import write_15m_status
+from .kline_status import read_15m_status, write_15m_status
 from v9711_live.environment import load_environment, MYSQL_DEFAULT_PASSWORD
 
 
@@ -979,6 +974,7 @@ def wait_for_coverage_and_aggregate(
     symbols: list[str],
     window_ms: int,
     should_stop,
+    max_attempts: int | None = None,
 ) -> bool:
     required_last_3m_ms = window_ms + (CANDLES_PER_15M - 1) * INTERVAL_3M_MS
     limiter = RequestLimiter(
@@ -986,7 +982,11 @@ def wait_for_coverage_and_aggregate(
         max_retries=args.rest_retries,
         retry_delay=args.retry_delay,
     )
+    attempts = 0
     while not should_stop():
+        if max_attempts is not None and attempts >= max_attempts:
+            return False
+        attempts += 1
         conn: Connection | None = None
         try:
             conn = connect_mysql(args)
@@ -1001,6 +1001,8 @@ def wait_for_coverage_and_aggregate(
                 )
                 close_quietly(conn)
                 conn = None
+                if max_attempts is not None:
+                    return False
                 sleep_interruptibly(
                     args.retry_interval,
                     should_stop,
@@ -1013,12 +1015,7 @@ def wait_for_coverage_and_aggregate(
             coverage = coverage_for_window(conn, symbols, window_ms)
             if coverage.complete_all:
                 total = aggregate_window(conn, symbols, window_ms)
-                write_15m_status(
-                    open_time_ms=window_ms,
-                    symbols=symbols,
-                    row_count=total,
-                    source="kline_aggregator_15m",
-                )
+                publish_aggregate_status(window_ms, symbols, total)
                 print(
                     f"{utc_iso()} now={utc_now():%Y-%m-%d %H:%M:%S} "
                     f"window {ms_label(window_ms)} complete; "
@@ -1051,6 +1048,8 @@ def wait_for_coverage_and_aggregate(
                     )
                     close_quietly(conn)
                     conn = None
+                    if max_attempts is not None:
+                        return False
                     sleep_interruptibly(
                         wait_seconds,
                         should_stop,
@@ -1093,6 +1092,8 @@ def wait_for_coverage_and_aggregate(
         finally:
             close_quietly(conn)
 
+        if max_attempts is not None:
+            return False
         sleep_interruptibly(
             args.retry_interval,
             should_stop,
@@ -1157,6 +1158,40 @@ def startup_min_15m_ms(latest_3m_ms: int, args: argparse.Namespace) -> int | Non
     return max(0, retention_min, bounded_min)
 
 
+class NewestFirstWindows:
+    """Backfill recent completed windows first; keep live work ahead of backlog."""
+
+    def __init__(self, oldest_ms: int, now_ms: int, retention_hours: float):
+        self.retention_ms = int(max(1.0, retention_hours) * 3600 * 1000)
+        self.next_live = floor_15m(now_ms)
+        self.pending = {value: 0.0 for value in range(
+            oldest_ms, self.next_live, INTERVAL_15M_MS)}
+
+    def select(self, now_ms: int, monotonic_now: float) -> int:
+        live = floor_15m(now_ms)
+        while self.next_live < live:
+            self.pending.setdefault(self.next_live, 0.0)
+            self.next_live += INTERVAL_15M_MS
+        cutoff = now_ms - self.retention_ms
+        self.pending = {key: retry for key, retry in self.pending.items() if key >= cutoff}
+        ready = [key for key, retry in self.pending.items() if retry <= monotonic_now]
+        return max(ready) if ready else self.next_live
+
+    def finish(self, window_ms: int, success: bool, retry_at: float) -> None:
+        if success:
+            self.pending.pop(window_ms, None)
+        else:
+            self.pending[window_ms] = retry_at
+
+
+def publish_aggregate_status(window_ms: int, symbols: list[str], total: int) -> None:
+    # Older backfill must never move the local latest-bar handoff backwards.
+    previous = read_15m_status()
+    if previous is None or window_ms >= previous.open_time_ms:
+        write_15m_status(open_time_ms=window_ms, symbols=symbols,
+                         row_count=total, source="kline_aggregator_15m")
+
+
 def initialize_cursor(
     conn: Connection,
     args: argparse.Namespace,
@@ -1172,19 +1207,8 @@ def initialize_cursor(
 
     min_open_ms = startup_min_15m_ms(latest_3m, args)
     latest_complete = latest_complete_15m_ms(conn, symbols, min_open_ms=min_open_ms)
-    if latest_complete is not None:
-        next_after_complete = latest_complete + INTERVAL_15M_MS
-        lookback_windows = max(0, int(args.startup_lookback_windows))
-        target_ms = max(0, next_after_complete - lookback_windows * INTERVAL_15M_MS)
-        if min_open_ms is not None:
-            target_ms = max(min_open_ms, target_ms)
-        return symbols, latest_3m, latest_complete, target_ms
-
-    latest_any = latest_any_15m_ms(conn, symbols, min_open_ms=min_open_ms)
-    if latest_any is not None:
-        return symbols, latest_3m, None, latest_any
-
-    return symbols, latest_3m, None, min_open_ms if min_open_ms is not None else floor_15m(latest_3m)
+    # Startup repairs run newest-first; the scheduler separately tracks live work.
+    return symbols, latest_3m, latest_complete, floor_15m(dt_to_ms(utc_now())) - INTERVAL_15M_MS
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1285,10 +1309,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=2,
         help=(
-            "On startup, re-check/re-aggregate at most this many recent 15m "
-            "windows before the next unconfirmed window.  After startup the "
-            "scheduler advances from its in-memory cursor instead of running "
-            "full-history progress checks. Default: 2."
+            "Legacy compatibility option. Startup now checks retained windows "
+            "newest-first, bounded by --startup-check-windows and retention."
         ),
     )
     parser.add_argument(
@@ -1363,7 +1385,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Kline aggregator scheduler (3m to 15m) mysql://{args.mysql_user}@"
         f"{args.mysql_host}:{args.mysql_port}/{args.mysql_database} "
         f"check={args.check_interval}s retry={args.retry_interval}s "
-        f"startup_lookback={args.startup_lookback_windows} "
+        f"startup_order=newest-first "
         f"startup_check={'all' if args.startup_check_all else str(args.startup_check_windows)} "
         f"trigger={args.trigger_file or 'disabled'}",
         flush=True,
@@ -1372,6 +1394,7 @@ def main(argv: list[str] | None = None) -> int:
     symbols: list[str] = []
     latest_complete_15m: int | None = None
     target_window_ms: int | None = None
+    schedule: NewestFirstWindows | None = None
     early_checked_3m: set[int] = set()
     last_status_print_at = 0.0
     conn: Connection | None = None
@@ -1407,6 +1430,14 @@ def main(argv: list[str] | None = None) -> int:
                 conn = connect_mysql(args)
                 latest_3m = get_latest_closed_3m_ms(conn, args.anchor_symbol)
                 prune_old_rows(conn, args, latest_3m)
+                if schedule is None and latest_3m is not None:
+                    # Scan the retained day newest-first, even on a partial restart.
+                    oldest = startup_min_15m_ms(latest_3m, args)
+                    if oldest is None:
+                        oldest = floor_15m(latest_3m) - int(args.retention_hours * 3600 * 1000)
+                    schedule = NewestFirstWindows(max(0, oldest), dt_to_ms(utc_now()), args.retention_hours)
+                if schedule is not None:
+                    target_window_ms = schedule.select(dt_to_ms(utc_now()), time.monotonic())
                 if target_window_ms is None:
                     print(f"{utc_iso()} no 3m data yet; retry in {args.check_interval}s", flush=True)
                     wait_seconds = args.check_interval
@@ -1451,14 +1482,18 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         close_quietly(conn)
                         conn = None
-                        ok = wait_for_coverage_and_aggregate(args, symbols, target_window_ms, should_stop)
+                        ok = wait_for_coverage_and_aggregate(
+                            args, symbols, target_window_ms, should_stop, max_attempts=2)
                         if args.once:
                             break
-                        if not ok:
+                        if schedule is not None:
+                            schedule.finish(target_window_ms, ok, time.monotonic() + args.retry_interval)
+                        if ok:
+                            latest_complete_15m = max(latest_complete_15m or 0, target_window_ms)
+                        if stopped:
                             break
-                        latest_complete_15m = target_window_ms
-                        target_window_ms += INTERVAL_15M_MS
-                        early_checked_3m = {value for value in early_checked_3m if value >= target_window_ms}
+                        early_checked_3m = {value for value in early_checked_3m
+                                            if value >= floor_15m(dt_to_ms(utc_now()))}
                         continue
         except KeyboardInterrupt:
             stopped = True

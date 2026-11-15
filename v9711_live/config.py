@@ -173,3 +173,10 @@ class ViewConfig:
     # Legacy argument retained for compatibility; file heartbeat is independent.
     heartbeat_seconds: float = env_float('V9711_LIVE_HEARTBEAT_SECONDS', 60.0)
     max_orders_display: int = env_int('V9711_LIVE_MAX_ORDERS_DISPLAY', 12)
+
+
+@dataclass(frozen=True)
+class SignalViewConfig(ViewConfig):
+    """Signal-only display throttle; execution and plan publication are unchanged."""
+    min_refresh_seconds: float = env_float(
+        'V9711_LIVE_SIGNAL_MIN_REFRESH_SECONDS', 3.0)

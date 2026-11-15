@@ -293,3 +293,26 @@ cd /opt/v9711-live/cloud
 If using systemd, reinstall the edited templates and daemon-reload. Existing
 installed service files will not change merely by pulling repository updates.
 Only restart the required services; do not launch duplicate trade processes.
+
+
+## Newest-first startup backfill and signal display
+
+The aggregator now repairs/aggregates the retained startup windows newest-first,
+so recent 3m history needed for signal warmup is downloaded before older history.
+Each unavailable window yields after a bounded coverage/repair attempt and is
+retried later; a missing old window no longer waits indefinitely ahead of the
+remaining backlog. Newly completed live windows take priority between attempts.
+The latest 15m status file never moves backwards when an older window completes.
+OHLC aggregation itself still uses chronological child candles.
+
+Signal redraws only on changed content and at most once every 3 seconds by
+default. Intermediate display changes are coalesced into the latest frame.
+File polling, calculation, desired-order publication, and trade display timing
+are unchanged. Optional private .env setting:
+
+```dotenv
+V9711_LIVE_SIGNAL_MIN_REFRESH_SECONDS=3
+```
+
+After pulling this update, restart only the aggregator and signal processes.
+Do not clear state or restart a second trade instance.
