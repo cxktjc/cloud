@@ -25,12 +25,12 @@ signal 仍然不直接连接行情 WebSocket。高频 WebSocket 由 `ticker_ws` 
 
 ## Ubuntu 安装
 
-假设部署路径是 `/opt/v9711-live`，并且服务器有一个可连接的 MySQL。服务器上不要放整个 `D:\0606`。
+假设部署路径是 `/opt/v9711-live/cloud`，并且服务器有一个可连接的 MySQL。服务器上不要放整个 `D:\0606`。
 
 ```bash
-sudo mkdir -p /opt/v9711-live
-sudo chown -R "$USER":"$USER" /opt/v9711-live
-cd /opt/v9711-live
+sudo mkdir -p /opt/v9711-live/cloud
+sudo chown -R "$USER":"$USER" /opt/v9711-live/cloud
+cd /opt/v9711-live/cloud
 git clone <你的私有仓库地址> .
 # 或者第一次从本机复制后：git init / git remote add / git push
 bash deploy/install_ubuntu.sh
@@ -148,7 +148,7 @@ trade 模拟正常、账户事件为 `live/ready/connected`、价格和3m状态�
 
 ## systemd
 
-把服务文件中的 `User=ubuntu` 改成实际运行用户，并确认部署路径确实是 `/opt/v9711-live`：
+把服务文件中的 `User=ubuntu` 改成实际运行用户，并确认部署路径确实是 `/opt/v9711-live/cloud`：
 
 ```bash
 sed -i "s/^User=ubuntu$/User=$USER/" deploy/systemd/*.service
@@ -272,3 +272,24 @@ To pin both processes to the same checkout, from the repository root:
 
 Waiting status now includes the exact resolved path and rejection reason.
 Stale, misaligned, or unfinished bars remain ineligible for new trading.
+
+## Correct server checkout: /opt/v9711-live/cloud
+
+All six systemd templates and .env.example use /opt/v9711-live/cloud.
+The Python package still derives defaults from its actual checkout when there
+are no environment overrides. Existing private .env files are not overwritten.
+Update stale V9711_DEPLOY_ROOT and market file overrides in the private .env.
+Do not replace the entire .env: retain credentials and check any existing state
+and account-stream paths before restarting a real executor. Changing a path
+does not migrate its ledger; do not start trade on an empty replacement ledger.
+
+For immediate signal path correction without changing state ownership:
+
+```bash
+cd /opt/v9711-live/cloud
+.venv/bin/python -B -m v9711_live.run_signal --check-inputs --status-file "$PWD/var/klines_3m_status.json" --price-file "$PWD/var/binance_ticker_price/latest.json"
+```
+
+If using systemd, reinstall the edited templates and daemon-reload. Existing
+installed service files will not change merely by pulling repository updates.
+Only restart the required services; do not launch duplicate trade processes.

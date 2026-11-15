@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/v9711-live
-EnvironmentFile=/opt/v9711-live/.env
-ExecStart=/opt/v9711-live/.venv/bin/python -m collectors.binance_futures_3m_ws --symbols-file /opt/v9711-live/config/symbols.txt --retention-hours 24 --status-file /opt/v9711-live/var/klines_3m_status.json --aggregator-trigger-file /opt/v9711-live/var/kline_aggregator_15m.trigger
+WorkingDirectory=/opt/v9711-live/cloud
+EnvironmentFile=/opt/v9711-live/cloud/.env
+ExecStart=/opt/v9711-live/cloud/.venv/bin/python -m collectors.binance_futures_3m_ws --symbols-file /opt/v9711-live/cloud/config/symbols.txt --retention-hours 24 --status-file /opt/v9711-live/cloud/var/klines_3m_status.json --aggregator-trigger-file /opt/v9711-live/cloud/var/kline_aggregator_15m.trigger
 Restart=on-failure
 RestartSec=3
 

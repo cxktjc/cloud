@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/v9711-live
-EnvironmentFile=/opt/v9711-live/.env
-ExecStart=/opt/v9711-live/.venv/bin/python -m collectors.ticker_ws --symbols-file /opt/v9711-live/config/symbols.txt --output /opt/v9711-live/var/binance_ticker_price/latest.json
+WorkingDirectory=/opt/v9711-live/cloud
+EnvironmentFile=/opt/v9711-live/cloud/.env
+ExecStart=/opt/v9711-live/cloud/.venv/bin/python -m collectors.ticker_ws --symbols-file /opt/v9711-live/cloud/config/symbols.txt --output /opt/v9711-live/cloud/var/binance_ticker_price/latest.json
 Restart=on-failure
 RestartSec=3
 

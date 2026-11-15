@@ -10,6 +10,18 @@ from collectors.kline_status import write_3m_status
 from collectors import binance_futures_3m_ws
 
 class InputPathsTests(unittest.TestCase):
+    def test_server_templates_use_cloud_checkout(self):
+        root=Path(__file__).resolve().parents[1]
+        prefix="/opt/v9711-live/cloud"
+        for service in (root/"deploy/systemd").glob("*.service"):
+            text=service.read_text(encoding="utf-8")
+            self.assertIn("WorkingDirectory="+prefix, text)
+            self.assertIn("EnvironmentFile="+prefix+"/.env", text)
+            self.assertIn("ExecStart="+prefix+"/.venv/bin/python", text)
+            self.assertNotIn("/cloud/cloud", text)
+        template=(root/".env.example").read_text(encoding="utf-8")
+        self.assertIn("V9711_LIVE_3M_STATUS_FILE="+prefix+"/var/klines_3m_status.json", template)
+
     def test_collector_default_matches_signal_path(self):
         import os
         env=dict(os.environ); env.pop("KLINE_3M_STATUS_FILE",None)

@@ -6,9 +6,9 @@ Requires=v9711-ticker.service v9711-3m.service
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/v9711-live
-EnvironmentFile=/opt/v9711-live/.env
-ExecStart=/opt/v9711-live/.venv/bin/python -m v9711_live.run_signal
+WorkingDirectory=/opt/v9711-live/cloud
+EnvironmentFile=/opt/v9711-live/cloud/.env
+ExecStart=/opt/v9711-live/cloud/.venv/bin/python -m v9711_live.run_signal
 Restart=on-failure
 RestartSec=3
 
