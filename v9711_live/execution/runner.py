@@ -927,7 +927,7 @@ def main() -> int:
         LOG.warning('live adapter connected with dry_run=True')
     # Reuse the collector's standard-library, OS-released single-writer lock.
     # Another trade process must not replace the same execution state files.
-    from .storage import SingleWriter
+    from ..storage import SingleWriter
     try:
         with SingleWriter(cfg.TRADE_LOCK_FILE):
             return LiveTrade(once=args.once, enabled=enabled,
