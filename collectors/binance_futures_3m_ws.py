@@ -30,6 +30,7 @@ from websockets.exceptions import ConnectionClosed
 
 from . import binance_network
 from v9711_live.environment import load_environment, MYSQL_DEFAULT_PASSWORD
+from v9711_live import config as live_cfg
 from .kline_status import write_3m_status
 
 
@@ -286,7 +287,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--status-file",
-        default=env("KLINE_3M_STATUS_FILE", DEFAULT_3M_STATUS_FILE),
+        default=env("KLINE_3M_STATUS_FILE", str(live_cfg.STATUS_FILE)),
         help=(
             "Atomically publish this file after every subscribed symbol has "
             "persisted its closed 3m bar. Set empty to disable."

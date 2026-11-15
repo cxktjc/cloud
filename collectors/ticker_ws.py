@@ -27,6 +27,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from . import binance_network
+from v9711_live import config as live_cfg
 
 LOG = logging.getLogger("v9711.ticker_ws")
 DEPLOY_ROOT = Path(os.environ.get("V9711_DEPLOY_ROOT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
@@ -331,7 +332,7 @@ async def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbols-file", type=Path, default=Path(os.environ.get("SYMBOLS_FILE", str(DEFAULT_SYMBOLS))))
-    parser.add_argument("--output", type=Path, default=Path(os.environ.get("PRICE_FILE", str(DEFAULT_OUTPUT))))
+    parser.add_argument("--output", type=Path, default=Path(os.environ.get("PRICE_FILE", str(live_cfg.PRICE_FILE))))
     parser.add_argument("--ws-base", default=os.environ.get("TICKER_WS_BASE", WS_BASE))
     parser.add_argument("--streams-per-connection", type=int, default=int(os.environ.get("TICKER_STREAMS_PER_CONNECTION", "200")))
     parser.add_argument("--publish-interval", type=float, default=float(os.environ.get("TICKER_PUBLISH_INTERVAL", "0.1")))

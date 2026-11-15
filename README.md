@@ -242,3 +242,33 @@ signal?? `--mysql-password`?3m?agg?????????????
 `MYSQL_ADMIN_PASSWORD`?git pull??????????.env?
 ??????????????MySQL????????
 ???????????????????????????????
+
+## Signal 3m handoff diagnostics
+
+Default file probes: 20ms; maintenance: 250ms; in-memory warmup: 40 completed
+3m bars (about two hours). File probes do not query MySQL every 20ms.
+The 3m collector publishes status only after each subscription group reaches
+90% completed-bar coverage. Database rows alone do not imply a published status.
+The agg process publishes 15m status, not the required 3m handoff.
+
+Producer defaults now share signal's configured status/price paths. Explicit
+CLI paths still take priority. New .env templates do not hardcode /opt paths;
+existing private .env files are never overwritten by git pull.
+
+Read-only check (no state writes or MySQL queries):
+
+```bash
+.venv/bin/python -B -m v9711_live.run_signal --check-inputs
+```
+
+Compare status.path with the collector log: published 3m status ... path=...
+To pin both processes to the same checkout, from the repository root:
+
+```bash
+# Restart the existing collector rather than running a duplicate.
+.venv/bin/python -B -u -m collectors.binance_futures_3m_ws --status-file "$PWD/var/klines_3m_status.json"
+.venv/bin/python -B -u -m v9711_live.run_signal --status-file "$PWD/var/klines_3m_status.json" --price-file "$PWD/var/binance_ticker_price/latest.json"
+```
+
+Waiting status now includes the exact resolved path and rejection reason.
+Stale, misaligned, or unfinished bars remain ineligible for new trading.

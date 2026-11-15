@@ -316,7 +316,9 @@ class LiveSignal:
 
     def _status_line(self) -> str:
         if self.current_status is None:
-            return '等待有效的本地已完成3m数据；信号账本与未退出持仓保留'
+            from .input_diagnostics import status_reason
+            reason = status_reason(self.status_reader._current, self.status_reader._json.error)
+            return '等待有效的本地已完成3m数据；信号账本与未退出持仓保留' + f" [reason={reason}; path={cfg.STATUS_FILE.resolve()}]"
         now = time.time()
         age = now - self.price_reader.last_success_epoch
         left = (self.current_status.open_time_ms + cfg.ORDER_BAR_LIFETIME_MS) / 1000 - now
@@ -394,6 +396,9 @@ class LiveSignal:
     def run(self) -> int:
         LOG.info('start version=%s authority=signal book=%s desired=%s',
                  cfg.VERSION, self.portfolio.path, cfg.DESIRED_FILE)
+        LOG.info('input paths 3m_status=%s price=%s mysql=%s:%s/%s history_bars=%s',
+                 cfg.STATUS_FILE.resolve(), cfg.PRICE_FILE.resolve(),
+                 cfg.MYSQL_HOST, cfg.MYSQL_PORT, cfg.MYSQL_DATABASE, cfg.HISTORY_BARS)
         poller = LocalChangePoller((cfg.STATUS_FILE, cfg.PRICE_FILE),
                                    maintenance_seconds=cfg.SIGNAL_MAINTENANCE_SECONDS)
         interval = min(cfg.STATUS_POLL_SECONDS, cfg.PRICE_POLL_SECONDS)
@@ -425,6 +430,11 @@ def main() -> int:
     parser.add_argument('--mysql-database', default=None)
     parser.add_argument('--mysql-password', default=None,
                         help='Override MYSQL_PASSWORD from the environment/private .env.')
+    parser.add_argument('--status-file', type=Path, default=None,
+                        help='Read the exact same completed-3m JSON path used by the collector.')
+    parser.add_argument('--price-file', type=Path, default=None)
+    parser.add_argument('--check-inputs', action='store_true',
+                        help='Show read-only input paths and validity; do not connect MySQL or change state.')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
@@ -434,6 +444,14 @@ def main() -> int:
         value = getattr(args, option)
         if value is not None:
             setattr(cfg, setting, value)
+    if args.status_file is not None:
+        cfg.STATUS_FILE = args.status_file.expanduser().resolve()
+    if args.price_file is not None:
+        cfg.PRICE_FILE = args.price_file.expanduser().resolve()
+    if args.check_inputs:
+        from .input_diagnostics import check_inputs
+        print(__import__('json').dumps(check_inputs(), ensure_ascii=False, indent=2))
+        return 0
     cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(cfg.LOG_FILE, encoding='utf-8')
     logging.basicConfig(
