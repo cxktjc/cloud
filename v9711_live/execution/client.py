@@ -15,12 +15,13 @@ import math
 import os
 import sys
 import time
-from decimal import Decimal, ROUND_CEILING, localcontext
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
 from pathlib import Path
 from typing import Any, Mapping
 
 from .. import config as cfg
 from ..contracts import atomic_write_json, read_json
+from ..local_poll import CachedJsonFile
 from .stream import AccountStreamView, StreamUnavailable
 from .submit_errors import ConfirmedSubmitRejection, is_transport_error
 from .nonblocking_io import NetworkPending
@@ -150,6 +151,8 @@ class ExchangeClient(BatchEntryMixin):
         self.dry_run = bool(dry_run)
         self.stream = AccountStreamView(account_stream_dir)
         self.exchange_info_cache_file = Path(exchange_info_cache_file)
+        self._metadata_reader = CachedJsonFile(self.exchange_info_cache_file)
+        self._metadata_lock = threading.RLock()
         self.price_file = Path(price_file)
         self.network_io = None
         self._transport_local = threading.local()
@@ -294,23 +297,24 @@ class ExchangeClient(BatchEntryMixin):
 
     def _symbol_meta(self, symbol: str) -> dict[str, Any]:
         symbol = str(symbol).upper()
-        if symbol in self._meta_cache:
-            return self._meta_cache[symbol]
-        default = {'step': 0.001, 'tick': 0.0001,
-                   'min_qty': 0.001, 'min_notional': 5.0}
-        try:
-            payload = json.loads(self.exchange_info_cache_file.read_text(encoding='utf-8'))
-            item = (payload.get('symbols') or {}).get(symbol) or {}
-            default.update({
-                'step': _finite(item.get('step'), default['step']),
-                'tick': _finite(item.get('tick'), default['tick']),
-                'min_qty': _finite(item.get('min_qty', item.get('step')), default['min_qty']),
-                'min_notional': _finite(item.get('min_notional'), default['min_notional']),
-            })
-        except (OSError, ValueError, TypeError, AttributeError):
-            pass
-        self._meta_cache[symbol] = default
-        return default
+        with self._metadata_lock:
+            payload = self._metadata_reader.read()
+        symbols = payload.get('symbols') if isinstance(payload, dict) else None
+        item = symbols.get(symbol) if isinstance(symbols, dict) else None
+        if not isinstance(item, dict):
+            raise ValueError(f'{symbol}: exchange metadata missing/invalid at '
+                             f'{self.exchange_info_cache_file}; run '
+                             'python -m scripts.refresh_exchange_info --output <cache-path>')
+        meta = {}
+        for name in ('tick', 'step', 'min_qty', 'min_notional'):
+            value = _finite(item.get(name), float('nan'))
+            if not math.isfinite(value) or value < 0 or (name in ('tick', 'step') and value <= 0):
+                raise ValueError(f'{symbol}: invalid exchange metadata field {name} '
+                                 f'at {self.exchange_info_cache_file}')
+            meta[name] = value
+        meta['tick_text'] = str(item['tick'])
+        meta['step_text'] = str(item['step'])
+        return meta
 
     @staticmethod
     def _align_down(value: float, step: float) -> float:
@@ -323,18 +327,27 @@ class ExchangeClient(BatchEntryMixin):
         return format(value, '.12f').rstrip('0').rstrip('.') or '0'
 
     def price_text(self, symbol: str, price: float) -> str:
-        tick = self._symbol_meta(symbol)['tick']
-        aligned = self._align_down(price, tick)
-        if aligned <= 0.0:
+        meta = self._symbol_meta(symbol)
+        with localcontext() as context:
+            context.prec = 40
+            tick = Decimal(meta['tick_text'])
+            aligned = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+        if not aligned.is_finite() or aligned <= 0:
             raise ValueError(f'{symbol}: aligned price below tick size')
-        return self._decimal_text(aligned)
+        text = format(aligned, 'f')
+        return text.rstrip('0').rstrip('.') if '.' in text else text
 
     def qty_text(self, symbol: str, notional: float, price: float) -> str:
         meta = self._symbol_meta(symbol)
-        step = _finite(meta.get('step'))
-        qty = self._align_down(notional / price, step) if price > 0.0 else 0.0
-        text = self._decimal_text(qty)
-        return text
+        if price <= 0:
+            return '0'
+        with localcontext() as context:
+            context.prec = 40
+            step = Decimal(meta['step_text'])
+            quantity = (Decimal(str(notional)) / Decimal(str(price)) / step).to_integral_value(
+                rounding=ROUND_FLOOR) * step
+        text = format(quantity, 'f')
+        return text.rstrip('0').rstrip('.') if '.' in text else text
 
     def validate_order(self, symbol: str, price: float, qty: float) -> tuple[bool, str]:
         """Validate exchange step, minimum quantity and minimum notional."""
@@ -381,7 +394,7 @@ class ExchangeClient(BatchEntryMixin):
         with localcontext() as context:
             context.prec = 40
             aligned_price = Decimal(price_text)
-            step_decimal = Decimal(str(step))
+            step_decimal = Decimal(meta['step_text'])
             requested_decimal = Decimal(str(requested))
             target = max(requested_decimal, Decimal('5'), Decimal(str(min_notional)))
             notional_units = (target / (aligned_price * step_decimal)).to_integral_value(

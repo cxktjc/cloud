@@ -331,3 +331,22 @@ var/state/trade.log, exposes entry_diagnostics in execution_feedback.json, and
 shows plan readiness, filtered candidates and current-bar submit rejections
 on the terminal. Diagnostics do not change trading decisions. Check the log
 for persisted rejection/uncertain-submit errors even after terminal redraws.
+
+
+## Required exchange precision cache before trade startup
+
+Before enabling trade on a new server, download the public exchangeInfo filters:
+
+```bash
+.venv/bin/python -B -m scripts.refresh_exchange_info
+```
+
+This writes to the same configured V9711_LIVE_EXCHANGE_INFO_CACHE_FILE that
+trade reads, and prints its resolved path. It does not access an account, submit
+orders, or change symbols/state. Run again after filter changes or new listings.
+The cache is runtime data and is not committed to Git. An invalid/failed download
+does not overwrite the previous cache. Missing symbol filters now block entry
+with an explicit error instead of silently guessing tickSize/stepSize. Price
+and entry quantity are serialized with Decimal-based exchange-filter alignment.
+Existing current-bar rejection records are retained; do not delete execution
+state to force a retry. Changed/new-bar plans resume through normal admission.
