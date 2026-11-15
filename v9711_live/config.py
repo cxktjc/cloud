@@ -180,3 +180,10 @@ class SignalViewConfig(ViewConfig):
     """Signal-only display throttle; execution and plan publication are unchanged."""
     min_refresh_seconds: float = env_float(
         'V9711_LIVE_SIGNAL_MIN_REFRESH_SECONDS', 3.0)
+
+
+@dataclass(frozen=True)
+class TradeViewConfig(ViewConfig):
+    """Execution display only; never throttles signal polling or order I/O."""
+    min_refresh_seconds: float = env_float(
+        'V9711_LIVE_TRADE_MIN_REFRESH_SECONDS', 3.0)

@@ -79,7 +79,7 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
         self.session_entries.observe_owned_state(self.positions, self.tracked)
         self.price = PriceReader(cfg.PRICE_FILE)
         self.view = TradeTerminalView(
-            min_refresh_seconds=cfg.ViewConfig().min_refresh_seconds,
+            min_refresh_seconds=cfg.TradeViewConfig().min_refresh_seconds,
             heartbeat_seconds=cfg.ViewConfig().heartbeat_seconds,
             max_rows=cfg.ViewConfig().max_orders_display)
         self._desired_reader = CachedJsonFile(cfg.DESIRED_FILE)

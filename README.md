@@ -350,3 +350,12 @@ with an explicit error instead of silently guessing tickSize/stepSize. Price
 and entry quantity are serialized with Decimal-based exchange-filter alignment.
 Existing current-bar rejection records are retained; do not delete execution
 state to force a retry. Changed/new-bar plans resume through normal admission.
+
+
+## Trade display refresh
+
+Trade now redraws changed content at most once every 3 seconds by default.
+Set V9711_LIVE_TRADE_MIN_REFRESH_SECONDS in .env to customize it. This only
+throttles terminal rendering; plan polling, admission, cancels, fills, timed
+exits and feedback publication keep their existing scheduling. Restart only
+trade to load the setting; preserve all state and run only one executor.

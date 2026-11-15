@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from collectors import kline_aggregator_15m as agg
 from v9711_live import config as cfg
 from v9711_live.terminal_view import TerminalView
+from v9711_live.execution.terminal import TradeTerminalView
 
 
 class BackfillTests(unittest.TestCase):
@@ -90,6 +91,21 @@ class DisplayTests(unittest.TestCase):
             self.assertTrue(view.render(now=3, value=4))
             self.assertFalse(view.render(now=20, value=4))
             self.assertEqual([call.args[0] for call in output.call_args_list], ['1', '4'])
+
+    def test_trade_display_coalesces_changes_without_heartbeat_redraw(self):
+        view = TradeTerminalView(min_refresh_seconds=3)
+        view._format = Mock(side_effect=lambda fields: str(fields['value']))
+        with patch('builtins.print') as output, patch('os.system'), patch('sys.stdout'):
+            self.assertTrue(view.render(now=0, value=1))
+            self.assertFalse(view.render(now=0.1, value=2))
+            self.assertFalse(view.render(now=2.99, value=3))
+            self.assertTrue(view.render(now=3, value=4))
+            self.assertFalse(view.render(now=30, value=4, clock_utc='new', updated_at_epoch=30))
+            self.assertEqual([call.args[0] for call in output.call_args_list], ['1', '4'])
+
+    def test_trade_uses_its_display_config_default(self):
+        self.assertEqual(TradeTerminalView().min_refresh_seconds,
+                         cfg.TradeViewConfig().min_refresh_seconds)
 
     def test_clock_and_sequence_do_not_redraw(self):
         view = TerminalView(cfg.ViewConfig(min_refresh_seconds=3))

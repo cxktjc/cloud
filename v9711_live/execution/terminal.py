@@ -50,7 +50,7 @@ def compact_positions(rows: Any, limit: int) -> str:
 
 
 class TradeTerminalView:
-    def __init__(self, *, min_refresh_seconds: float = 0.1,
+    def __init__(self, *, min_refresh_seconds: float = cfg.TradeViewConfig().min_refresh_seconds,
                  heartbeat_seconds: float = 60.0, max_rows: int = 12):
         self.min_refresh_seconds = float(min_refresh_seconds)
         self.heartbeat_seconds = float(heartbeat_seconds)
