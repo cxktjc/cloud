@@ -316,3 +316,18 @@ V9711_LIVE_SIGNAL_MIN_REFRESH_SECONDS=3
 
 After pulling this update, restart only the aggregator and signal processes.
 Do not clear state or restart a second trade instance.
+
+
+## Trade plan diagnostics (no private credentials)
+
+Both signal and trade derive desired_orders.json from the same
+V9711_LIVE_STATE_DIR (default: checkout/var/state). Existing process environment
+variables take precedence over .env, so compare startup input-path logs if two
+processes disagree. The signal nearest-candidate label describes a published
+signal intent, not an exchange acknowledgement or a reserved execution slot.
+
+Trade records startup resolved paths and changed-only entry diagnostics in
+var/state/trade.log, exposes entry_diagnostics in execution_feedback.json, and
+shows plan readiness, filtered candidates and current-bar submit rejections
+on the terminal. Diagnostics do not change trading decisions. Check the log
+for persisted rejection/uncertain-submit errors even after terminal redraws.

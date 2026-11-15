@@ -148,6 +148,20 @@ class TradeTerminalView:
             'trade收益仅来自精确归属订单成交/平仓和当前实际持仓；差异按同价对比signal模型，不是交易所账户总收益。',
             '=' * 116,
         ])
+        diagnostics = f.get('entry_diagnostics') or {}
+        if diagnostics:
+            lines.insert(-1, 'Entry plan: status={desired_status} signal_ready={signal_ready} '
+                         'plan_ready={plan_ready} published={published} executable={priced_executable}'
+                         .format(**diagnostics))
+            lines.insert(-1, '  blockers=' + ','.join(diagnostics.get('blockers') or ['none'])
+                         + ' selected=' + ','.join(diagnostics.get('selected_to_place') or ['none']))
+            lines.insert(-1, '  signal file: ' + str(diagnostics.get('desired_file')))
+            for symbol, reason in list((diagnostics.get('filtered') or {}).items())[:self.max_rows]:
+                lines.insert(-1, f'  entry skipped {symbol}: {reason}')
+        rejections = sorted((f.get('entry_rejections') or {}).values(),
+                            key=lambda row: row.get('rejected_at_epoch', 0), reverse=True)
+        for row in rejections[:3]:
+            lines.insert(-1, f'  ENTRY REJECTED {row.get("symbol")}: {row.get("error")}')
         session = f.get('session_entry_stats')
         if session is not None:
             block = [

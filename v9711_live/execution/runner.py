@@ -457,28 +457,33 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
 
     def _place_order(self, row: Mapping[str, Any]) -> None:
         symbol = str(row.get('symbol') or '').upper()
+        def skipped(reason: str) -> None:
+            if not hasattr(self, '_submit_skip_reasons'):
+                self._submit_skip_reasons = {}
+            self._submit_skip_reasons[symbol or '<missing-symbol>'] = reason
+
         if not symbol or symbol in self.tracked or symbol in self.positions:
-            return
+            return skipped('missing_symbol_or_already_tracked_or_held')
         submit_now = time.time()
         bar_ms = int(self._finite(row.get('order_bar_open_ms')))
         if bar_ms > 0 and not bar_ms <= submit_now * 1000 < bar_ms + cfg.BAR_MS:
-            return  # Slow cancel/submit I/O must not open an expired-bar order.
+            return skipped('order_bar_expired_before_submit')
         reopen_until = self._finite(
             self.ledger.state['reopen_until_epoch'].get(symbol))
         if submit_now < reopen_until:
-            return
+            return skipped('post_close_reopen_cooldown')
         final_exit_bar = self._in_final_pre_exit_bar(now=submit_now)
         if ((len(self.positions) >= cfg.SLOTS and not final_exit_bar)
                 or len(self.tracked) >= cfg.MAX_PENDING_ORDERS):
-            return
+            return skipped('position_or_pending_capacity_full')
         client_id = self.ledger.client_id(
             symbol, int(self._finite(row.get('order_bar_open_ms'))), 'entry')
         if self.ledger.owns_client(client_id) or self._entry_submission_blocked(row):
-            return
+            return skipped('exact_client_identity_already_used_or_plan_rejected')
         price = self._finite(row.get('limit_price'))
         notional = self._finite(row.get('notional'))
         if price <= 0.0 or notional <= 0.0:
-            return
+            return skipped('invalid_price_or_notional')
         prepared = self.client.prepare_limit(symbol, price, notional) \
             if hasattr(self.client, 'prepare_limit') else None
         if prepared is None:
@@ -490,7 +495,7 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
             LOG.warning('skip order symbol=%s reason=%s price=%s qty=%s notional=%.8g',
                         symbol, prepared.get('reason'), prepared.get('price'),
                         prepared.get('qty'), notional)
-            return
+            return skipped('preflight: ' + str(prepared.get('reason')))
         qty = self._finite(prepared.get('qty'))
         price_text = str(prepared.get('price') or '')
         qty_text = str(prepared.get('qty') or '')
@@ -688,6 +693,7 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
             'pending_rotation': self.ledger.state.get('pending_rotation'),
             'rotated_out_plans': dict(self.ledger.state.get('rotated_out_plans') or {}),
             'reopen_until_epoch': dict(self.ledger.state['reopen_until_epoch']),
+            'entry_diagnostics': getattr(self, '_entry_diagnostics', {}),
             'stream_health': dict(stream_health),
             'network_io': self._network_io.health() if self._network_io else {'enabled': False},
             'note': ('Executor-owned exact-identity state. Aggregate account '
@@ -723,6 +729,8 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
             entry_gap_policy=GapPolicy().describe(),
             current_admission_gap=self._current_admission_gap(),
             pending_rotation=self.ledger.state.get('pending_rotation'),
+            entry_diagnostics=getattr(self, '_entry_diagnostics', {}),
+            entry_rejections=dict(self.ledger.state['entry_submit_rejections']),
             stream_health=dict(stream_health))
 
     def step(self, *, now: float | None = None) -> None:
@@ -731,6 +739,7 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
 
     def _step(self, *, now: float | None = None) -> None:
         self.cycles += 1
+        self._submit_skip_reasons = {}
         now = time.time() if now is None else float(now)
         snapshot, status = self.desired_snapshot(now=now)
         self._io_signal = (snapshot, status)
@@ -762,6 +771,7 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
             self._preflight_bar = bar_ms
         self._prune_entry_rejections(bar_ms)
         live_desired = []
+        filtered_entries = {}
         for raw in desired_rows:
             if not isinstance(raw, Mapping):
                 continue
@@ -775,6 +785,7 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
                 item['observed_price'] = price
                 item['gap'] = (price - limit) / limit
                 if symbol not in self.tracked and self._entry_submission_blocked(item):
+                    filtered_entries[symbol] = 'submission_blocked_for_current_plan'
                     continue  # Do not rotate for or re-send a known rejected plan.
                 # Never cancel a valid incumbent for a challenger that cannot
                 # meet tick/step/min-notional constraints. Preparation is local.
@@ -790,8 +801,12 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
                             self._rejected_preflight.add(key)
                             LOG.warning('candidate not executable; no rotation symbol=%s reason=%s',
                                         symbol, prepared.get('reason'))
+                        filtered_entries[symbol] = 'preflight: ' + str(prepared.get('reason'))
                         continue
                 live_desired.append(item)
+            else:
+                filtered_entries[symbol or '<missing-symbol>'] = (
+                    'order_bar_mismatch' if row_bar != bar_ms else 'missing_or_stale_price_or_invalid_limit')
         tracked_view = {}
         for symbol, old in self.tracked.items():
             item = dict(old)
@@ -838,6 +853,32 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
                     raw['_rotation_origin'] = dict(self.ledger.state.get('pending_rotation') or {})
                 self._place_order(raw)
         self._consume_rotation(plan)
+        filtered_entries.update(self._submit_skip_reasons)
+        blockers = []
+        if status != 'valid':
+            blockers.append('desired_' + status)
+        if not snapshot.get('signal_ready'):
+            blockers.append('signal_not_ready')
+        if not (bar_ms > 0 and bar_ms / 1000 <= now < (bar_ms + cfg.BAR_MS) / 1000):
+            blockers.append('outside_order_bar')
+        if len(self.positions) >= cfg.SLOTS and not final_exit_bar:
+            blockers.append('position_capacity_full')
+        self._entry_diagnostics = {
+            'desired_file': str(cfg.DESIRED_FILE.resolve()),
+            'desired_status': status, 'signal_ready': bool(snapshot.get('signal_ready')),
+            'plan_ready': plan_ready, 'bar_open_ms': bar_ms,
+            'published': len(desired_rows), 'priced_executable': len(live_desired),
+            'selected_to_place': [row.symbol for row in plan.place],
+            'tracked': sorted(self.tracked), 'blockers': blockers,
+            'filtered': filtered_entries,
+            'actions': [{'symbol': a.symbol, 'action': a.action, 'reason': a.reason}
+                        for a in plan.actions],
+            'admission_gap': self._current_admission_gap(),
+        }
+        diagnostic_key = json.dumps(self._entry_diagnostics, sort_keys=True)
+        if diagnostic_key != getattr(self, '_last_entry_diagnostic_key', None):
+            LOG.info('entry diagnostics %s', diagnostic_key)
+            self._last_entry_diagnostic_key = diagnostic_key
         self._refresh_entry_cancel_plan()
         self.ledger.save()
         stream_health = self._stream_health()
@@ -870,6 +911,10 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
         LOG.info('start enabled=%s dry_run=%s max_orders=%d max_positions=%d desired=%s',
                  self.client.enabled, self.client.dry_run,
                  cfg.MAX_PENDING_ORDERS, cfg.SLOTS, cfg.DESIRED_FILE)
+        LOG.info('input paths root=%s state=%s desired=%s price=%s account=%s feedback=%s log=%s',
+                 cfg.ROOT.resolve(), cfg.STATE_DIR.resolve(), cfg.DESIRED_FILE.resolve(),
+                 cfg.PRICE_FILE.resolve(), cfg.ACCOUNT_STREAM_DIR.resolve(),
+                 cfg.EXECUTION_FEEDBACK_FILE.resolve(), cfg.TRADE_LOG_FILE.resolve())
         LOG.info('network I/O nonblocking=%s workers=%s; main loop owns state and signal polling',
                  self._network_io is not None, self._network_io.worker_count if self._network_io else 0)
         LOG.info('entry gap policy bootstrap<3=%.2f%% fill<6=%.2f%% full-rotation=%.2f%%; '
