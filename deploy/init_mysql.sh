@@ -13,4 +13,4 @@ fi
 MYSQL_PWD="${MYSQL_ADMIN_PASSWORD:-${MYSQL_PASSWORD:-}}" \
   mysql --protocol=tcp --host="$MYSQL_HOST" --port="$MYSQL_PORT" --user="$MYSQL_ADMIN_USER" \
   < "$ROOT/sql/001_schema.sql"
-printf 'MySQL schema initialized: binance_futures, binance_ticker_price\n'
+printf 'MySQL schema initialized: binance_futures\n'

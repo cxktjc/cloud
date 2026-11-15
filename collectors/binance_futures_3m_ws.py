@@ -28,7 +28,7 @@ import aiomysql
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from . import binance_proxy
+from . import binance_network
 from .kline_status import write_3m_status
 
 
@@ -753,7 +753,7 @@ async def stream_worker(
                 close_timeout=10,
                 max_queue=4096,
                 compression=None,
-                **binance_proxy.websocket_connect_kwargs(),
+                **binance_network.websocket_connect_kwargs(),
             ) as websocket:
                 LOG.info("%s connected", name)
                 connect_count += 1

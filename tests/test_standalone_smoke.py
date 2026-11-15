@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch, Mock
+import os
 from pathlib import Path
 import sys
 
@@ -11,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from collectors.ticker_ws import SnapshotState
+from collectors import binance_network
 from v9711_live import config as cfg
 from v9711_live.market_data import PriceReader
 
@@ -47,6 +50,21 @@ class StandaloneSmokeTests(unittest.TestCase):
             state.group_failed(2, "test disconnect")
             self.assertFalse(state.publish_if_due())
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "error")
+
+    def test_binance_network_is_direct_only(self):
+        from v9711_live.exchange import binance_network as trade_network
+        poisoned = {"BINANCE_PROXY_URL": "http://invalid:1", "BINANCE_PROXY": "http://invalid:2",
+                    "HTTP_PROXY": "http://invalid:3", "HTTPS_PROXY": "http://invalid:4",
+                    "ALL_PROXY": "http://invalid:5", "https_proxy": "http://invalid:6"}
+        for module in (binance_network, trade_network):
+            with self.subTest(module=module.__name__), patch.dict(os.environ, poisoned):
+                self.assertEqual(module.websocket_connect_kwargs(), {"proxy": None})
+                opener = Mock()
+                with patch.object(module.urllib.request, "ProxyHandler") as handler, \
+                     patch.object(module.urllib.request, "build_opener", return_value=opener):
+                    module.urlopen("https://example.invalid", timeout=7)
+                    handler.assert_called_once_with({})
+                    opener.open.assert_called_once_with("https://example.invalid", timeout=7)
 
     def test_local_symbol_file_is_nonempty(self):
         symbols = [line.strip() for line in cfg.SYMBOLS_FILE.read_text(encoding="utf-8").splitlines()

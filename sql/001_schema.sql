@@ -1,6 +1,5 @@
 -- v9711 standalone MySQL schema. Run as an administrative MySQL user.
 CREATE DATABASE IF NOT EXISTS binance_futures CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE DATABASE IF NOT EXISTS binance_ticker_price CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 USE binance_futures;
 
@@ -56,12 +55,4 @@ CREATE TABLE IF NOT EXISTS strategy_symbols (
     symbol VARCHAR(32) NOT NULL PRIMARY KEY,
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-USE binance_ticker_price;
-CREATE TABLE IF NOT EXISTS ticker_price_snapshots (
-    captured_ms BIGINT NOT NULL PRIMARY KEY,
-    symbol_count INT NOT NULL,
-    prices JSON NOT NULL,
-    KEY idx_ticker_captured (captured_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

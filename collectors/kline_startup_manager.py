@@ -53,7 +53,7 @@ except ImportError:
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from . import binance_proxy
+from . import binance_network
 from .binance_futures_3m_ws import KlineRow, TableColumn, build_insert_sql
 
 
@@ -122,8 +122,8 @@ def ws_connect(url: str):
     """
     Use websockets' asyncio client for these long-lived public streams.
 
-    The current websockets client supports explicit proxy configuration, which
-    lets these Binance streams use the same local proxy as REST repairs.
+    The deployment uses direct HTTPS/WSS connections for both streams and REST
+    repair requests; no proxy or local forwarding port is configured.
     """
     return websockets.connect(
         url,
@@ -132,7 +132,7 @@ def ws_connect(url: str):
         open_timeout=60,
         close_timeout=10,
         max_queue=1024,
-        **binance_proxy.websocket_connect_kwargs(),
+        **binance_network.websocket_connect_kwargs(),
     )
 
 
@@ -517,7 +517,7 @@ def fetch_json(
         if limiter is not None:
             limiter.wait()
         try:
-            with binance_proxy.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with binance_network.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 return json.load(response)
         except HTTPError as exc:
             if not is_retryable_http_error(exc) or attempt > max_retries:

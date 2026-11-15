@@ -20,7 +20,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request
 
-from . import binance_proxy
+from . import binance_network
 
 ROOT = Path(os.environ.get("V9711_DEPLOY_ROOT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 LOG = logging.getLogger("binance.account_stream")
@@ -346,7 +346,7 @@ class RestClient:
         request = Request(url, headers={"X-MBX-APIKEY": self.key}, method=method,
                           data=b"" if method in {"POST", "PUT"} else None)
         try:
-            with binance_proxy.urlopen(request, timeout=self.timeout) as response:
+            with binance_network.urlopen(request, timeout=self.timeout) as response:
                 result = json.loads(response.read())
         except HTTPError as exc:
             try:
@@ -389,7 +389,7 @@ class Listener:
         async with connect(self.ws_base + "/" + self.listen_key, open_timeout=20,
                            ping_interval=20, ping_timeout=20, close_timeout=5,
                            max_size=2**22, max_queue=1024,
-                           **binance_proxy.websocket_connect_kwargs()) as ws:
+                           **binance_network.websocket_connect_kwargs()) as ws:
             queue = asyncio.Queue(maxsize=20000)
 
             async def receiver():
@@ -526,8 +526,8 @@ def main():
                 store.export()
                 LOG.info("offline replay complete")
             else:
-                LOG.info("listener starting account=%s proxy=%s output=%s", args.account_id,
-                         "configured" if binance_proxy.proxy_url() else "direct", args.output_dir)
+                LOG.info("listener starting account=%s network=direct output=%s", args.account_id,
+                         args.output_dir)
                 asyncio.run(Listener(RestClient(key, secret, args.rest_base), store,
                                      ws_base=args.ws_base, resync_seconds=args.resync_seconds).run())
         except KeyboardInterrupt:

@@ -26,7 +26,7 @@ from urllib.parse import urlencode
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from . import binance_proxy
+from . import binance_network
 
 LOG = logging.getLogger("v9711.ticker_ws")
 DEPLOY_ROOT = Path(os.environ.get("V9711_DEPLOY_ROOT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
@@ -189,7 +189,7 @@ async def consume_group(
                 ping_interval=ping_interval,
                 ping_timeout=ping_timeout,
                 close_timeout=10,
-                **binance_proxy.websocket_connect_kwargs(),
+                **binance_network.websocket_connect_kwargs(),
             ) as socket:
                 state.group_connected(group_index)
                 retry = 1.0

@@ -9,7 +9,7 @@ import sys
 ROOT_PATH = Path(__file__).resolve().parents[1]
 if str(ROOT_PATH) not in sys.path:
     sys.path.insert(0, str(ROOT_PATH))
-from collectors import binance_proxy
+from collectors import binance_network
 
 ROOT = Path(os.environ.get("V9711_DEPLOY_ROOT", str(Path(__file__).resolve().parents[1]))).resolve()
 URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -23,7 +23,7 @@ def main() -> int:
         symbols = json.loads(args.from_status.read_text(encoding="utf-8")).get("symbols", [])
     else:
         req = Request(URL, headers={"User-Agent": "v9711-live-symbol-sync/1.0", "Accept": "application/json"})
-        with binance_proxy.urlopen(req, timeout=15) as response:
+        with binance_network.urlopen(req, timeout=15) as response:
             data = json.loads(response.read())
         symbols = [row["symbol"] for row in data.get("symbols", [])
                    if row.get("status") == "TRADING" and row.get("contractType") == "PERPETUAL"

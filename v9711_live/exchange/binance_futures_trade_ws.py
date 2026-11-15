@@ -41,7 +41,7 @@ from urllib.request import Request
 
 import websockets
 
-from . import binance_proxy
+from . import binance_network
 
 
 REST_BASE_URL = "https://fapi.binance.com"
@@ -181,7 +181,7 @@ def _rest_signed_request(
         },
     )
     try:
-        with binance_proxy.urlopen(req, timeout=request_timeout or REQUEST_TIMEOUT) as response:
+        with binance_network.urlopen(req, timeout=request_timeout or REQUEST_TIMEOUT) as response:
             data = response.read()
             return json.loads(data) if data else {}
     except HTTPError as exc:
@@ -400,7 +400,7 @@ class BinanceFuturesTradeWS:
         }
         if self.ws_url.startswith("wss://") and not self.ssl_verify:
             connect_kwargs["ssl"] = ssl._create_unverified_context()
-        connect_kwargs.update(binance_proxy.websocket_connect_kwargs())
+        connect_kwargs.update(binance_network.websocket_connect_kwargs())
         self._ws = await websockets.connect(self.ws_url, **connect_kwargs)
         self._connected_at = time.monotonic()
 

@@ -19,7 +19,7 @@ signal 仍然不直接连接行情 WebSocket。高频 WebSocket 由 `ticker_ws` 
 
 - `klines_3m`：按 `KLINE_RETENTION_HOURS=24` 清理，只保留最近约1天。
 - `klines_15m`：aggregator 同样清理和检查最近24小时，启动扫描默认96根15m窗口。
-- `latest.json`：只保留当前快照，不写价格历史数据库。
+- `latest.json`：只保留当前一份价格快照，WebSocket采集不追加价格历史，也不创建价格历史表。
 - `events.sqlite3`、`var/state/`：**不能按1天清理**。这里保存真实持仓、订单身份、成交归属、复利余额和恢复游标。
 - 当前 `config/symbols.txt` 是从本地 v9711 当前3m状态导出的647个策略币对；不要在正式运行中随意覆盖它。需要更新时先测试新币对是否有足够40根完成3m预热。
 
@@ -64,14 +64,13 @@ MYSQL_PASSWORD=...
 bash deploy/init_mysql.sh
 ```
 
-脚本会创建：
+脚本只创建 `binance_futures` 数据库及以下策略K线表：
 
 - `binance_futures.klines_3m`
 - `binance_futures.klines_15m`
 - `binance_futures.strategy_symbols`
-- `binance_ticker_price.ticker_price_snapshots`（预留；当前WS价格采集只写latest JSON）
 
-如果 MySQL 在另一台机器，修改 `.env` 后再初始化。不要把密码提交到 Git。
+Binance行情、账户和交易连接全部走服务器自身的直连HTTPS/WSS，不读取代理环境变量，也不使用本地代理端口。MySQL仍需要自己的数据库连接配置；不要把密码提交到 Git。
 
 ## 币对文件
 
@@ -181,20 +180,20 @@ sudo systemctl start v9711-ticker.service v9711-3m.service v9711-15m.service v97
 
 ## Git
 
-本地目录已经单独初始化为 Git 仓库，当前不绑定远端。创建私有仓库后：
+本地目录已经单独初始化为 Git 仓库，并已推送到 `git@github.com:cxktjc/cloud.git` 的 `main` 分支：
 
 ```bash
-git remote add origin <你的私有仓库地址>
-git push -u origin main
+git pull --ff-only origin main
 ```
 
 `.env`、运行数据库、日志、signal/trade状态和价格快照都被 `.gitignore` 排除。服务器正式接管前，必须先备份并核对 `var/state/`、真实未决订单和账户持仓；不能通过删除状态文件来“清空”或重新开始。
 
 ## 重要检查
 
-1. 3m collector 的数据库表必须有 `open_time_ms` 主键索引；初始化SQL已提供。
-2. WebSocket价格采集使用 `aggTrade`，按200个币对一组连接，默认每100ms合并写一次快照；如果服务器带宽/磁盘压力较大，可把 `TICKER_PUBLISH_INTERVAL` 调到0.2或0.5。
-3. `exchangeInfo`更新币对后，新币对需要先积累warmup；signal不会因为文件更新就虚构历史K线。
-4. 1天行情只够短时重启恢复。停机超过1天，不能静默跳过缺失bar；应先补数据或保持trade停用。
-5. 本包没有复制其他策略目录；批量LIMIT下单辅助和交易适配器已内置到 `v9711_live/exchange/`。
+1. 所有Binance服务使用直连HTTPS/WSS，不需要配置代理地址或本地代理端口。
+2. 3m collector 的数据库表必须有 `open_time_ms` 主键索引；初始化SQL已提供。
+3. WebSocket价格采集使用 `aggTrade`，按200个币对一组连接，默认每100ms合并写一次快照；如果服务器带宽/磁盘压力较大，可把 `TICKER_PUBLISH_INTERVAL` 调到0.2或0.5。
+4. `exchangeInfo`更新币对后，新币对需要先积累warmup；signal不会因为文件更新就虚构历史K线。
+5. 1天行情只够短时重启恢复。停机超过1天，不能静默跳过缺失bar；应先补数据或保持trade停用。
+6. 本包没有复制其他策略目录；批量LIMIT下单辅助和交易适配器已内置到 `v9711_live/exchange/`。
 

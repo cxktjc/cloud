@@ -2,7 +2,7 @@
 
 Reads:
     state/desired_orders.json          signal-owned desired near-limit candidates
-    var/binance_ticker_price/latest.json  local 10s price snapshot
+    var/binance_ticker_price/latest.json  local high-frequency price snapshot
     var/binance_account_stream/*       exact order fills / statuses (read-only)
 Writes (execution-owned only):
     state/execution_intents.json       exact registered order identities
