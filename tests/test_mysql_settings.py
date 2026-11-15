@@ -30,6 +30,14 @@ class MysqlSettingsTests(unittest.TestCase):
                 args=module.parse_args() if module is binance_futures_3m_ws else module.parse_args(sys.argv[1:])
                 self.assertEqual(args.mysql_password,"test-cli")
 
+    def test_cloud_collectors_share_default_without_private_env(self):
+        from v9711_live.environment import MYSQL_DEFAULT_PASSWORD
+        for module in (binance_futures_3m_ws, kline_aggregator_15m, kline_startup_manager):
+            with self.subTest(module=module.__name__), patch.dict(os.environ, {}, clear=True), \
+                 patch.object(module, "load_environment"), patch.object(sys,"argv",["test"]):
+                args=module.parse_args() if module is binance_futures_3m_ws else module.parse_args([])
+                self.assertEqual(args.mysql_password, MYSQL_DEFAULT_PASSWORD)
+
     def test_signal_override_reaches_db_config_before_construction(self):
         with tempfile.TemporaryDirectory() as folder, \
              patch.object(cfg,"STATE_DIR",Path(folder)), \

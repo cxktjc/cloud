@@ -54,7 +54,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from . import binance_network
-from v9711_live.environment import load_environment
+from v9711_live.environment import load_environment, MYSQL_DEFAULT_PASSWORD
 from .binance_futures_3m_ws import KlineRow, TableColumn, build_insert_sql
 
 
@@ -1629,7 +1629,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mysql-host", default=os.environ.get("MYSQL_HOST", DEFAULT_MYSQL_HOST))
     parser.add_argument("--mysql-port", type=int, default=int(os.environ.get("MYSQL_PORT", str(DEFAULT_MYSQL_PORT))))
     parser.add_argument("--mysql-user", default=os.environ.get("MYSQL_USER", DEFAULT_MYSQL_USER))
-    parser.add_argument("--mysql-password", default=os.environ.get("MYSQL_PASSWORD", ""))
+    parser.add_argument("--mysql-password", default=os.environ.get("MYSQL_PASSWORD", MYSQL_DEFAULT_PASSWORD))
     parser.add_argument("--mysql-database", default=os.environ.get("MYSQL_DATABASE", DEFAULT_MYSQL_DATABASE))
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--ws-base-url", default=DEFAULT_WS_BASE_URL)

@@ -29,7 +29,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from . import binance_network
-from v9711_live.environment import load_environment
+from v9711_live.environment import load_environment, MYSQL_DEFAULT_PASSWORD
 from .kline_status import write_3m_status
 
 
@@ -220,7 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mysql-host", default=env("MYSQL_HOST", DEFAULT_MYSQL_HOST))
     parser.add_argument("--mysql-port", type=int, default=int(env("MYSQL_PORT", str(DEFAULT_MYSQL_PORT))))
     parser.add_argument("--mysql-user", default=env("MYSQL_USER", DEFAULT_MYSQL_USER))
-    parser.add_argument("--mysql-password", default=env("MYSQL_PASSWORD", ""))
+    parser.add_argument("--mysql-password", default=env("MYSQL_PASSWORD", MYSQL_DEFAULT_PASSWORD))
     parser.add_argument("--mysql-database", default=env("MYSQL_DATABASE", DEFAULT_MYSQL_DATABASE))
     parser.add_argument("--symbol-column", default=env("SYMBOL_COLUMN", "symbol"))
     parser.add_argument("--symbols-file", default=env("SYMBOLS_FILE", DEFAULT_SYMBOLS_FILE),

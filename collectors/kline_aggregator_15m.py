@@ -48,7 +48,7 @@ from .kline_startup_manager import (
     upsert_3m_rows,
 )
 from .kline_status import write_15m_status
-from v9711_live.environment import load_environment
+from v9711_live.environment import load_environment, MYSQL_DEFAULT_PASSWORD
 
 
 INTERVAL_3M_MS = 3 * 60 * 1000
@@ -1195,7 +1195,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mysql-host", default=os.environ.get("MYSQL_HOST", DEFAULT_MYSQL_HOST))
     parser.add_argument("--mysql-port", type=int, default=int(os.environ.get("MYSQL_PORT", str(DEFAULT_MYSQL_PORT))))
     parser.add_argument("--mysql-user", default=os.environ.get("MYSQL_USER", DEFAULT_MYSQL_USER))
-    parser.add_argument("--mysql-password", default=os.environ.get("MYSQL_PASSWORD", ""))
+    parser.add_argument("--mysql-password", default=os.environ.get("MYSQL_PASSWORD", MYSQL_DEFAULT_PASSWORD))
     parser.add_argument("--mysql-database", default=os.environ.get("MYSQL_DATABASE", DEFAULT_MYSQL_DATABASE))
     parser.add_argument("--symbols-file", default=os.environ.get("SYMBOLS_FILE", DEFAULT_SYMBOLS_FILE),
                         help="Local strategy symbol list; default is config/symbols.txt.")

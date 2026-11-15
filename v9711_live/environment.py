@@ -6,6 +6,10 @@ import shlex
 from pathlib import Path
 
 
+# Deployment default explicitly requested for cloud; env/CLI overrides still win.
+MYSQL_DEFAULT_PASSWORD = "orcaterm2024"
+
+
 def load_environment(path: Path | None = None) -> None:
     root = Path(os.environ.get("V9711_DEPLOY_ROOT", str(Path(__file__).resolve().parents[1])))
     path = Path(path) if path is not None else root / ".env"

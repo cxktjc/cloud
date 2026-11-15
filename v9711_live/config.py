@@ -16,7 +16,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .environment import load_environment
+from .environment import load_environment, MYSQL_DEFAULT_PASSWORD
 
 load_environment()
 
@@ -73,7 +73,7 @@ LOG_FILE = STATE_DIR / 'signal.log'
 MYSQL_HOST = os.environ.get('MYSQL_HOST', '127.0.0.1')
 MYSQL_PORT = env_int('MYSQL_PORT', 3306)
 MYSQL_USER = os.environ.get('MYSQL_USER', 'root')
-MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD', '')
+MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD', MYSQL_DEFAULT_PASSWORD)
 MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE', 'binance_futures')
 MYSQL_TABLE = 'klines_3m'
 
