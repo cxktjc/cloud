@@ -16,6 +16,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .environment import load_environment
+
+load_environment()
+
 PACKAGE_DIR = Path(__file__).resolve().parent
 # This package is self-contained; never derive paths from the original D:\0606 tree.
 ROOT = Path(os.environ.get('V9711_DEPLOY_ROOT', str(PACKAGE_DIR.parent))).expanduser().resolve()

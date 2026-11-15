@@ -54,6 +54,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from . import binance_network
+from v9711_live.environment import load_environment
 from .binance_futures_3m_ws import KlineRow, TableColumn, build_insert_sql
 
 
@@ -1623,6 +1624,7 @@ async def repair_loop(args: argparse.Namespace, state: SharedState, stop_event: 
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    load_environment()
     parser = argparse.ArgumentParser(description="Hybrid startup manager for Binance futures rankings/watchlist/klines.")
     parser.add_argument("--mysql-host", default=os.environ.get("MYSQL_HOST", DEFAULT_MYSQL_HOST))
     parser.add_argument("--mysql-port", type=int, default=int(os.environ.get("MYSQL_PORT", str(DEFAULT_MYSQL_PORT))))

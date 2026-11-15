@@ -419,9 +419,21 @@ class LiveSignal:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--mysql-host', default=None)
+    parser.add_argument('--mysql-port', type=int, default=None)
+    parser.add_argument('--mysql-user', default=None)
+    parser.add_argument('--mysql-database', default=None)
+    parser.add_argument('--mysql-password', default=None,
+                        help='Override MYSQL_PASSWORD from the environment/private .env.')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
+    for option, setting in (("mysql_host", "MYSQL_HOST"), ("mysql_port", "MYSQL_PORT"),
+                            ("mysql_user", "MYSQL_USER"), ("mysql_database", "MYSQL_DATABASE"),
+                            ("mysql_password", "MYSQL_PASSWORD")):
+        value = getattr(args, option)
+        if value is not None:
+            setattr(cfg, setting, value)
     cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(cfg.LOG_FILE, encoding='utf-8')
     logging.basicConfig(

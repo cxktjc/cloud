@@ -29,6 +29,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from . import binance_network
+from v9711_live.environment import load_environment
 from .kline_status import write_3m_status
 
 
@@ -212,6 +213,7 @@ def env(name: str, default: str = "") -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    load_environment()
     parser = argparse.ArgumentParser(
         description="Subscribe Binance USD-M futures 3m klines and write to existing MySQL klines_3m table.",
     )

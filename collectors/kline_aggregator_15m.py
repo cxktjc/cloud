@@ -48,6 +48,7 @@ from .kline_startup_manager import (
     upsert_3m_rows,
 )
 from .kline_status import write_15m_status
+from v9711_live.environment import load_environment
 
 
 INTERVAL_3M_MS = 3 * 60 * 1000
@@ -1187,6 +1188,7 @@ def initialize_cursor(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    load_environment()
     parser = argparse.ArgumentParser(
         description="Schedule 3m to 15m aggregation from local MySQL data."
     )
