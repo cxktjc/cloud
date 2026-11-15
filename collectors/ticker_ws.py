@@ -32,7 +32,18 @@ LOG = logging.getLogger("v9711.ticker_ws")
 DEPLOY_ROOT = Path(os.environ.get("V9711_DEPLOY_ROOT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 DEFAULT_SYMBOLS = DEPLOY_ROOT / "config" / "symbols.txt"
 DEFAULT_OUTPUT = DEPLOY_ROOT / "var" / "binance_ticker_price" / "latest.json"
-WS_BASE = "wss://fstream.binance.com/stream"
+WS_BASE = "wss://fstream.binance.com/market/stream"
+DEFAULT_WS_BASES = (WS_BASE, "wss://fstream.binance.com/public/stream", "wss://fstream.binance.com/stream")
+FIRST_DATA_TIMEOUT = 15.0
+MAX_SILENCE_SECONDS = 30.0
+
+
+def endpoint_candidates(base: str) -> tuple[str, ...]:
+    """Try alternatives only for Binance production paths, not custom hosts."""
+    if base in DEFAULT_WS_BASES:
+        return (base,) + tuple(value for value in DEFAULT_WS_BASES if value != base)
+    return (base,)
+
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -89,6 +100,8 @@ class SnapshotState:
         self.total_groups = max(1, int(total_groups))
         self.ready_groups: set[int] = set()
         self.group_errors: dict[int, str] = {}
+        self.group_received_mono: dict[int, float] = {}
+        self.group_received_epoch: dict[int, float] = {}
         self.prices: dict[str, dict[str, Any]] = {}
         self.dirty = False
         self.sequence = 0
@@ -99,23 +112,24 @@ class SnapshotState:
         self.started = time.time()
         self._write("starting", error="")
 
-    def update(self, symbol: str, price: str, exchange_time_ms: int) -> None:
+    def update(self, symbol: str, price: str, exchange_time_ms: int) -> bool:
         symbol = symbol.upper()
         if symbol not in self.allowed:
-            return
+            return False
         try:
             number = float(price)
             stamp = int(exchange_time_ms)
         except (TypeError, ValueError):
-            return
+            return False
         if not math.isfinite(number) or number <= 0 or stamp <= 0:
-            return
+            return False
         previous = self.prices.get(symbol)
         row = {"price": str(price), "exchange_time_ms": stamp}
         if previous == row:
-            return
+            return True
         self.prices[symbol] = row
         self.dirty = True
+        return True
 
     def _write(self, status: str, *, error: str = "") -> None:
         now = time.time()
@@ -123,8 +137,10 @@ class SnapshotState:
         if status == "ok":
             self.last_error = ""
             self.sequence += 1
-            self.last_publish = now
-            self.last_publish_mono = self.last_write_mono
+            # A file heartbeat is not a market-data receipt. Use the oldest
+            # group's actual accepted message time; silence cannot renew TTL.
+            self.last_publish = min(self.group_received_epoch.values())
+            self.last_publish_mono = min(self.group_received_mono.values())
         payload = {
             "schema_version": 1,
             "source": "binance_futures_aggtrade_ws",
@@ -139,12 +155,25 @@ class SnapshotState:
             "error": error,
             "count": len(self.prices),
             "prices": dict(self.prices),
+            "groups_ready": len(self.ready_groups),
+            "groups_total": self.total_groups,
+            "group_errors": dict(self.group_errors),
         }
         atomic_json(self.output, payload)
 
     def group_connected(self, group_index: int) -> None:
-        self.ready_groups.add(int(group_index))
-        self.group_errors.pop(int(group_index), None)
+        # Transport handshake alone does not establish data readiness.
+        self.ready_groups.discard(int(group_index))
+        self.group_received_mono.pop(int(group_index), None)
+        self.group_received_epoch.pop(int(group_index), None)
+        self.dirty = True
+
+    def group_received(self, group_index: int) -> None:
+        group_index = int(group_index)
+        self.ready_groups.add(group_index)
+        self.group_errors.pop(group_index, None)
+        self.group_received_mono[group_index] = time.monotonic()
+        self.group_received_epoch[group_index] = time.time()
         self.dirty = True
 
     def group_failed(self, group_index: int, message: str) -> None:
@@ -160,6 +189,9 @@ class SnapshotState:
         if not self.prices:
             return "starting"
         if len(self.ready_groups) < self.total_groups or self.group_errors:
+            return "error"
+        if any(time.monotonic() - receipt > MAX_SILENCE_SECONDS
+               for receipt in self.group_received_mono.values()):
             return "error"
         return "ok"
 
@@ -179,47 +211,80 @@ async def consume_group(
     stop: asyncio.Event, group_index: int,
 ) -> None:
     retry = 1.0
+    endpoints = endpoint_candidates(base)
+    endpoint_index = 0
+    allowed = set(group)
     while not stop.is_set():
         started = time.monotonic()
+        selected_base = endpoints[endpoint_index % len(endpoints)]
+        received = False
         try:
-            url = stream_url(group, base)
-            LOG.info("ticker group=%s connecting symbols=%s", group_index, len(group))
+            url = stream_url(group, selected_base)
+            LOG.info("ticker group=%s connecting symbols=%s endpoint=%s", group_index, len(group), selected_base)
             async with websockets.connect(
-                url,
-                ping_interval=ping_interval,
-                ping_timeout=ping_timeout,
-                close_timeout=10,
+                url, ping_interval=ping_interval, ping_timeout=ping_timeout,
+                open_timeout=15, close_timeout=3, max_queue=4096, compression=None,
                 **binance_network.websocket_connect_kwargs(),
             ) as socket:
                 state.group_connected(group_index)
-                retry = 1.0
+                LOG.info("ticker group=%s handshake complete; waiting for first valid aggTrade endpoint=%s",
+                         group_index, selected_base)
+                connected_at = time.monotonic()
+                last_data_at = connected_at
+                valid_count = 0
+                raw_count = 0
                 while not stop.is_set():
-                    if time.monotonic() - started >= reconnect_before:
-                        LOG.info("ticker group=%s reconnecting before connection limit", group_index)
+                    now_mono = time.monotonic()
+                    if now_mono - connected_at >= reconnect_before:
                         state.group_failed(group_index, "scheduled reconnect")
                         break
+                    deadline = (last_data_at + min(read_timeout, MAX_SILENCE_SECONDS)
+                                if received else connected_at + FIRST_DATA_TIMEOUT)
+                    remaining = deadline - now_mono
+                    if remaining <= 0:
+                        raise TimeoutError(f"no valid aggTrade; received_messages={raw_count} valid={valid_count}")
                     try:
-                        raw = await asyncio.wait_for(socket.recv(), timeout=read_timeout)
+                        raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
                     except asyncio.TimeoutError as exc:
-                        raise TimeoutError(f"no ticker message for {read_timeout}s") from exc
+                        raise TimeoutError(
+                            f"no valid aggTrade; endpoint={selected_base} received_messages={raw_count} "
+                            f"valid={valid_count} waiting_for={'next_data' if received else 'first_data'}") from exc
+                    raw_count += 1
                     message = json.loads(raw)
+                    if not isinstance(message, dict):
+                        raise ValueError("expected JSON object from combined stream")
                     data = message.get("data", message)
-                    if data.get("e") != "aggTrade":
+                    if "code" in message:
+                        raise ValueError(f"subscription error code={message.get('code')} msg={str(message.get('msg'))[:200]}")
+                    if not isinstance(data, dict) or data.get("e") != "aggTrade":
+                        if raw_count == 1:
+                            LOG.warning("ticker group=%s unexpected first message keys=%s", group_index, list(message)[:8])
                         continue
-                    state.update(str(data.get("s", "")), str(data.get("p", "")), int(data.get("T", data.get("E", 0))))
+                    symbol = str(data.get("s", "")).upper()
+                    stamp = int(data.get("T", data.get("E", 0)))
+                    if symbol not in allowed or not -5 <= time.time() - stamp / 1000 <= 60:
+                        continue
+                    if not state.update(symbol, str(data.get("p", "")), stamp):
+                        continue
+                    state.group_received(group_index)
+                    last_data_at = time.monotonic()
+                    valid_count += 1
+                    if not received:
+                        received = True
+                        retry = 1.0
+                        LOG.info("ticker group=%s DATA READY endpoint=%s first_symbol=%s latency=%.3fs",
+                                 group_index, selected_base, symbol, last_data_at - started)
         except asyncio.CancelledError:
+            state.group_failed(group_index, "collector stopped")
             raise
-        except (ConnectionClosed, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
-            detail = f"{type(exc).__name__}: {exc}"[:500]
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"[:700]
             LOG.warning("ticker group=%s disconnected retry=%.1fs error=%s", group_index, retry, detail)
             state.group_failed(group_index, detail)
+            if not received:
+                endpoint_index += 1
             await asyncio.sleep(retry)
-            retry = min(retry * 2.0, 60.0)
-        except Exception as exc:
-            LOG.exception("ticker group=%s unexpected error", group_index)
-            state.group_failed(group_index, f"{type(exc).__name__}: {exc}")
-            await asyncio.sleep(retry)
-            retry = min(retry * 2.0, 60.0)
+            retry = min(retry * 2.0, 30.0)
 
 
 async def publish_loop(state: SnapshotState, interval: float, stop: asyncio.Event) -> None:
@@ -273,7 +338,7 @@ def main() -> int:
     parser.add_argument("--heartbeat", type=float, default=float(os.environ.get("TICKER_HEARTBEAT", "5")))
     parser.add_argument("--ping-interval", type=float, default=float(os.environ.get("TICKER_PING_INTERVAL", "30")))
     parser.add_argument("--ping-timeout", type=float, default=float(os.environ.get("TICKER_PING_TIMEOUT", "20")))
-    parser.add_argument("--read-timeout", type=float, default=float(os.environ.get("TICKER_READ_TIMEOUT", "300")))
+    parser.add_argument("--read-timeout", type=float, default=float(os.environ.get("TICKER_READ_TIMEOUT", "30")))
     parser.add_argument("--reconnect-before", type=float, default=float(os.environ.get("TICKER_RECONNECT_BEFORE", str(23 * 3600))))
     parser.add_argument("--max-symbols", type=int, default=int(os.environ.get("TICKER_MAX_SYMBOLS", "1024")))
     args = parser.parse_args()

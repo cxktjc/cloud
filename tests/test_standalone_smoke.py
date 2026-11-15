@@ -31,6 +31,7 @@ class StandaloneSmokeTests(unittest.TestCase):
             state = SnapshotState(["ABCUSDT"], path, heartbeat=5, total_groups=1)
             state.group_connected(1)
             state.update("ABCUSDT", "1.2300", 1_700_000_000_000)
+            state.group_received(1)
             self.assertTrue(state.publish_if_due())
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "ok")
