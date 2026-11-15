@@ -25,7 +25,8 @@ class StandaloneSmokeTests(unittest.TestCase):
     def test_ws_snapshot_matches_signal_reader_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "latest.json"
-            state = SnapshotState(["ABCUSDT"], path, heartbeat=5)
+            state = SnapshotState(["ABCUSDT"], path, heartbeat=5, total_groups=1)
+            state.group_connected(1)
             state.update("ABCUSDT", "1.2300", 1_700_000_000_000)
             self.assertTrue(state.publish_if_due())
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -34,6 +35,18 @@ class StandaloneSmokeTests(unittest.TestCase):
             snapshot = reader.read()
             self.assertIsNotNone(snapshot)
             self.assertAlmostEqual(snapshot.prices["ABCUSDT"].price, 1.23)
+
+    def test_partial_ws_group_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "latest.json"
+            state = SnapshotState(["AUSDT", "BUSDT"], path, heartbeat=5, total_groups=2)
+            state.group_connected(1)
+            state.group_connected(2)
+            state.update("AUSDT", "1", 1_700_000_000_000)
+            state.update("BUSDT", "2", 1_700_000_000_000)
+            state.group_failed(2, "test disconnect")
+            self.assertFalse(state.publish_if_due())
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "error")
 
     def test_local_symbol_file_is_nonempty(self):
         symbols = [line.strip() for line in cfg.SYMBOLS_FILE.read_text(encoding="utf-8").splitlines()

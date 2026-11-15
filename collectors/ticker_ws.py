@@ -81,16 +81,20 @@ def stream_url(symbols: list[str], base: str) -> str:
 
 
 class SnapshotState:
-    def __init__(self, symbols: list[str], output: Path, heartbeat: float) -> None:
+    def __init__(self, symbols: list[str], output: Path, heartbeat: float, total_groups: int) -> None:
         self.symbols = tuple(symbols)
         self.allowed = set(symbols)
         self.output = output
         self.heartbeat = max(0.2, float(heartbeat))
+        self.total_groups = max(1, int(total_groups))
+        self.ready_groups: set[int] = set()
+        self.group_errors: dict[int, str] = {}
         self.prices: dict[str, dict[str, Any]] = {}
         self.dirty = False
         self.sequence = 0
         self.last_publish = 0.0
         self.last_publish_mono = 0.0
+        self.last_write_mono = 0.0
         self.last_error = ""
         self.started = time.time()
         self._write("starting", error="")
@@ -115,11 +119,12 @@ class SnapshotState:
 
     def _write(self, status: str, *, error: str = "") -> None:
         now = time.time()
+        self.last_write_mono = time.monotonic()
         if status == "ok":
             self.last_error = ""
             self.sequence += 1
             self.last_publish = now
-            self.last_publish_mono = time.monotonic()
+            self.last_publish_mono = self.last_write_mono
         payload = {
             "schema_version": 1,
             "source": "binance_futures_aggtrade_ws",
@@ -137,21 +142,35 @@ class SnapshotState:
         }
         atomic_json(self.output, payload)
 
-    def publish_if_due(self, force: bool = False) -> bool:
-        now = time.monotonic()
-        if not force and not self.dirty and now - self.last_publish_mono < self.heartbeat:
-            return False
-        status = "ok" if self.prices else "starting"
-        self._write(status, error=self.last_error)
-        self.dirty = False
-        return status == "ok"
+    def group_connected(self, group_index: int) -> None:
+        self.ready_groups.add(int(group_index))
+        self.group_errors.pop(int(group_index), None)
+        self.dirty = True
 
-    def error(self, message: str) -> None:
-        self.last_error = str(message)[:500]
+    def group_failed(self, group_index: int, message: str) -> None:
+        self.ready_groups.discard(int(group_index))
+        self.group_errors[int(group_index)] = str(message)[:500]
+        self.last_error = self.group_errors[int(group_index)]
         try:
             self._write("error", error=self.last_error)
         except OSError:
             LOG.exception("failed to publish ticker error state")
+
+    def _current_status(self) -> str:
+        if not self.prices:
+            return "starting"
+        if len(self.ready_groups) < self.total_groups or self.group_errors:
+            return "error"
+        return "ok"
+
+    def publish_if_due(self, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and not self.dirty and now - self.last_write_mono < self.heartbeat:
+            return False
+        status = self._current_status()
+        self._write(status, error=self.last_error)
+        self.dirty = False
+        return status == "ok"
 
 
 async def consume_group(
@@ -172,10 +191,12 @@ async def consume_group(
                 close_timeout=10,
                 **binance_proxy.websocket_connect_kwargs(),
             ) as socket:
+                state.group_connected(group_index)
                 retry = 1.0
                 while not stop.is_set():
                     if time.monotonic() - started >= reconnect_before:
                         LOG.info("ticker group=%s reconnecting before connection limit", group_index)
+                        state.group_failed(group_index, "scheduled reconnect")
                         break
                     try:
                         raw = await asyncio.wait_for(socket.recv(), timeout=read_timeout)
@@ -191,12 +212,12 @@ async def consume_group(
         except (ConnectionClosed, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
             detail = f"{type(exc).__name__}: {exc}"[:500]
             LOG.warning("ticker group=%s disconnected retry=%.1fs error=%s", group_index, retry, detail)
-            state.error(detail)
+            state.group_failed(group_index, detail)
             await asyncio.sleep(retry)
             retry = min(retry * 2.0, 60.0)
         except Exception as exc:
             LOG.exception("ticker group=%s unexpected error", group_index)
-            state.error(f"{type(exc).__name__}: {exc}")
+            state.group_failed(group_index, f"{type(exc).__name__}: {exc}")
             await asyncio.sleep(retry)
             retry = min(retry * 2.0, 60.0)
 
@@ -216,7 +237,7 @@ async def run(args: argparse.Namespace) -> int:
     symbols = load_symbols(args.symbols_file)
     if args.max_symbols and len(symbols) > args.max_symbols:
         raise RuntimeError(f"symbols file has {len(symbols)} symbols, exceeds --max-symbols={args.max_symbols}")
-    state = SnapshotState(symbols, args.output, args.heartbeat)
+    state = SnapshotState(symbols, args.output, args.heartbeat, total_groups=math.ceil(len(symbols) / max(1, int(args.streams_per_connection))))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
