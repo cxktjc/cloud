@@ -1,0 +1,16 @@
+[Unit]
+Description=v9711 3m to 15m aggregator (one-day window)
+After=v9711-3m.service
+Requires=v9711-3m.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/v9711-live
+EnvironmentFile=/opt/v9711-live/.env
+ExecStart=/opt/v9711-live/.venv/bin/python -m collectors.kline_aggregator_15m --symbols-file /opt/v9711-live/config/symbols.txt --retention-hours 24 --startup-check-windows 96 --trigger-file /opt/v9711-live/var/kline_aggregator_15m.trigger
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

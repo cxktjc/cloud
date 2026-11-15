@@ -1,0 +1,16 @@
+[Unit]
+Description=v9711 signal process
+After=v9711-ticker.service v9711-3m.service
+Requires=v9711-ticker.service v9711-3m.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/v9711-live
+EnvironmentFile=/opt/v9711-live/.env
+ExecStart=/opt/v9711-live/.venv/bin/python -m v9711_live.run_signal
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

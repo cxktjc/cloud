@@ -1,0 +1,17 @@
+[Unit]
+Description=v9711 live trade executor
+After=v9711-signal.service v9711-account.service v9711-ticker.service
+Requires=v9711-signal.service v9711-account.service v9711-ticker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/v9711-live
+EnvironmentFile=/opt/v9711-live/.env
+# Do not enable this unit until signal/account/price checks pass.
+ExecStart=/opt/v9711-live/.venv/bin/python -m v9711_live.execution.runner --enable-live --no-dry-run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

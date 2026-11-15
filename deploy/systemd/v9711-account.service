@@ -1,0 +1,16 @@
+[Unit]
+Description=v9711 Binance account event stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/v9711-live
+EnvironmentFile=/opt/v9711-live/.env
+ExecStart=/opt/v9711-live/.venv/bin/python -m collectors.binance_account_stream --output-dir /opt/v9711-live/var/binance_account_stream --env-file /opt/v9711-live/.env
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
