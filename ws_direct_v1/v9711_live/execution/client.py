@@ -180,7 +180,7 @@ class ExchangeClient(BatchEntryMixin):
         return self._broker
 
     def _ready_broker(self) -> Any:
-        """Reconnect before I/O after transport failure/long idle, never resend."""
+        """Reuse healthy sockets; managed brokers recover in the background, never replay."""
         now_mono = time.monotonic()
         if now_mono < self._broker_rate_limit_until_mono:
             raise ConnectionError('trade broker rate limit cooldown; no request sent')
@@ -190,8 +190,12 @@ class ExchangeClient(BatchEntryMixin):
             self._broker_last_io_mono = now_mono
             self._broker_reconnect_needed = False
             self._broker_reconnect_after_mono = 0.0
-        idle = now_mono - self._broker_last_io_mono >= cfg.ORDER_WS_IDLE_RECONNECT_SECONDS
-        if self._broker_reconnect_needed or idle:
+        if getattr(type(broker), 'MANAGES_WS_LIFECYCLE', False) is True:
+            # The core protects send/ACK and background reconnect with one lock.
+            # Never force-close a connection its supervisor already recovered.
+            self._broker_reconnect_needed = False
+            return broker
+        if self._broker_reconnect_needed:
             if now_mono < self._broker_reconnect_after_mono:
                 raise ConnectionError('trade WS reconnect cooldown; no request sent')
             try:
@@ -200,7 +204,7 @@ class ExchangeClient(BatchEntryMixin):
                 self._broker_reconnect_needed = True
                 self._broker_reconnect_after_mono = time.monotonic() + cfg.ORDER_WS_RECONNECT_RETRY_SECONDS
                 raise
-            LOG.info('trade WS reconnected reason=%s', 'transport_error' if self._broker_reconnect_needed else 'idle')
+            LOG.info('trade WS reconnected reason=transport_error')
             self._broker_reconnect_needed = False
             self._broker_reconnect_after_mono = 0.0
             self._broker_last_io_mono = time.monotonic()
@@ -269,7 +273,12 @@ class ExchangeClient(BatchEntryMixin):
         if before_send is not None:
             before_send()  # A reconnect may have consumed the last seconds of a bar.
         try:
-            # BinanceWSBroker.place_order auto-resends MARKET SELL through REST
+            checked = getattr(type(broker), 'place_order_checked', None)
+            if method == 'place_order' and callable(checked):
+                # The guard runs again INSIDE the socket lock after reconnect;
+                # UNKNOWN responses never trigger an automatic REST resend.
+                return broker.place_order_checked(*args, before_send=before_send, **kwargs)
+            # Legacy/injected BinanceWSBroker.place_order may resend MARKET SELL through REST
             # after any WS exception. A close must NOT be resubmitted before
             # resolving its exact fate (a market order may already be filled).
             # Use the same broker's WS coroutine directly for close submissions;

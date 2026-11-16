@@ -3,8 +3,8 @@
 WebSocket-first Binance USD-M Futures broker.
 
 Trading/account requests are sent through Binance's WebSocket API first.
-Critical close/reconciliation paths have REST fallbacks so a transient WS
-disconnect does not leave a planned FLAT state stuck in the account. API keys
+Transport recovery never replays uncertain order submissions. The executor
+retains exact identities and reconciles them from account/query evidence. API keys
 are loaded from .env or the environment:
 
   BINANCE_API_KEY=...
@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import hashlib
 import hmac
 import json
 import logging
 import os
-import ssl
 import sys
 import threading
 import time
@@ -39,9 +39,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request
 
-import websockets
-
 from . import binance_network
+from .trade_ws_lifecycle import TradeWSLifecycle
 
 
 REST_BASE_URL = "https://fapi.binance.com"
@@ -55,7 +54,6 @@ RECV_WINDOW = 5000
 # heavier exchangeInfo download (~1.5 MB) gets its own longer timeout in
 # trade_runner.
 REQUEST_TIMEOUT = 5
-RECONNECT_BEFORE_SECONDS = 23 * 60 * 60
 DEFAULT_TARGET_LEVERAGE = 2
 
 
@@ -359,7 +357,7 @@ def rest_place_order_batch(
             for row in result]
 
 
-class BinanceFuturesTradeWS:
+class BinanceFuturesTradeWS(TradeWSLifecycle):
     def __init__(
         self,
         api_key: str,
@@ -380,9 +378,8 @@ class BinanceFuturesTradeWS:
         self.recv_window = recv_window
         self.request_timeout = request_timeout
         self.ssl_verify = ssl_verify
-        self._ws = None
-        self._connected_at = 0.0
         self._lock = asyncio.Lock()
+        self._init_lifecycle()
 
     async def __aenter__(self) -> "BinanceFuturesTradeWS":
         await self.connect()
@@ -391,81 +388,41 @@ class BinanceFuturesTradeWS:
     async def __aexit__(self, *_exc: object) -> None:
         await self.close()
 
-    async def connect(self) -> None:
-        await self.close()
-        connect_kwargs: dict[str, Any] = {
-            "ping_interval": None,
-            "close_timeout": 10,
-            "max_queue": 1024,
-        }
-        if self.ws_url.startswith("wss://") and not self.ssl_verify:
-            connect_kwargs["ssl"] = ssl._create_unverified_context()
-        connect_kwargs.update(binance_network.websocket_connect_kwargs())
-        self._ws = await websockets.connect(self.ws_url, **connect_kwargs)
-        self._connected_at = time.monotonic()
-
-    async def close(self) -> None:
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-        self._ws = None
-
-    async def _ensure_connected(self) -> None:
-        if self._ws is None:
-            await self.connect()
-            return
-        if time.monotonic() - self._connected_at > RECONNECT_BEFORE_SECONDS:
-            await self.connect()
-
-    async def _call(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        params = dict(params or {})
-        params["apiKey"] = self.api_key
-        params["timestamp"] = int(time.time() * 1000)
-        params["recvWindow"] = self.recv_window
-        params = {k: _normalize_param_value(v) for k, v in params.items() if v is not None}
-        params["signature"] = _ws_sign(params, self.api_secret)
-
-        request_id = str(uuid.uuid4())
-        payload = {"id": request_id, "method": method, "params": params}
-
+    async def _request(self, method, params, *, signed, before_send=None):
         async with self._lock:
             await self._ensure_connected()
+            # Revalidate AFTER a reconnect/lock wait and BEFORE signing/sending.
+            # An expired or withdrawn plan must not be sent from the old queue.
+            if before_send is not None:
+                before_send()
+            request_params = {k:_normalize_param_value(v) for k,v in dict(params or {}).items() if v is not None}
+            request_params.setdefault('apiKey', self.api_key)
+            if signed:
+                request_params['apiKey'] = self.api_key
+                request_params['timestamp'] = int(time.time()*1000)
+                request_params['recvWindow'] = self.recv_window
+                request_params['signature'] = _ws_sign(request_params, self.api_secret)
+            request_id = str(uuid.uuid4())
+            payload = dict(id=request_id, method=method, params=request_params)
             try:
-                await self._ws.send(json.dumps(payload, separators=(",", ":")))
+                await self._ws.send(json.dumps(payload, separators=(',', ':')))
                 response = await asyncio.wait_for(self._read_response(request_id), timeout=self.request_timeout)
-            except Exception:
-                await self.close()
+            except (Exception, asyncio.CancelledError):
+                # Sending may already have succeeded. Recover the CONNECTION
+                # only; exact intent/query/stream reconciliation resolves fate.
+                await self._invalidate_locked()
                 raise
-
-        status = int(response.get("status", 0))
+        status = int(response.get('status', 0))
         if status not in (200, 201, 204):
-            error = response.get("error") or {}
-            raise APIError(int(error.get("code", -1)), str(error.get("msg", f"WS status={status}")))
-        return response.get("result", {})
+            error = response.get('error') or {}
+            raise APIError(int(error.get('code', -1)), str(error.get('msg', f'WS status={status}')))
+        return response.get('result', {})
+
+    async def _call(self, method: str, params: dict[str, Any] | None = None, *, before_send=None) -> Any:
+        return await self._request(method, params, signed=True, before_send=before_send)
 
     async def _call_api_key_only(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        request_params = {k: _normalize_param_value(v) for k, v in dict(params or {}).items() if v is not None}
-        request_params.setdefault("apiKey", self.api_key)
-
-        request_id = str(uuid.uuid4())
-        payload = {"id": request_id, "method": method, "params": request_params}
-
-        async with self._lock:
-            await self._ensure_connected()
-            try:
-                await self._ws.send(json.dumps(payload, separators=(",", ":")))
-                response = await asyncio.wait_for(self._read_response(request_id), timeout=self.request_timeout)
-            except Exception:
-                await self.close()
-                raise
-
-        status = int(response.get("status", 0))
-        if status not in (200, 201, 204):
-            error = response.get("error") or {}
-            raise APIError(int(error.get("code", -1)), str(error.get("msg", f"WS status={status}")))
-        return response.get("result", {})
+        return await self._request(method, params, signed=False)
 
     async def _read_response(self, request_id: str) -> dict[str, Any]:
         while True:
@@ -581,6 +538,7 @@ class BinanceFuturesTradeWS:
         position_side: str | None = None,
         price_match: str | None = None,
         client_order_id: str | None = None,
+        before_send: Any = None,
     ) -> dict[str, Any]:
         """下单。price 与 price_match 互斥。
 
@@ -621,7 +579,7 @@ class BinanceFuturesTradeWS:
         if self.dry_run:
             print(c(f"  [DRY-RUN/WS] order.place params={params}", YEL))
             return {"_source": "WS"}
-        result = await self._call("order.place", params)
+        result = await self._call("order.place", params, before_send=before_send)
         return mark_order_source(result if isinstance(result, dict) else {}, "WS")
 
     async def place_stop_market_order(
@@ -695,6 +653,7 @@ class BinanceWSBroker:
     """
 
     CONNECT_TIMEOUT = 5
+    MANAGES_WS_LIFECYCLE = True
 
     def __init__(
         self,
@@ -728,7 +687,17 @@ class BinanceWSBroker:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            # Cancel the keepalive supervisor and any timed-out request task
+            # before releasing the loop/thread; no zombie coroutine may send.
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._loop.close()
 
     async def _create_broker(self) -> BinanceFuturesTradeWS:
         broker = BinanceFuturesTradeWS(
@@ -745,7 +714,11 @@ class BinanceWSBroker:
 
     def _run(self, coro: Any, timeout: int | None = None) -> Any:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout or self.request_timeout + 10)
+        try:
+            return future.result(timeout=timeout or self.request_timeout + 10)
+        except FutureTimeoutError:
+            future.cancel()  # Never allow a timed-out queued coroutine to send later.
+            raise
 
     def close(self) -> None:
         try:
@@ -763,6 +736,10 @@ class BinanceWSBroker:
         if not self._loop.is_running():
             raise ConnectionError("broker event loop is not running")
         self._run(self._broker.connect(), timeout=self.CONNECT_TIMEOUT)
+
+    def place_order_checked(self, *args, before_send=None, **kwargs):
+        """Exact submission ONCE; no transport-error REST replay."""
+        return self._run(self._broker.place_order(*args, before_send=before_send, **kwargs))
 
     @property
     def hedge_mode(self) -> bool:
@@ -836,45 +813,10 @@ class BinanceWSBroker:
         price_match: str | None = None,
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
-        try:
-            return self._run(
-                self._broker.place_order(
-                    symbol,
-                    side,
-                    quantity,
-                    price=price,
-                    reduce_only=reduce_only,
-                    position_side=position_side,
-                    price_match=price_match,
-                    client_order_id=client_order_id,
-                )
-            )
-        except Exception as exc:
-            is_market_close = (
-                price is None
-                and price_match is None
-                and str(side).upper() == "SELL"
-                and (reduce_only or (position_side or "").upper() == "LONG")
-            )
-            if not is_market_close or self.dry_run:
-                raise
-            logging.getLogger(__name__).warning(
-                "WS close order failed for %s; using REST fallback: %s",
-                symbol,
-                exc,
-            )
-            return _rest_place_market_order(
-                self.api_key,
-                self.api_secret,
-                recv_window=self.recv_window,
-                symbol=symbol,
-                side=side,
-                quantity=quantity,
-                reduce_only=reduce_only,
-                position_side=position_side,
-                client_order_id=client_order_id,
-                request_timeout=self.request_timeout,
-            )
+        # A lost ACK may mean FILLED. Never blindly replay MARKET SELL via REST.
+        return self.place_order_checked(symbol, side, quantity, price=price,
+            reduce_only=reduce_only, position_side=position_side,
+            price_match=price_match, client_order_id=client_order_id)
 
     def place_stop_market_order(
         self,

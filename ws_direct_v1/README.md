@@ -310,3 +310,35 @@ deleted. Legacy executors remain locked while the new live trader is running.
 If application was interrupted, trade startup is blocked: rerun the same manual
 apply command to finish the frozen transaction. Do not delete the pending journal
 or ledgers. Changed/conflicting files stop recovery rather than being discarded.
+
+### Trading WebSocket keepalive and disconnect recovery
+
+Only WS-DIRECT's trade request transport is changed; signal, account and market
+collectors are separate and unchanged. An established trading WS stays open when
+there are no orders. Protocol Ping every 20s and Pong timeout 10s keep it alive
+and detect failed links; the old 30s idle-triggered reconnect is removed. The old
+V9711_LIVE_WS_IDLE_RECONNECT_SECONDS environment value no longer controls it.
+Keepalive does not send trading/account API requests and does not log per ping.
+
+A supervisor on each existing broker's own event loop checks connections in the
+background. Real disconnects recover without waiting for the next order, with
+1..30s bounded backoff on connection failures. Healthy sessions rotate after 23h.
+Socket replacement shares the request lock, so routine recovery/rotation never
+cuts across a still-running send/ACK receive. Other trade network lanes and the
+signal/decision owner do not wait for this lane's reconnect.
+
+The supervisor reconnects ONLY the transport. It never clears ledger entries,
+forgets positions or resends orders. Exact intents and pending slots are already
+persisted before network submission. If a send may have reached Binance but its
+response is lost, the identity remains UNKNOWN across reconnect/restart and is
+resolved via the existing account-stream/exact-query path. In particular, MARKET
+SELL is not blindly replayed through a REST fallback. Canceled entry plans and
+bar expiry are checked again at the actual WS send after any reconnect wait.
+Timed-out synchronous calls cancel their queued async task, preventing late
+post-timeout submissions. New orders cannot be guaranteed during a real outage;
+the safety guarantee is retained identity/accounting, not uninterrupted fills.
+
+Update with git pull --ff-only and restart ONLY the WS-DIRECT trade using its
+ordinary --enable-live --no-dry-run command. Keep the ledgers; do NOT use the
+manual signal-ledger sync flag for this upgrade. No signal/account/market restart
+is required for this transport-only fix.
