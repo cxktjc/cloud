@@ -1,0 +1,16 @@
+[Unit]
+Description=v9711 WS-direct v2 50/30/20 trade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/v9711-live/cloud/ws_direct_v2
+EnvironmentFile=/opt/v9711-live/cloud/ws_direct_v2/.env
+ExecStart=/opt/v9711-live/cloud/.venv/bin/python -B -u -m v9711_live.execution.runner --enable-live --no-dry-run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

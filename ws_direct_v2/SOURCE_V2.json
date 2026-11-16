@@ -1,0 +1,15 @@
+{
+  "version": "v9711_ws_direct_v2_503020",
+  "v1_git_commit": "bf4754052e8381d74ce58f9002a1d925cb8a8a97",
+  "v1_hash_manifest": "V1_BASELINE.json",
+  "v1_files_verified": 88,
+  "strategy_reference": "D:\\0606\\deliverables\\v20106_independent_long_short_20261028\\e802_config_c_mysql_20261112\\baseline_503020_stop25_20261116",
+  "strategy_reference_sha256": {
+    "run.py": "9ec2a2ab95af76ecce0085c48be490eb5bebbafddba61fdff743dbf699b7aa64",
+    "lib\\config_c_hard_stop_v10.py": "30bbf28fed028c889e0b177aa98ef48c7c48d92115baf7765288f1567af6d09a"
+  },
+  "scope": "v1 engineering port with actual-position-count 50/30/20 sizing and native isolated books; preserves v1 exits, no added 25% stop",
+  "verification_date_utc": "2026-11-16",
+  "test_count": 203,
+  "syntax_file_count": 74
+}
