@@ -76,3 +76,14 @@ reuse, source/destination conflict, active legacy lock, incomplete ledger, paper
 exclusion, simulated identity and dry-run rejection, recognized interrupted copy
 recovery, foreign journal preservation and refusal to treat a signal book as
 proof of exchange ownership. No server login, account query or real trade ran.
+
+## 2026-11-16 dry-run display snapshot correction
+
+Feedback mode is not durable order evidence. A stale dry_run feedback no longer
+blocks a real/native execution ledger. Pure simulated native execution history
+is fully backed up under var/state/execution_backups before switching to real
+legacy execution state, or an empty live execution book when only confirmed
+simulated identities exist. Signal state is untouched. Mixed real/unknown and
+simulated histories are never reset. Interrupted switches resume only after
+backup/manifest, legacy hashes and current file bytes validate. Later real
+changes are never overwritten. 114 local tests passed; no live orders ran.

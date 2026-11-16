@@ -204,3 +204,13 @@ lease checks, incremental/full selector parity, precision, liquidation/UNKNOWN
 recovery, safe migration and original model/policy source hashes. No live orders
 or production state are touched by these tests. Server/network latency and live
 exchange acceptance still require separate supervised validation.
+
+### Switching after a previous dry-run
+
+A dry_run feedback snapshot alone does not invalidate durable real orders.
+Pure simulated execution files in var/state are backed up automatically under
+var/state/execution_backups before starting a real execution book or importing
+a real legacy book. This never moves/resets signal_portfolio.json. Actual
+orders, owned positions, unknown client identities or mixed real/simulated
+history are not erased. The backup location is printed at startup. No manual
+file removal or migration marker editing is required.

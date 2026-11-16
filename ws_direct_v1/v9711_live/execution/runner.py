@@ -1012,6 +1012,9 @@ def main() -> int:
                 receipt = prepare_live_state(cfg.STATE_DIR, legacy_locations(cfg.ROOT), leases)
                 LOG.info('live execution ledger ready mode=%s source=%s destination=%s; signal ledger untouched',
                          receipt.get('mode', 'previous_migration'), receipt.get('source'), cfg.STATE_DIR)
+                if receipt.get('backup'):
+                    LOG.warning('prior simulated/empty execution files backed up at %s; signal ledger unchanged',
+                                receipt['backup'])
             from .ws_direct import DirectTrade
             return DirectTrade(once=args.once, enabled=enabled,
                                dry_run=dry_run).run()

@@ -95,11 +95,12 @@ class StartupStateTests(unittest.TestCase):
                 prepare_live_state(self.dest,[self.source],leases)
         self.assertFalse((self.dest/FILES[0]).exists())
 
-    def test_dry_run_feedback_is_never_imported(self):
+    def test_stale_dry_run_feedback_does_not_discard_real_ledger(self):
         (self.source/'execution_feedback.json').write_text('{"mode":"dry_run"}')
         with ExitStack() as leases:
-            with self.assertRaisesRegex(RuntimeError,'dry-run execution'):
-                prepare_live_state(self.dest,[self.source],leases)
+            result=prepare_live_state(self.dest,[self.source],leases)
+        self.assertTrue(result['completed'])
+        self.assertEqual((self.dest/FILES[1]).read_bytes(),(self.source/FILES[1]).read_bytes())
 
     def test_interrupted_own_journal_resumes_matching_bytes(self):
         from v9711_live.execution import startup_state as startup
@@ -147,5 +148,132 @@ class StartupStateTests(unittest.TestCase):
                 return Mock(run=Mock(return_value=0))
             stack.enter_context(patch.object(ws_direct,'DirectTrade',side_effect=construct))
             self.assertEqual(runner.main(),0)
+
+    def simulated_pair(self, directory):
+        entry={'client_order_id':'paper-entry','order_id':'sim-123','kind':'entry'}
+        (directory/FILES[0]).write_text(json.dumps({'intents':{'c:paper-entry':dict(entry)}}))
+        (directory/FILES[1]).write_text(json.dumps({'state':{'tracked_orders':{'SHELLUSDT':dict(entry)},
+            'owned_positions':{},'realized_balance':15}}))
+        (directory/'execution_feedback.json').write_text('{"mode":"dry_run"}')
+        return {name:(directory/name).read_bytes() for name in (*FILES,'execution_feedback.json')}
+
+    def test_native_real_unknown_with_dry_run_feedback_is_preserved(self):
+        self.write_pair(self.dest)
+        (self.dest/'execution_feedback.json').write_text('{"mode":"dry_run"}')
+        before={name:(self.dest/name).read_bytes() for name in FILES}
+        with ExitStack() as leases:
+            result=prepare_live_state(self.dest,[],leases)
+        self.assertEqual(result['mode'],'existing_native')
+        for name,raw in before.items():
+            self.assertEqual((self.dest/name).read_bytes(),raw)
+        self.assertFalse((self.dest/'execution_backups').exists())
+
+    def test_pure_simulation_is_backed_up_then_fresh_live_has_no_fake_order(self):
+        before=self.simulated_pair(self.dest)
+        with ExitStack() as leases:
+            result=prepare_live_state(self.dest,[],leases)
+        self.assertEqual(result['mode'],'live_after_simulation_archive')
+        backup=Path(result['backup'])
+        for name,raw in before.items():
+            self.assertEqual((backup/name).read_bytes(),raw)
+        self.assertEqual(json.loads((self.dest/FILES[0]).read_text())['intents'],{})
+        self.assertEqual(json.loads((self.dest/FILES[1]).read_text())['state']['owned_positions'],{})
+        self.assertEqual(self.signal.read_bytes(),self.before)
+        with ExitStack() as leases:
+            self.assertTrue(prepare_live_state(self.dest,[],leases)['completed'])
+
+    def test_simulated_native_prefers_real_legacy_after_backup(self):
+        before=self.simulated_pair(self.dest)
+        with ExitStack() as leases:
+            result=prepare_live_state(self.dest,[self.source],leases)
+        for name in FILES:
+            self.assertEqual((self.dest/name).read_bytes(),(self.source/name).read_bytes())
+            self.assertEqual((Path(result['backup'])/name).read_bytes(),before[name])
+        self.assertEqual(self.signal.read_bytes(),self.before)
+
+    def test_mixed_real_and_simulation_are_never_reset(self):
+        self.simulated_pair(self.dest)
+        path=self.dest/FILES[1]; data=json.loads(path.read_text())
+        data['state']['owned_positions']={'REALUSDT':{'quantity':1,'close_status':'UNKNOWN'}}
+        path.write_text(json.dumps(data)); before=path.read_bytes()
+        with ExitStack() as leases:
+            with self.assertRaisesRegex(RuntimeError,'mixed real/unknown'):
+                prepare_live_state(self.dest,[],leases)
+        self.assertEqual(path.read_bytes(),before)
+        self.assertFalse((self.dest/'execution_backups').exists())
+
+    def test_unacknowledged_real_client_identity_prevents_reset(self):
+        self.simulated_pair(self.dest)
+        path=self.dest/FILES[0]; data=json.loads(path.read_text())
+        data['intents']['c:uncertain-live']={'client_order_id':'uncertain-live','order_id':'','kind':'entry'}
+        path.write_text(json.dumps(data))
+        with ExitStack() as leases:
+            with self.assertRaisesRegex(RuntimeError,'mixed real/unknown'):
+                prepare_live_state(self.dest,[],leases)
+
+    def test_empty_dry_run_native_can_take_over_real_legacy_with_backup(self):
+        (self.dest/FILES[0]).write_text('{"intents":{}}')
+        (self.dest/FILES[1]).write_text('{"state":{"owned_positions":{},"tracked_orders":{},"realized_balance":15}}')
+        (self.dest/'execution_feedback.json').write_text('{"mode":"dry_run"}')
+        with ExitStack() as leases:
+            result=prepare_live_state(self.dest,[self.source],leases)
+        self.assertTrue(Path(result['backup']).is_dir())
+        self.assertEqual((self.dest/FILES[1]).read_bytes(),(self.source/FILES[1]).read_bytes())
+
+    def test_archive_switch_resumes_after_first_live_file_replaced(self):
+        from v9711_live.execution import startup_state as startup
+        before=self.simulated_pair(self.dest)
+        original=startup._atomic_bytes
+        count=0
+        def fail_second(path,raw):
+            nonlocal count
+            count+=1
+            if count==2: raise OSError('interrupted')
+            original(path,raw)
+        with patch.object(startup,'_atomic_bytes',side_effect=fail_second), ExitStack() as leases:
+            with self.assertRaises(OSError):
+                prepare_live_state(self.dest,[],leases)
+        self.assertTrue((self.dest/'.migration_in_progress').exists())
+        with ExitStack() as leases:
+            result=prepare_live_state(self.dest,[],leases)
+        self.assertFalse((self.dest/'.migration_in_progress').exists())
+        self.assertEqual(json.loads((self.dest/FILES[0]).read_text())['intents'],{})
+        for name,raw in before.items():
+            self.assertEqual((Path(result['backup'])/name).read_bytes(),raw)
+        self.assertEqual(self.signal.read_bytes(),self.before)
+
+    def test_real_order_id_without_position_still_prevents_simulation_reset(self):
+        self.simulated_pair(self.dest)
+        path=self.dest/FILES[0]; data=json.loads(path.read_text())
+        data['intents']['c:real']={'client_order_id':'real','order_id':'98765','kind':'entry'}
+        path.write_text(json.dumps(data)); before=path.read_bytes()
+        with ExitStack() as leases:
+            with self.assertRaisesRegex(RuntimeError,'mixed real/unknown'):
+                prepare_live_state(self.dest,[],leases)
+        self.assertEqual(path.read_bytes(),before)
+
+    def test_interrupted_archive_never_overwrites_later_real_change(self):
+        from v9711_live.execution import startup_state as startup
+        self.simulated_pair(self.dest)
+        with patch.object(startup,'_atomic_bytes',side_effect=OSError('interrupted')), ExitStack() as leases:
+            with self.assertRaises(OSError):
+                prepare_live_state(self.dest,[],leases)
+        path=self.dest/FILES[0]
+        changed=b'{"intents":{"c:real":{"order_id":"98765"}}}'
+        path.write_bytes(changed)
+        with ExitStack() as leases:
+            with self.assertRaisesRegex(RuntimeError,'changed since simulation backup'):
+                prepare_live_state(self.dest,[],leases)
+        self.assertEqual(path.read_bytes(),changed)
+        self.assertEqual(self.signal.read_bytes(),self.before)
+
+    def test_real_legacy_can_coexist_with_an_ignored_pure_simulated_legacy(self):
+        paper=self.root/'old-simulated'; paper.mkdir(); before=self.simulated_pair(paper)
+        with ExitStack() as leases:
+            result=prepare_live_state(self.dest,[paper,self.source],leases)
+        self.assertEqual(result['source'],str(self.source))
+        self.assertEqual((self.dest/FILES[1]).read_bytes(),(self.source/FILES[1]).read_bytes())
+        for name,raw in before.items():
+            self.assertEqual((paper/name).read_bytes(),raw)
 
 if __name__=='__main__': unittest.main()
