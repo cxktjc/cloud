@@ -162,6 +162,92 @@ class AccountStreamView:
         finally:
             db.close()
 
+    def manual_flat_evidence(self, *, symbol: str, since_ms: int,
+                             owned_qty: float, excluded_client_ids=()) -> dict[str, Any] | None:
+        """Explicit LONG-flat account state plus sufficient non-bot SELL fills.
+
+        Aggregate account state alone is not enough to book a strategy close.
+        Require post-entry account-flat evidence and actual SELL/TRADE fills;
+        exclude this executor's already reconciled close IDs to avoid double
+        counting. Full REST snapshot absence is accepted only after its fence.
+        """
+        self.health()
+        if since_ms <= 0 or owned_qty <= 0:
+            return None
+        symbol = _text(symbol).upper()
+        excluded = {str(item) for item in excluded_client_ids if item}
+        db = self._connect()
+        try:
+            db.execute('BEGIN')
+            account = db.execute("SELECT value FROM meta WHERE key='account_id'").fetchone()
+            if not account or json.loads(account[0]) != self.account_id:
+                raise StreamUnavailable('manual-flat account database identity mismatch')
+            current = db.execute('SELECT version_ms,payload FROM positions WHERE key=?',
+                                 (symbol + ':LONG',)).fetchone()
+            fence_row = db.execute("SELECT value FROM meta WHERE key='snapshot_fence_ms'").fetchone()
+            fence = int(_finite(json.loads(fence_row[0]))) if fence_row else 0
+            if current:
+                version, raw = current
+                row = json.loads(raw)
+                if (_text(row.get('symbol')).upper() != symbol
+                        or row.get('position_side') != 'LONG'
+                        or _finite(row.get('quantity'), float('nan')) != 0):
+                    return None
+                flat_ms = int(version)
+                if row.get('source') == 'REST_BOOTSTRAP':
+                    flat_ms = max(flat_ms, fence)
+                flat_basis = 'explicit_account_LONG_zero'
+            elif fence >= since_ms:
+                flat_ms, flat_basis = fence, 'post_entry_full_REST_snapshot_absence'
+            else:
+                return None
+            if flat_ms < since_ms:
+                return None
+            fills = []
+            for transaction_ms, raw in db.execute(
+                    'SELECT transaction_ms,payload FROM fills WHERE transaction_ms>=? '
+                    'AND transaction_ms<=? ORDER BY transaction_ms ASC', (since_ms, flat_ms)):
+                fill = json.loads(raw)
+                cid = _text(fill.get('client_order_id'))
+                quantity = _finite(fill.get('last_quantity'))
+                price = _finite(fill.get('last_price'))
+                if (_text(fill.get('symbol')).upper() == symbol
+                        and fill.get('position_side') == 'LONG'
+                        and str(fill.get('order_side') or '').upper() == 'SELL'
+                        and _text(fill.get('order_id')) not in ('', '0')
+                        and cid not in excluded
+                        and not cid.startswith(('v9711l_', 'autoclose-', 'adl_autoclose'))
+                        and quantity > 0 and price > 0):
+                    fills.append(dict(order_id=_text(fill.get('order_id')),
+                                      client_order_id=cid, quantity=quantity, price=price,
+                                      event_ms=int(transaction_ms),
+                                      commission=_finite(fill.get('commission')),
+                                      commission_asset=_text(fill.get('commission_asset'))))
+            # Allocate FIFO only the quantity owned by this trade ledger.
+            remaining = float(owned_qty)
+            allocated = []
+            quote = 0.0
+            for fill in fills:
+                take = min(remaining, fill['quantity'])
+                if take <= 0:
+                    continue
+                part = dict(fill, quantity=take)
+                allocated.append(part)
+                quote += take * fill['price']
+                remaining -= take
+                if remaining <= max(1e-12, owned_qty * 1e-9):
+                    break
+            if remaining > max(1e-12, owned_qty * 1e-9):
+                return None
+            return dict(symbol=symbol, account_id=self.account_id, orders=allocated,
+                        closed_owned_qty=float(owned_qty), average_price=quote/owned_qty,
+                        flat_version_ms=flat_ms, flat_basis=flat_basis,
+                        fill_basis='post-entry non-strategy SELL fills allocated FIFO')
+        except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+            raise StreamUnavailable(f'manual-flat evidence unavailable: {exc}') from exc
+        finally:
+            db.close()
+
     def lookup_order(self, *, symbol: str, order_id: Any = None,
                      client_order_id: str = '') -> dict[str, Any] | None:
         """Read exact cumulative order + deduplicated standard/LITE fills."""

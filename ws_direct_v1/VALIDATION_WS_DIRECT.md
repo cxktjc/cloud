@@ -87,3 +87,19 @@ simulated identities exist. Signal state is untouched. Mixed real/unknown and
 simulated histories are never reset. Interrupted switches resume only after
 backup/manifest, legacy hashes and current file bytes validate. Later real
 changes are never overwritten. 114 local tests passed; no live orders ran.
+
+## 2026-11-16 manual close / signal-capital sync
+
+- Manual close retirement requires a fresh matching account snapshot, explicit
+  LONG zero (or post-entry full REST snapshot omission), and enough post-entry
+  non-v9711 SELL fills. Own close IDs are excluded to avoid double booking.
+- Actual close VWAP PnL is recorded as an estimate using configured entry/exit
+  fees, then the phantom owned position is retired. Without complete evidence,
+  the position is retained.
+- Ready signal realized capital/notional/revision is force-synced as a distinct
+  execution-ledger record. Actual execution realized balance is never overwritten;
+  new order target notionals still come from signal candidate templates.
+- Detailed forced-close rows were removed from the live panel; durable audit
+  entries remain in the ledger and the panel reports aggregate counts only.
+- 119 local tests passed; original signal, selection and forced-close frozen
+  source hashes remain unchanged. No live account or order was touched.

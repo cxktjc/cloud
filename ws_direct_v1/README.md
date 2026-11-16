@@ -214,3 +214,24 @@ a real legacy book. This never moves/resets signal_portfolio.json. Actual
 orders, owned positions, unknown client identities or mixed real/simulated
 history are not erased. The backup location is printed at startup. No manual
 file removal or migration marker editing is required.
+
+### Manual external close and signal-capital synchronization
+
+The live executor retires an exact-owned LONG position after a manual/web close
+only when the account stream proves both (1) a post-entry explicit LONG=0 or a
+post-entry full REST snapshot omission and (2) enough post-entry non-v9711 SELL
+trade fills. It records an estimated realized PnL from the fill VWAP and configured
+fees; it does not rely on a mark-price/position-absence guess. Until both proofs
+arrive, the owned position is retained.
+
+On every ready signal snapshot, execution force-syncs a separate
+signal_capital_sync ledger record (signal realized balance, per-order target,
+revision/session). The desired-order notional remains signal-authoritative.
+Trade realized_balance remains exact execution accounting and is intentionally
+NOT overwritten by model PnL. This keeps sizing synchronized without falsifying
+actual fills or trade returns.
+
+Resolved forced/manual closes stay in execution_ledger.json for audit. The panel
+shows only aggregate counts, not a repeated symbol-by-symbol history. An old
+exact close identity remains in cleanup until terminal exchange evidence; the
+summary is not an open position.

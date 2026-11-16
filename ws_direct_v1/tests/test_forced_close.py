@@ -134,6 +134,66 @@ class ForcedCloseTests(unittest.TestCase):
         self.assertTrue(self.trade._entry_submission_blocked({'symbol':'BULLAUSDT'}))
         self.wire.assert_not_called()
 
+    def manual_sell(self, quantity='192', price='0.13368', stamp=None, **overrides):
+        stamp = int((self.now+0.5)*1000) if stamp is None else stamp
+        order = dict(s='KITEUSDT', ps='LONG', S='SELL', c='web_manual_1', i=9101,
+                     x='TRADE', X='FILLED', z=quantity, l=quantity, ap=price,
+                     L=price, t=456, rp='0.063', n='0.001', N='USDT')
+        order.update(overrides)
+        self.store.apply({'e':'ORDER_TRADE_UPDATE','E':stamp,'T':stamp,'o':order})
+        self.store.apply({'e':'ACCOUNT_UPDATE','E':stamp+1,'T':stamp+1,
+                          'a':{'m':'ORDER','P':[{'s':'KITEUSDT','ps':'LONG','pa':'0','ep':'0'}]}})
+        self.store.export()
+
+    def test_manual_web_close_retires_exact_owned_position_from_stream(self):
+        self.trade.positions['KITEUSDT'] = dict(symbol='KITEUSDT', side='LONG',
+            quantity=38., entry_price=.132, entry_epoch=self.now-1000,
+            order_bar_open_ms=int((self.now-1100)*1000),
+            entry_client_order_id='v9711l_entry_kite', exit_due_epoch=self.now+300)
+        self.manual_sell()
+        self.trade._reconcile_manual_flats(now=self.now+1)
+        self.assertNotIn('KITEUSDT', self.trade.positions)
+        row = self.trade.ledger.state['manual_close_history']['v9711l_entry_kite']
+        self.assertEqual(row['closed_owned_qty'],38)
+        self.assertAlmostEqual(row['average_price'],.13368)
+        self.assertGreater(row['booked_pnl'],0)
+
+    def test_manual_flat_requires_actual_sell_fills_and_long_zero(self):
+        self.trade.positions['KITEUSDT'] = dict(symbol='KITEUSDT', side='LONG',
+            quantity=38., entry_price=.132, entry_epoch=self.now-1000,
+            order_bar_open_ms=int((self.now-1100)*1000),
+            entry_client_order_id='v9711l_entry_kite')
+        stamp=int((self.now+.5)*1000)
+        self.zero(quantity='0', stamp=stamp)
+        self.trade._reconcile_manual_flats(now=self.now+1)
+        self.assertIn('KITEUSDT', self.trade.positions)
+        self.manual_sell(quantity='10', stamp=stamp+10)
+        self.trade._reconcile_manual_flats(now=self.now+2)
+        self.assertIn('KITEUSDT', self.trade.positions)
+
+    def test_manual_sell_without_explicit_flat_does_not_retire_position(self):
+        self.trade.positions['KITEUSDT'] = dict(symbol='KITEUSDT', side='LONG',
+            quantity=38., entry_price=.132, entry_epoch=self.now-1000,
+            order_bar_open_ms=int((self.now-1100)*1000),
+            entry_client_order_id='v9711l_entry_kite')
+        stamp=int((self.now+.5)*1000)
+        order=dict(s='KITEUSDT', ps='LONG', S='SELL', c='web_manual_1', i=9101,
+                   x='TRADE', X='FILLED', z='38', l='38', ap='.13368', L='.13368',
+                   t=456, rp='.063', n='.001', N='USDT')
+        self.store.apply({'e':'ORDER_TRADE_UPDATE','E':stamp,'T':stamp,'o':order})
+        self.store.export()
+        self.trade._reconcile_manual_flats(now=self.now+1)
+        self.assertIn('KITEUSDT', self.trade.positions)
+
+    def test_executor_own_close_fill_not_double_counted_as_manual(self):
+        self.trade.positions['KITEUSDT'] = dict(symbol='KITEUSDT', side='LONG',
+            quantity=38., entry_price=.132, entry_epoch=self.now-1000,
+            order_bar_open_ms=int((self.now-1100)*1000),
+            entry_client_order_id='v9711l_entry_kite', close_client_order_id='v9711l_close_kite')
+        self.manual_sell(c='v9711l_close_kite')
+        self.trade._reconcile_manual_flats(now=self.now+1)
+        self.assertIn('KITEUSDT', self.trade.positions)
+
     def test_adl_forced_exit_is_also_recognized(self):
         self.forced(c='adl_autoclose-test', x='TRADE')
         self.trade._reconcile_forced_exits(now=self.now)

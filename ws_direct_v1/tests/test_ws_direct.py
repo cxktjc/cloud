@@ -324,6 +324,30 @@ class DirectAdmissionTests(unittest.TestCase):
         self.assertNotIn('entry skipped STALEUSDT', text)
         self.assertIn('waiting first/reconnect tick=1 stale=1', text)
         self.assertIn('entry skipped BADUSDT: preflight: invalid precision', text)
+        fields['forced_close_history'] = {'BULLA-entry': {
+            'symbol': 'BULLAUSDT', 'closed_owned_qty': 192}}
+        fields['forced_close_cleanup'] = {'BULLAUSDT': {'reason': 'confirmed_forced_flat'}}
+        fields['manual_close_history'] = {}
+        fields['signal_capital_sync'] = {'realized_balance': 14.9,
+            'notional_per_order': 14.9/3, 'revision': 42}
+        text = self.trade.view._format(fields)
+        self.assertNotIn('BULLAUSDT', text)
+        self.assertIn('Closed audit: forced=1 manual/external=0 old exact-order cleanup pending=1', text)
+        self.assertIn('Signal compounding capital synced: balance=14.900000', text)
+
+    def test_signal_capital_sync_does_not_overwrite_actual_trade_balance(self):
+        self.trade.ledger.state['realized_balance'] = 12.3
+        snapshot = {'signal_ready': True, 'signal_session_id': 'fresh-session',
+            'signal_revision': 42, 'target_positions': [], 'portfolio': {
+                'session_id': 'fresh-session', 'revision': 42, 'initial_equity': 15,
+                'realized_balance': 14.9, 'notional_per_order': 14.9/3,
+                'sizing_divisor': 3, 'positions': {}}}
+        self.trade._apply_signal_targets(snapshot)
+        sync = self.trade.ledger.state['signal_capital_sync']
+        self.assertEqual(sync['realized_balance'], 14.9)
+        self.assertEqual(sync['notional_per_order'], 14.9/3)
+        self.assertEqual(self.trade.ledger.state['realized_balance'], 12.3)
+        self.assertEqual(self.trade.ledger.state['signal_portfolio']['revision'], 42)
 
 
 

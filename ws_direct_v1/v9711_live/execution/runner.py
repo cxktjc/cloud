@@ -48,6 +48,7 @@ from .submit_errors import require_submit_ack, submit_error_is_ambiguous
 from .stream import StreamUnavailable
 from .terminal import TradeTerminalView
 from .forced_close import ForcedCloseMixin
+from .manual_close import ManualCloseMixin
 
 LOG = logging.getLogger('v9711_live_trade')
 
@@ -55,7 +56,7 @@ TERMINAL = {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED',
             'EXPIRED_IN_MATCH', 'REJECTED'}
 
 
-class LiveTrade(ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
+class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
     def __init__(self, *, once: bool = False, enabled: bool | None = None,
                  dry_run: bool | None = None, nonblocking_io: bool | None = None):
         self.session_entries = SessionEntryStats(started_at=time.time())
@@ -619,7 +620,21 @@ class LiveTrade(ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkT
         # Execution feedback exposes these fields alongside exact-owned actual
         # positions; it never invents an exchange position from a target.
         self.ledger.state['signal_target_positions'] = targets
-        self.ledger.state['signal_portfolio'] = dict(snapshot.get('portfolio') or {})
+        portfolio = dict(snapshot.get('portfolio') or {})
+        self.ledger.state['signal_portfolio'] = portfolio
+        # Force-sync the model's compounding capital separately from execution
+        # PnL. New candidate notionals already come from this same signal book;
+        # never overwrite actual realized_balance or claim model fills as trades.
+        self.ledger.state['signal_capital_sync'] = {
+            'session_id': snapshot.get('signal_session_id') or portfolio.get('session_id'),
+            'revision': snapshot.get('signal_revision', portfolio.get('revision')),
+            'initial_equity': self._finite(portfolio.get('initial_equity'), cfg.EQUITY0),
+            'realized_balance': self._finite(portfolio.get('realized_balance'), cfg.EQUITY0),
+            'notional_per_order': self._finite(portfolio.get('notional_per_order')),
+            'sizing_divisor': self._finite(portfolio.get('sizing_divisor'), cfg.SIGNAL_SIZING_DIVISOR),
+            'synced_at_epoch': time.time(),
+            'source': 'current_ready_signal_snapshot',
+        }
 
     def _comparison(self, *, snapshot: Mapping[str, Any], price_map: Mapping[str, float],
                     signal_desired_count: int, priced_desired_count: int,
@@ -685,6 +700,8 @@ class LiveTrade(ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkT
             'signal_session_id': self.ledger.state.get('signal_session_id'),
             'signal_revision': self.ledger.state.get('last_signal_revision'),
             'signal_portfolio': self.ledger.state.get('signal_portfolio') or {},
+            'signal_capital_sync': self.ledger.state.get('signal_capital_sync') or {},
+            'manual_close_history': dict(self.ledger.state.get('manual_close_history', {})),
             'comparison': dict(comparison),
             'session_entry_stats': self.session_entries.snapshot(
                 max_rows=cfg.ViewConfig().max_orders_display),
@@ -761,6 +778,7 @@ class LiveTrade(ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkT
         for symbol in list(self.positions):
             self._reconcile_position_close(symbol, now=now)
         self._reconcile_forced_exits(now=now)
+        self._reconcile_manual_flats(now=now)
         self._apply_signal_targets(snapshot)
         self.session_entries.observe_signal(snapshot, status=status, now=now)
         targets = self._target_positions(snapshot)

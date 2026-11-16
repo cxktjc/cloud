@@ -148,18 +148,21 @@ class TradeTerminalView:
             'trade收益仅来自精确归属订单成交/平仓和当前实际持仓；差异按同价对比signal模型，不是交易所账户总收益。',
             '=' * 116,
         ])
-        forced = sorted((f.get('forced_close_history') or {}).values(),
-                        key=lambda row: row.get('processed_at_epoch', 0), reverse=True)
-        for row in forced[:3]:
-            lines.insert(-1, f'Exchange forced close: {row["symbol"]} '
-                         f'qty={row["closed_owned_qty"]:g} price={row["average_price"]:g} '
-                         f'booked_pnl={row["booked_pnl"]:+.6f} '
-                         f'event_UTC={iso(max(o["event_ms"] for o in row["orders"]))} '
-                         '(fee estimate; not an open position; no replenishment)')
-        cleanup = f.get('forced_close_cleanup') or {}
-        if cleanup:
-            lines.insert(-1, 'Forced-flat old exact-order cleanup (NOT holdings): '
-                         + ', '.join(cleanup) + '; same-symbol entries blocked until resolved')
+        forced_count = len(f.get('forced_close_history') or {})
+        manual_count = len(f.get('manual_close_history') or {})
+        cleanup_count = len(f.get('forced_close_cleanup') or {})
+        if forced_count or manual_count or cleanup_count:
+            lines.insert(-1, f'Closed audit: forced={forced_count} manual/external={manual_count} '
+                         f'old exact-order cleanup pending={cleanup_count} '
+                         '(audit retained; not an open position)')
+        capital = f.get('signal_capital_sync') or {}
+        if capital:
+            trade_balance = actual.get('realized_balance', cfg.EQUITY0)
+            lines.insert(-1, f'Signal compounding capital synced: balance='
+                         f'{capital.get("realized_balance", 0):.6f} '
+                         f'notional/order={capital.get("notional_per_order", 0):.6f} '
+                         f'revision={capital.get("revision", "-")}; '
+                         f'trade actual realized balance remains {trade_balance:.6f} (not overwritten)')
         diagnostics = f.get('entry_diagnostics') or {}
         ws = diagnostics.get('ws_direct') or {}
         if ws:
