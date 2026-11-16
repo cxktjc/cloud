@@ -359,3 +359,34 @@ Set V9711_LIVE_TRADE_MIN_REFRESH_SECONDS in .env to customize it. This only
 throttles terminal rendering; plan polling, admission, cancels, fills, timed
 exits and feedback publication keep their existing scheduling. Restart only
 trade to load the setting; preserve all state and run only one executor.
+
+
+## Forced liquidation/ADL reconciliation, including old UNKNOWN close state
+
+Trade now reads the canonical local account SQLite history to reconcile an
+existing owned LONG against explicit exchange forced SELL fills. It requires:
+
+- a healthy live account feed with matching account ID;
+- a liquidation/CALCULATED or ADL order, FILLED with positive quantity/price,
+  LONG/SELL, no older than the strategy entry;
+- forced quantities covering the remaining owned amount; and
+- a subsequent explicit account LONG zero, or a later full REST bootstrap
+  omitting that position. Missing positions or margin warnings alone are not fills.
+
+On proof, any locally available own close fills are accounted first, then the
+remaining owned amount is closed at the forced-order average. Realized PnL uses
+the owned entry price and configured entry/exit fee estimate (not the entire
+account's reported realized PnL). Actual exchange realized fields are retained
+in the audit for comparison. State records forced_close_history atomically with
+balance/removal; restart does not book the same owned exit again. Old historical
+events are checked at startup, so an existing MARKET/UNKNOWN position can recover
+without deleting or manually editing execution state.
+
+No replacement BUY is submitted. Signal model positions are unchanged. Same
+symbol entry is blocked through the original exit/cooldown, and while any old
+exact close-order cleanup is unresolved. Existing uncertain close intents move
+to forced_close_cleanup for exact query/cancel only; they no longer appear as
+holdings, unrealized PnL, or an in-flight position close. Unknown order fate is
+not fabricated as CANCELED/FILLED. Partial or ambiguous evidence stays retained
+for safety. An updated trade process can read existing account SQLite data;
+account/signal do not need to be restarted. Preserve both state and account DB.

@@ -89,6 +89,79 @@ class AccountStreamView:
         except sqlite3.Error as exc:
             raise StreamUnavailable(f'account stream database unavailable: {exc}') from exc
 
+    def forced_flat_evidence(self, *, symbol: str, since_ms: int,
+                             owned_qty: float) -> dict[str, Any] | None:
+        """Historical forced SELL + explicit subsequent account LONG zero.
+
+        Zero/missing account positions alone never establish strategy ownership
+        or prove a close. Only already-owned LONG positions use this evidence.
+        Read canonical SQLite in one snapshot, including after executor restart.
+        """
+        self.health()
+        if since_ms <= 0 or owned_qty <= 0:
+            return None
+        symbol = _text(symbol).upper()
+        db = self._connect()
+        try:
+            db.execute('BEGIN')
+            account = db.execute("SELECT value FROM meta WHERE key='account_id'").fetchone()
+            if not account or json.loads(account[0]) != self.account_id:
+                raise StreamUnavailable('forced-close account database identity mismatch')
+            zero = db.execute('SELECT version_ms,payload FROM positions WHERE key=?',
+                              (symbol + ':LONG',)).fetchone()
+            fence_row = db.execute("SELECT value FROM meta WHERE key='snapshot_fence_ms'").fetchone()
+            fence = int(_finite(json.loads(fence_row[0]))) if fence_row else 0
+            if zero:
+                position = json.loads(zero[1])
+                if (_text(position.get('symbol')).upper() != symbol
+                        or position.get('position_side') != 'LONG'
+                        or _finite(position.get('quantity'), float('nan')) != 0):
+                    return None
+                flat_ms = int(zero[0])
+                if position.get('source') == 'REST_BOOTSTRAP':
+                    flat_ms = max(flat_ms, fence)
+                flat_basis = 'explicit_account_LONG_zero'
+            else:
+                # A completed full REST bootstrap may omit flat symbols. This
+                # is evidence only when paired with the exact forced orders.
+                flat_ms, flat_basis = fence, 'subsequent_full_REST_snapshot_absence'
+            if flat_ms < since_ms:
+                return None
+            orders = []
+            for version, raw in db.execute(
+                    'SELECT version_ms,payload FROM orders WHERE key>=? AND key<? '
+                    'AND version_ms>=? ORDER BY version_ms ASC',
+                    (symbol + ':', symbol + ';', since_ms)):
+                row = json.loads(raw)
+                cid = _text(row.get('client_order_id'))
+                forced = (row.get('liquidation') is True or row.get('adl') is True
+                          or row.get('execution_type') == 'CALCULATED'
+                          or cid.startswith(('autoclose-', 'adl_autoclose')))
+                quantity = _finite(row.get('executed_quantity'))
+                price = _finite(row.get('average_price'))
+                if price <= 0 and _finite(row.get('last_quantity')) == quantity:
+                    price = _finite(row.get('last_price'))
+                if (not forced or _text(row.get('symbol')).upper() != symbol
+                        or row.get('position_side') != 'LONG' or row.get('order_side') != 'SELL'
+                        or row.get('status') != 'FILLED' or quantity <= 0 or price <= 0
+                        or not _text(row.get('order_id')) or int(version) > flat_ms):
+                    continue
+                orders.append(dict(order_id=_text(row['order_id']), client_order_id=cid,
+                                   quantity=quantity, price=price, event_ms=int(version),
+                                   exchange_realized_pnl=row.get('realized_pnl'),
+                                   liquidation=not bool(row.get('adl')), adl=bool(row.get('adl'))))
+            total = sum(row['quantity'] for row in orders)
+            if not orders or total + max(1e-12, owned_qty * 1e-9) < owned_qty:
+                return None  # partial or unrelated forced evidence cannot erase residual
+            return dict(symbol=symbol, account_id=self.account_id, orders=orders,
+                        total_forced_qty=total,
+                        average_price=sum(row['quantity'] * row['price'] for row in orders) / total,
+                        flat_version_ms=flat_ms, flat_basis=flat_basis)
+        except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+            raise StreamUnavailable(f'forced-close evidence unavailable: {exc}') from exc
+        finally:
+            db.close()
+
     def lookup_order(self, *, symbol: str, order_id: Any = None,
                      client_order_id: str = '') -> dict[str, Any] | None:
         """Read exact cumulative order + deduplicated standard/LITE fills."""

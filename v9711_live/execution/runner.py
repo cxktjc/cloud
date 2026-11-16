@@ -47,6 +47,7 @@ from .nonblocking_io import NetworkTradeMixin
 from .submit_errors import require_submit_ack, submit_error_is_ambiguous
 from .stream import StreamUnavailable
 from .terminal import TradeTerminalView
+from .forced_close import ForcedCloseMixin
 
 LOG = logging.getLogger('v9711_live_trade')
 
@@ -54,7 +55,7 @@ TERMINAL = {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED',
             'EXPIRED_IN_MATCH', 'REJECTED'}
 
 
-class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
+class LiveTrade(ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
     def __init__(self, *, once: bool = False, enabled: bool | None = None,
                  dry_run: bool | None = None, nonblocking_io: bool | None = None):
         self.session_entries = SessionEntryStats(started_at=time.time())
@@ -409,6 +410,8 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
 
     def _entry_submission_blocked(self, row: Mapping[str, Any]) -> bool:
         symbol = str(row.get('symbol') or '').upper()
+        if self._forced_entry_blocked(symbol, now=time.time()):
+            return True
         cid = self.ledger.client_id(
             symbol, int(self._finite(row.get('order_bar_open_ms'))), 'entry')
         rotated = self.ledger.state.get('rotated_out_plans', {}).get(cid)
@@ -693,6 +696,8 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
             'pending_rotation': self.ledger.state.get('pending_rotation'),
             'rotated_out_plans': dict(self.ledger.state.get('rotated_out_plans') or {}),
             'reopen_until_epoch': dict(self.ledger.state['reopen_until_epoch']),
+            'forced_close_history': dict(self.ledger.state.get('forced_close_history', {})),
+            'forced_close_cleanup': dict(self.ledger.state.get('forced_close_cleanup', {})),
             'entry_diagnostics': getattr(self, '_entry_diagnostics', {}),
             'stream_health': dict(stream_health),
             'network_io': self._network_io.health() if self._network_io else {'enabled': False},
@@ -729,6 +734,8 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
             entry_gap_policy=GapPolicy().describe(),
             current_admission_gap=self._current_admission_gap(),
             pending_rotation=self.ledger.state.get('pending_rotation'),
+            forced_close_history=dict(self.ledger.state.get('forced_close_history', {})),
+            forced_close_cleanup=dict(self.ledger.state.get('forced_close_cleanup', {})),
             entry_diagnostics=getattr(self, '_entry_diagnostics', {}),
             entry_rejections=dict(self.ledger.state['entry_submit_rejections']),
             stream_health=dict(stream_health))
@@ -748,9 +755,12 @@ class LiveTrade(PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
         self.session_entries.observe_owned_state(self.positions, self.tracked)
         self._drain_network()
         self.reconcile_orders(now=now)
+        self._reconcile_forced_exits(now=now)
+        self._cleanup_forced_close_orders(now=now)
         self._publish_entry_gate()
         for symbol in list(self.positions):
             self._reconcile_position_close(symbol, now=now)
+        self._reconcile_forced_exits(now=now)
         self._apply_signal_targets(snapshot)
         self.session_entries.observe_signal(snapshot, status=status, now=now)
         targets = self._target_positions(snapshot)

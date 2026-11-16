@@ -148,6 +148,18 @@ class TradeTerminalView:
             'trade收益仅来自精确归属订单成交/平仓和当前实际持仓；差异按同价对比signal模型，不是交易所账户总收益。',
             '=' * 116,
         ])
+        forced = sorted((f.get('forced_close_history') or {}).values(),
+                        key=lambda row: row.get('processed_at_epoch', 0), reverse=True)
+        for row in forced[:3]:
+            lines.insert(-1, f'Exchange forced close: {row["symbol"]} '
+                         f'qty={row["closed_owned_qty"]:g} price={row["average_price"]:g} '
+                         f'booked_pnl={row["booked_pnl"]:+.6f} '
+                         f'event_UTC={iso(max(o["event_ms"] for o in row["orders"]))} '
+                         '(fee estimate; not an open position; no replenishment)')
+        cleanup = f.get('forced_close_cleanup') or {}
+        if cleanup:
+            lines.insert(-1, 'Forced-flat old exact-order cleanup (NOT holdings): '
+                         + ', '.join(cleanup) + '; same-symbol entries blocked until resolved')
         diagnostics = f.get('entry_diagnostics') or {}
         if diagnostics:
             lines.insert(-1, 'Entry plan: status={desired_status} signal_ready={signal_ready} '

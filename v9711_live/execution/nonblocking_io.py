@@ -265,7 +265,8 @@ class NetworkTradeMixin:
             position_exit_due_epochs=tuple(self._finite(pos.get('exit_due_epoch'))
                                            for pos in self.positions.values()),
             allowed=frozenset(str(p.get('client_order_id')) for p in self.tracked.values()
-                              if not p.get('cancel_requested'))))
+                              if not p.get('cancel_requested')
+                              and not self._forced_entry_blocked(str(p.get('symbol') or ''), now=time.time()))))
 
     @contextmanager
     def entry_cancel_plan(self):
