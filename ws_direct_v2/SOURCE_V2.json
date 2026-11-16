@@ -10,6 +10,7 @@
   },
   "scope": "v1 engineering port with actual-position-count 50/30/20 sizing and native isolated books; preserves v1 exits, no added 25% stop",
   "verification_date_utc": "2026-11-16",
-  "test_count": 203,
-  "syntax_file_count": 74
+  "test_count": 205,
+  "syntax_file_count": 74,
+  "startup_policy": "Native v2 ignores old ledger contents; manual exchange cancellation/closure is handled by the operator; legacy process locks retained"
 }

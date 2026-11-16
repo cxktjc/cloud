@@ -48,23 +48,6 @@ def _initialize(destination):
     journal_path.unlink()
 
 
-def _check_legacy(old):
-    ledger = old / 'execution_ledger.json'
-    intents = old / 'execution_intents.json'
-    if ledger.exists():
-        state = _json(ledger).get('state')
-        if not isinstance(state, dict):
-            raise RuntimeError(f'invalid old ledger preserved: {ledger}')
-        if any(state.get(k) for k in ('owned_positions', 'tracked_orders', 'forced_close_cleanup')):
-            raise RuntimeError(f'old strategy has unresolved exposure at {ledger}; '
-                               'finish with old trade, no automatic adoption')
-    if ledger.exists() or intents.exists():
-        pair = _read_pair(old)
-        if json.loads(pair['execution_intents.json'])['intents']:
-            raise RuntimeError(f'old strategy has unresolved exact intents at {intents}; '
-                               'reconcile with old trade, no automatic adoption')
-
-
 def prepare_live_state(destination, candidates, leases):
     # Caller already owns destination trade.lock and the price mirror lock.
     destination = Path(destination).resolve()
@@ -77,8 +60,10 @@ def prepare_live_state(destination, candidates, leases):
     for old in dict.fromkeys(Path(p).resolve() for p in candidates):
         if old == destination or not old.exists():
             continue
+        # Keep process exclusion only. After an operator manually closes/cancels
+        # at the exchange, stale old books are not evidence of current exposure.
+        # Never read, import, clear or require repairing those old ledgers.
         leases.enter_context(SingleWriter(old / 'trade.lock'))
-        _check_legacy(old)
     destination.mkdir(parents=True, exist_ok=True)
     _initialize(destination)
     pair = _read_pair(destination)

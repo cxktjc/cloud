@@ -18,7 +18,7 @@ LOG = logging.getLogger('v9711.ws_direct')
 
 def check_inputs():
     from .startup_v2 import legacy_locations
-    return dict(execution_ledger_candidates=[str(p) for p in legacy_locations(cfg.ROOT)],
+    return dict(legacy_trade_lock_dirs=[str(p) for p in legacy_locations(cfg.ROOT)],
                 version=cfg.WS_DIRECT_MODE, root=str(cfg.ROOT), state=str(cfg.STATE_DIR.resolve()),
                 plans=str(cfg.DESIRED_FILE.resolve()), price_output=str(cfg.PRICE_FILE.resolve()),
                 bars=str(cfg.STATUS_FILE.resolve()), account=str(cfg.ACCOUNT_STREAM_DIR.resolve()),

@@ -261,10 +261,8 @@ def sync(state_dir, *, prices=None, symbols=None, apply=False, candidates=None, 
         legacy_hashes = _source_hashes(sources)
         for path in sources:
             hashes = legacy_hashes[str(path)]
-            if previous_receipt.get('kind') == 'execution_native_v2':
-                from .startup_v2 import _check_legacy
-                _check_legacy(path)
-                continue  # Independent v2 history need not equal a flat old book.
+            if state.get('strategy_version') == cfg.VERSION:
+                continue  # Native v2 never adopted old books; stale rows are unrelated.
             if hashes and len(hashes) != 2:
                 raise ValueError(f'incomplete legacy execution ledger pair: {path}')
             known = (previous_receipt.get('legacy_sha256') or {}).get(str(path))

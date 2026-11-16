@@ -114,16 +114,17 @@ class NativeStartupTests(unittest.TestCase):
             prepare_live_state(p,[],leases)
             self.assertEqual(json.loads(file.read_bytes())['state']['realized_balance'],12.34)
 
-    def test_no_adoption_of_unsettled_v1(self):
+    def test_stale_v1_positions_do_not_block_or_get_adopted(self):
         with tempfile.TemporaryDirectory() as d, ExitStack() as leases:
             p=Path(d);old=p/'old';old.mkdir();dest=p/'new';dest.mkdir()
             source=old/'execution_ledger.json'
             source.write_text(json.dumps({'state':{'owned_positions':{'X':{'quantity':1}}}}))
             before=source.read_bytes()
-            with self.assertRaisesRegex(RuntimeError,'unresolved exposure'):
-                prepare_live_state(dest,[old],leases)
+            prepare_live_state(dest,[old],leases)
             self.assertEqual(source.read_bytes(),before)
-            self.assertFalse((dest/'execution_ledger.json').exists())
+            state=json.loads((dest/'execution_ledger.json').read_bytes())['state']
+            self.assertEqual(state['owned_positions'],{})
+            self.assertEqual(state['realized_balance'],cfg.EQUITY0)
 
     def test_paper_ledger_not_adopted(self):
         with tempfile.TemporaryDirectory() as d, ExitStack() as leases:

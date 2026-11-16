@@ -92,7 +92,7 @@ class NativeStateSafety(unittest.TestCase):
         self.assertEqual(signal.read_bytes(), before)
         self.assertEqual((paper / 'execution_ledger.json').read_text(), 'paper history')
 
-    def test_old_orphan_exact_intent_blocks_fresh_v2_without_modifying_source(self):
+    def test_old_orphan_exact_intent_does_not_block_or_modify_native_v2(self):
         old = self.root / 'old'
         old.mkdir()
         for name, value in startup._initial_pair().items():
@@ -100,17 +100,43 @@ class NativeStateSafety(unittest.TestCase):
         atomic_write_json(old / 'execution_intents.json', dict(intents={
             'c:old': dict(client_order_id='old', kind='entry', order_id='123')}))
         before = {p.name: p.read_bytes() for p in old.glob('*.json')}
-        with self.assertRaisesRegex(RuntimeError, 'unresolved exact intents'):
-            self.prepare([old])
+        self.prepare([old])
         self.assertEqual(before, {p.name: p.read_bytes() for p in old.glob('*.json')})
-        self.assertFalse((self.dest / 'execution_ledger.json').exists())
+        self.assertEqual(json.loads((self.dest / 'execution_intents.json').read_bytes())['intents'], {})
 
-    def test_unpaired_old_intents_block_startup(self):
+    def test_unpaired_old_intents_do_not_block_native_startup(self):
         old = self.root / 'old'
         old.mkdir()
         atomic_write_json(old / 'execution_intents.json', dict(intents={}))
-        with self.assertRaisesRegex(RuntimeError, 'incomplete execution ledger pair'):
-            self.prepare([old])
+        before = (old / 'execution_intents.json').read_bytes()
+        self.prepare([old])
+        self.assertEqual((old / 'execution_intents.json').read_bytes(), before)
+
+    def test_malformed_old_ledger_is_not_read_or_repaired(self):
+        old = self.root / 'old'
+        old.mkdir()
+        ledger = old / 'execution_ledger.json'
+        ledger.write_text('unreadable old ledger; leave it alone')
+        before = ledger.read_bytes()
+        self.prepare([old])
+        self.assertEqual(ledger.read_bytes(), before)
+
+    def test_existing_v2_balance_and_positions_survive_changed_stale_old_book(self):
+        old = self.root / 'old'
+        old.mkdir()
+        source = old / 'execution_ledger.json'
+        source.write_text('{"state":{"owned_positions":{"OLD":{"quantity":99}}}}')
+        with ExitStack() as leases:
+            startup.prepare_live_state(self.dest, [old], leases)
+        ledger = self.dest / 'execution_ledger.json'
+        payload = json.loads(ledger.read_bytes())
+        payload['state'].update(realized_balance=12.34, owned_positions={
+            'NATIVE': dict(quantity=2, entry_price=1, entry_client_order_id=cfg.ORDER_CLIENT_PREFIX+'_owned')})
+        atomic_write_json(ledger, payload)
+        before = ledger.read_bytes()
+        source.write_text('old file changed after manual exchange close')
+        self.prepare([old])
+        self.assertEqual(ledger.read_bytes(), before)
 
     def test_interrupted_native_pair_initialization_resumes_exact_empty_pair(self):
         def write(path, value):
@@ -196,7 +222,7 @@ class NativeStateSafety(unittest.TestCase):
 
 
 class ManualNativeSync(unittest.TestCase):
-    def test_one_time_sync_is_compatible_with_independent_flat_old_book(self):
+    def test_one_time_sync_ignores_stale_old_positions_and_preserves_old_book(self):
         from v9711_live.execution import manual_sync
         from v9711_live.signal_portfolio import SignalPortfolio
         with tempfile.TemporaryDirectory() as directory:
@@ -207,6 +233,7 @@ class ManualNativeSync(unittest.TestCase):
                 path = old / 'execution_ledger.json'
                 value = json.loads(path.read_bytes())
                 value['state']['realized_balance'] = 123
+                value['state']['owned_positions'] = {'STALE': dict(quantity=99, close_status='UNKNOWN')}
                 atomic_write_json(path, value)
                 startup.prepare_live_state(dest, [old], leases)
             signal = SignalPortfolio(dest / cfg.SIGNAL_BOOK_FILENAME)
