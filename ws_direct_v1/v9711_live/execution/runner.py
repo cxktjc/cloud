@@ -1008,11 +1008,10 @@ def main() -> int:
             leases.enter_context(SingleWriter(cfg.TRADE_LOCK_FILE))
             leases.enter_context(SingleWriter(cfg.PRICE_FILE.with_suffix('.writer.lock')))
             if enabled and not dry_run:
-                migration = read_json(cfg.STATE_DIR / 'WS_MIGRATION.json') or {}
-                if migration.get('completed') and migration.get('source'):
-                    # Hold the original executor lock for this entire live run.
-                    # This blocks an old systemd auto-restart without editing it.
-                    leases.enter_context(SingleWriter(Path(migration['source']) / 'trade.lock'))
+                from .startup_state import prepare_live_state, legacy_locations
+                receipt = prepare_live_state(cfg.STATE_DIR, legacy_locations(cfg.ROOT), leases)
+                LOG.info('live execution ledger ready mode=%s source=%s destination=%s; signal ledger untouched',
+                         receipt.get('mode', 'previous_migration'), receipt.get('source'), cfg.STATE_DIR)
             from .ws_direct import DirectTrade
             return DirectTrade(once=args.once, enabled=enabled,
                                dry_run=dry_run).run()

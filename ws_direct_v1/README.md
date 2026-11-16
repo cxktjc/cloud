@@ -133,46 +133,50 @@ Signal may start without a price file; trade establishes WS and publishes it.
 Do not run two new trades writing the same mirror. A separate writer lock is
 held for the mirror's entire lifetime. Stop the paper processes before live.
 
-## Preserve live ownership on cutover (mandatory)
+## Automatic execution-ledger takeover on live startup
 
-Stop the OLD trade AND old signal; leave account/3m/agg running. Confirm there
-is no remaining old executor, including systemd auto-restarts. Do not cancel or
-forget exchange orders manually just to switch code versions.
+Signal and execution use different books in the SAME var/state directory:
+signal_portfolio.json is the model book; execution_ledger.json and
+execution_intents.json record real exact-order ownership. Model positions must
+never be converted into exchange fills.
 
-Earlier server logs used /opt/v9711-live/var/state as the legacy state directory,
-NOT /opt/v9711-live/cloud/var/state. Confirm your actual current path before using
---source. Default below is only the path seen in those logs.
+Stop the OLD trade before starting the new live trade; leave account/3m/agg
+running. A matching new signal already using var/state can remain running:
+automatic takeover does not copy, replace, lock or delete its signal book.
+A --paper signal must be stopped and launched without --paper for live plans.
+
+The live runner now automatically:
+
+1. Reuses a valid existing real execution pair in its own var/state, without
+   requiring a manually created migration marker.
+2. Otherwise detects old execution files in ../var/state and ../../var/state
+   relative to ws_direct_v1 (cloud/var/state and /opt/v9711-live/var/state on
+   this server). It locks legacy trade writers before reading/copying.
+3. Copies ONLY the two execution files, byte-for-byte, preserving UNKNOWN
+   positions/orders and realized PnL; never copies signal_portfolio.json.
+4. Keeps legacy trade locks for the whole new live process lifetime and writes
+   a takeover receipt automatically. A recognized interrupted automatic copy
+   resumes only if source hashes and already-copied bytes still match.
+5. Rejects conflicting/partial ledgers, simulated identities, dry-run history
+   or missing real history with explicit paths and reasons; never guesses,
+   overwrites existing execution files, imports paper or invents account fills.
+
+The older scripts.migrate_state command remains an OPTIONAL offline tool, not
+a mandatory startup step. Do not run it on top of existing state or delete files
+to satisfy a marker check. Existing successful migration receipts remain valid.
+
+Start matching live signal if not already running:
 
 ```bash
 cd /opt/v9711-live/cloud/ws_direct_v1
-../.venv/bin/python -B -m scripts.migrate_state --source /opt/v9711-live/var/state
-# Inspect preview, then copy with both old processes stopped:
-../.venv/bin/python -B -m scripts.migrate_state --source /opt/v9711-live/var/state --apply
+/opt/v9711-live/cloud/.venv/bin/python -B -u -m v9711_live.run_signal
 ```
 
-The script locks both old/new signal/trade state owners, copies execution
-intents/ledger and signal portfolio byte-for-byte, never deletes/moves source,
-and refuses existing destination state. It does NOT copy old desired[] plans.
-UNKNOWN positions/close identities/forced-close audit are preserved. The new
-live process also holds the original source trade.lock for its entire lifetime,
-blocking an old executor auto-restart while the new trader is running. A partial
-migration leaves a marker that blocks live startup. Live mode requires a
-successful WS_MIGRATION.json marker; it will not silently start an empty ledger.
-If a paper trial already used the LIVE var/state by mistake, do not delete it
-blindly: inspect it instead of forcing an overwrite.
-
-Then in separate terminals, without --paper:
+Then start the new trade (REAL ORDER SUBMISSION):
 
 ```bash
-# New matching signal:
 cd /opt/v9711-live/cloud/ws_direct_v1
-../.venv/bin/python -B -u -m v9711_live.run_signal
-```
-
-```bash
-# REAL ORDER SUBMISSION: only after migration and input checks.
-cd /opt/v9711-live/cloud/ws_direct_v1
-../.venv/bin/python -B -u -m v9711_live.execution.runner --enable-live --no-dry-run
+/opt/v9711-live/cloud/.venv/bin/python -B -u -m v9711_live.execution.runner --enable-live --no-dry-run
 ```
 
 No old trade should be running beside it. If reverting after new fills, stop

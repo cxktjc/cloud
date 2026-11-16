@@ -25,13 +25,15 @@ class TradeEntrypointTests(unittest.TestCase):
              patch.object(sys, 'argv', ['trade', '--enable-live', '--no-dry-run', '--once']), \
              patch.object(runner.logging, 'FileHandler', return_value=logging.NullHandler()), \
              patch('v9711_live.storage.SingleWriter') as lock, \
-             patch.object(ws_direct, 'DirectTrade') as trade:
+             patch.object(ws_direct, 'DirectTrade') as trade, \
+             patch('v9711_live.execution.startup_state.prepare_live_state', return_value={'mode': 'test'}) as prepare:
             trade.return_value.run.return_value = 0
             self.assertEqual(runner.main(), 0)
             lock.assert_any_call(Path(folder) / 'trade.lock')
             self.assertEqual(lock.call_count, 2)
             trade.assert_called_once_with(once=True, enabled=True, dry_run=False)
             trade.return_value.run.assert_called_once_with()
+            prepare.assert_called_once()
 
     def test_duplicate_writer_does_not_start_executor(self):
         with tempfile.TemporaryDirectory() as folder, \

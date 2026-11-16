@@ -15,7 +15,9 @@ LOG = logging.getLogger('v9711.ws_direct')
 
 
 def check_inputs():
-    return dict(version=cfg.WS_DIRECT_MODE, root=str(cfg.ROOT), state=str(cfg.STATE_DIR.resolve()),
+    from .startup_state import legacy_locations
+    return dict(execution_ledger_candidates=[str(p) for p in legacy_locations(cfg.ROOT)],
+                version=cfg.WS_DIRECT_MODE, root=str(cfg.ROOT), state=str(cfg.STATE_DIR.resolve()),
                 plans=str(cfg.DESIRED_FILE.resolve()), price_output=str(cfg.PRICE_FILE.resolve()),
                 bars=str(cfg.STATUS_FILE.resolve()), account=str(cfg.ACCOUNT_STREAM_DIR.resolve()),
                 symbols=str(cfg.SYMBOLS_FILE.resolve()), filters=str(cfg.EXCHANGE_INFO_CACHE_FILE.resolve()),
@@ -186,7 +188,7 @@ class DirectTrade(LiveTrade):
             marker = read_json(cfg.STATE_DIR / 'WS_MIGRATION.json') or {}
             if ((cfg.STATE_DIR / '.migration_in_progress').exists() or not marker.get('completed')
                     or not cfg.EXECUTION_INTENT_FILE.is_file() or not cfg.EXECUTION_LEDGER_FILE.is_file()):
-                raise RuntimeError('live WS-direct requires completed stopped-ledger migration; run scripts.migrate_state --source <legacy-state> --apply; never delete existing ledgers')
+                raise RuntimeError('live execution startup not prepared; launch execution.runner for automatic ledger detection; never delete existing ledgers')
         if self.once:
             self.step()
             return 0

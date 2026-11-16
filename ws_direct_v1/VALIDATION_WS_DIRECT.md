@@ -59,3 +59,20 @@ file publication and signal round trips, not every possible source of latency.
 - 90 local unit tests passed, including background-refresh failure/nonblocking,
   stale environment path isolation, paper continuity and diagnostic tests.
 - No live order submission or real server/network verification was performed.
+
+## 2026-11-16 automatic execution takeover
+
+The CLI now prepares live ownership automatically under the destination trade
+lock, before constructing the executor. It discovers the fixed legacy paths,
+locks old executors for the entire live lifetime, and copies only real execution
+intents/ledger. The matching running signal book is never replaced. Existing
+valid native execution state no longer needs a manually produced receipt.
+Conflicting/partial/simulated state remains fail-closed. New automatic partial
+copies resume only with matching source hashes and matching destination bytes.
+The low-level DirectTrade loop still rejects bypassing CLI startup preparation.
+
+104 local tests passed, including automatic takeover with UNKNOWN state, native
+reuse, source/destination conflict, active legacy lock, incomplete ledger, paper
+exclusion, simulated identity and dry-run rejection, recognized interrupted copy
+recovery, foreign journal preservation and refusal to treat a signal book as
+proof of exchange ownership. No server login, account query or real trade ran.

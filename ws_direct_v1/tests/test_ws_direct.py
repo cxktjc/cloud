@@ -199,7 +199,7 @@ class DirectAdmissionTests(unittest.TestCase):
         self.trade.client.enabled = True
         self.trade.client.dry_run = False
         self.trade.market.start = Mock()
-        with self.assertRaisesRegex(RuntimeError,'requires completed'):
+        with self.assertRaisesRegex(RuntimeError,'startup not prepared'):
             self.trade._run_loop()
         self.trade.market.start.assert_not_called()
 
