@@ -439,6 +439,7 @@ def main() -> int:
     parser.add_argument('--check-inputs', action='store_true',
                         help='Show read-only input paths and validity; do not connect MySQL or change state.')
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--paper', action='store_true', help='Use isolated var/paper_state; paths do not read .env.')
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
     for option, setting in (("mysql_host", "MYSQL_HOST"), ("mysql_port", "MYSQL_PORT"),

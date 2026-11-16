@@ -40,3 +40,22 @@ slippage or financial return has been validated. Local fsync, maintenance, JSON
 parsing and thread scheduling still take time. Exchange ACK latency is not the
 receive-to-decision/dispatch metric. The implementation removes per-tick price
 file publication and signal round trips, not every possible source of latency.
+
+## 2026-11-16 fixed-path / startup diagnostic correction
+
+- All runtime paths derive from code location. Stale .env/shell path variables
+  cannot redirect the signal, price mirror, account input or precision cache.
+- Explicit --paper on both processes retains var/paper_state. No state files
+  are moved, deleted or migrated by this correction.
+- Public precision filters refresh on a separate worker; the tick callback does
+  not wait for HTTP. Invalid/missing precision remains fail-closed. Failed
+  refresh retains the previous cache. Readiness checks run at startup/maintenance,
+  not as an extra file read per tick.
+- First/reconnect-tick waits and stale quotes are separate diagnostic reasons;
+  the panel summarizes them and preserves actionable preflight errors.
+- Full plan dumps require DEBUG (and are not serialized at normal INFO level).
+- WS metrics report fresh/subscribed symbol coverage. Group health is not a
+  guarantee that every subscribed symbol already delivered its first trade.
+- 90 local unit tests passed, including background-refresh failure/nonblocking,
+  stale environment path isolation, paper continuity and diagnostic tests.
+- No live order submission or real server/network verification was performed.

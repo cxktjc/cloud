@@ -19,9 +19,9 @@ class InputPathsTests(unittest.TestCase):
             self.assertIn("ExecStart=/opt/v9711-live/cloud/.venv/bin/python", text)
             self.assertNotIn("/cloud/cloud", text)
         template=(root/".env.example").read_text(encoding="utf-8")
-        self.assertIn("V9711_LIVE_3M_STATUS_FILE=/opt/v9711-live/cloud/var/klines_3m_status.json", template)
+        self.assertNotIn("V9711_LIVE_3M_STATUS_FILE=", template)
 
-    def _read_config(self, overrides=None):
+    def _read_config(self, overrides=None, args=()):
         import json, os, subprocess
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("V9711_", "KLINE_"))}
@@ -35,7 +35,7 @@ print(json.dumps({name: str(getattr(c, name).resolve()) for name in
     ('ROOT', 'SHARED_ROOT', 'STATUS_FILE', 'ACCOUNT_STREAM_DIR',
      'EXCHANGE_INFO_CACHE_FILE', 'PRICE_FILE', 'STATE_DIR')}))
 """
-        result = subprocess.run([sys.executable, "-B", "-c", code],
+        result = subprocess.run([sys.executable, "-B", "-c", code, *args],
             cwd=Path(__file__).resolve().parents[1], env=env,
             check=True, capture_output=True, text=True)
         return {k: Path(v) for k, v in json.loads(result.stdout).items()}
@@ -48,18 +48,22 @@ print(json.dumps({name: str(getattr(c, name).resolve()) for name in
         shared = root.parent / 'var'
         self.assertEqual(paths['STATUS_FILE'], shared / 'klines_3m_status.json')
         self.assertEqual(paths['ACCOUNT_STREAM_DIR'], shared / 'binance_account_stream')
-        self.assertEqual(paths['EXCHANGE_INFO_CACHE_FILE'], shared / 'exchange_info_cache.json')
+        self.assertEqual(paths['EXCHANGE_INFO_CACHE_FILE'], root / 'var/exchange_info_cache.json')
         self.assertEqual(paths['STATE_DIR'], root / 'var/state')
         self.assertEqual(paths['PRICE_FILE'], root / 'var/binance_ticker_price/latest.json')
 
-    def test_explicit_shared_read_overrides_win(self):
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory).resolve()
-            paths = self._read_config({'V9711_WS_SHARED_ROOT': str(base),
-                'V9711_LIVE_3M_STATUS_FILE': str(base / 'custom.json')})
-            self.assertEqual(paths['STATUS_FILE'], base / 'custom.json')
-            self.assertEqual(paths['ACCOUNT_STREAM_DIR'], base / 'var/binance_account_stream')
-            self.assertEqual(paths['EXCHANGE_INFO_CACHE_FILE'], base / 'var/exchange_info_cache.json')
+    def test_stale_env_cannot_redirect_runtime_paths(self):
+        names = ('V9711_DEPLOY_ROOT', 'V9711_WS_SHARED_ROOT',
+            'V9711_LIVE_3M_STATUS_FILE', 'V9711_LIVE_ACCOUNT_STREAM_DIR',
+            'V9711_LIVE_EXCHANGE_INFO_CACHE_FILE', 'V9711_LIVE_PRICE_FILE',
+            'V9711_LIVE_SYMBOLS_FILE', 'V9711_LIVE_STATE_DIR')
+        self.assertEqual(self._read_config({name: '/wrong/path' for name in names}),
+                         self._read_config())
+
+    def test_paper_flag_preserves_existing_paper_directory(self):
+        root = Path(__file__).resolve().parents[1]
+        paths = self._read_config(args=('--paper',))
+        self.assertEqual(paths['STATE_DIR'], root / 'var/paper_state')
 
     def test_missing_status_diagnostic_is_read_only(self):
         with tempfile.TemporaryDirectory() as directory:

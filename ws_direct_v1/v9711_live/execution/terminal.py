@@ -164,17 +164,27 @@ class TradeTerminalView:
         ws = diagnostics.get('ws_direct') or {}
         if ws:
             lines.insert(-1, f'Internal WS: healthy={ws.get("healthy")} queue={ws.get("queue")} '
-                         f'decided={ws.get("decided")} stale={ws.get("rejected_backlog")} '
+                         f'prices={ws.get("fresh_symbols", 0)}/{ws.get("subscribed", 0)} decided={ws.get("decided")} stale={ws.get("rejected_backlog")} '
                          f'overflow={ws.get("overflow")} p95_us={ws.get("receive_to_decision_us_p95")} '
                          '(decision/dispatch, not exchange ACK; mirror runs after decision)')
         if diagnostics:
             lines.insert(-1, 'Entry plan: status={desired_status} signal_ready={signal_ready} '
                          'plan_ready={plan_ready} published={published} executable={priced_executable}'
-                         .format(**diagnostics))
+                         .format(**dict(diagnostics, published=diagnostics.get('template_total', diagnostics['published']))))
             lines.insert(-1, '  blockers=' + ','.join(diagnostics.get('blockers') or ['none'])
                          + ' selected=' + ','.join(diagnostics.get('selected_to_place') or ['none']))
-            lines.insert(-1, '  signal file: ' + str(diagnostics.get('desired_file')))
-            for symbol, reason in list((diagnostics.get('filtered') or {}).items())[:self.max_rows]:
+            filtered = diagnostics.get('filtered') or {}
+            quiet_reasons = {'quote_waiting_first_tick', 'quote_waiting_reconnect_tick',
+                             'quote_stream_not_ready', 'quote_stale',
+                             'missing_or_stale_price_or_invalid_limit'}
+            waiting = sum(reason in {'quote_waiting_first_tick', 'quote_waiting_reconnect_tick'}
+                          for reason in filtered.values())
+            stale = sum(reason == 'quote_stale' for reason in filtered.values())
+            if waiting or stale:
+                lines.insert(-1, f'  quotes: waiting first/reconnect tick={waiting} stale={stale}')
+            actionable = [(symbol, reason) for symbol, reason in filtered.items()
+                          if reason not in quiet_reasons]
+            for symbol, reason in actionable[:3]:
                 lines.insert(-1, f'  entry skipped {symbol}: {reason}')
         rejections = sorted((f.get('entry_rejections') or {}).values(),
                             key=lambda row: row.get('rejected_at_epoch', 0), reverse=True)

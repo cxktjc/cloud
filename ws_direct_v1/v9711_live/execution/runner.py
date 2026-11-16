@@ -913,10 +913,11 @@ class LiveTrade(ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkT
                         for a in plan.actions],
             'admission_gap': self._current_admission_gap(),
         }
-        diagnostic_key = None if getattr(self, '_fast_tick', False) else json.dumps(self._entry_diagnostics, sort_keys=True)
-        if not getattr(self, '_fast_tick', False) and diagnostic_key != getattr(self, '_last_entry_diagnostic_key', None):
-            LOG.info('entry diagnostics %s', diagnostic_key)
-            self._last_entry_diagnostic_key = diagnostic_key
+        if not getattr(self, '_fast_tick', False) and LOG.isEnabledFor(logging.DEBUG):
+            diagnostic_key = json.dumps(self._entry_diagnostics, sort_keys=True)
+            if diagnostic_key != getattr(self, '_last_entry_diagnostic_key', None):
+                LOG.debug('entry diagnostics %s', diagnostic_key)
+                self._last_entry_diagnostic_key = diagnostic_key
         return desired_rows, live_desired, price_map, plan
 
     def run(self) -> int:
@@ -972,6 +973,7 @@ class LiveTrade(ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkT
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--paper', action='store_true', help='Use isolated var/paper_state; paths do not read .env.')
     parser.add_argument('--enable-live', action='store_true',
                         help='Allow the exchange adapter to connect and submit exact orders.')
     parser.add_argument('--no-dry-run', action='store_true',
@@ -979,6 +981,8 @@ def main() -> int:
     parser.add_argument('--log-level', default='INFO')
     parser.add_argument('--check-inputs', action='store_true', help='Read-only WS-direct paths and contract diagnostics.')
     args = parser.parse_args()
+    if args.paper and args.no_dry_run:
+        parser.error('--paper cannot be combined with --no-dry-run')
     if args.check_inputs:
         from .ws_direct import check_inputs
         print(json.dumps(check_inputs(), indent=2, ensure_ascii=False))

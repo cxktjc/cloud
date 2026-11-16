@@ -120,6 +120,17 @@ class DirectMarket:
             return bool(self.healthy() and tick and self.generation[tick.group] == tick.generation
                         and -5 <= time.time()-tick.exchange_ms/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS)
 
+    def quote_state(self, symbol):
+        with self._lock:
+            tick = self.processed.get(symbol)
+            if tick is None:
+                return 'quote_waiting_first_tick'
+            if tick.generation != self.generation[tick.group]:
+                return 'quote_waiting_reconnect_tick'
+            if not self.healthy():
+                return 'quote_stream_not_ready'
+            return 'quote_stale'
+
     def prices(self, symbols=None):
         if not self.healthy():
             return {}
@@ -185,6 +196,8 @@ class DirectMarket:
             values = sorted(self.latencies_us)
             percentile = lambda p: values[min(len(values)-1, int((len(values)-1)*p))] if values else None
             return dict(self.counts, queue=self.events.qsize(), healthy=self.healthy(),
+                        subscribed=len(self.symbols), received_symbols=len(self.processed),
+                        fresh_symbols=len(self.prices()),
                         receive_to_decision_us_p50=percentile(.5),
                         receive_to_decision_us_p95=percentile(.95),
                         receive_to_decision_us_p99=percentile(.99),

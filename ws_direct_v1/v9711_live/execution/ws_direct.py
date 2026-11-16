@@ -8,6 +8,7 @@ from pathlib import Path
 from .. import config as cfg
 from .runner import LiveTrade
 from .ws_market import DirectMarket
+from .metadata_sync import MetadataSync
 from collectors.ticker_ws import load_symbols
 
 LOG = logging.getLogger('v9711.ws_direct')
@@ -36,6 +37,13 @@ class DirectTrade(LiveTrade):
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.market_guard = self._market_send_allowed
+        self._refresh_precision_readiness()
+
+    def _refresh_precision_readiness(self):
+        # Only startup/maintenance reads the cache; no extra file read per tick.
+        with self.client._metadata_lock:
+            metadata = self.client._metadata_reader.read()
+        self._precision_ready = isinstance(metadata, dict) and bool(metadata.get('symbols'))
 
     def _market_send_allowed(self, symbol):
         account_ready = (not self.client.enabled or self.client.dry_run
@@ -49,6 +57,7 @@ class DirectTrade(LiveTrade):
             self._account_deadline = stamp + cfg.ACCOUNT_STREAM_MAX_AGE_SECONDS - float(health.get('age_seconds', 0))
         else:
             self._account_deadline = 0
+        self._refresh_precision_readiness()
         return super().step(now=now)
 
     def _execute_entries(self, snapshot, status, **kwargs):
@@ -57,7 +66,16 @@ class DirectTrade(LiveTrade):
                 status = 'ws_not_ready'
             elif self.client.enabled and not self.client.dry_run and time.time() > self._account_deadline:
                 status = 'account_not_ready'
-        return super()._execute_entries(snapshot, status, **kwargs)
+        if status == 'valid' and not self._precision_ready:
+            status = 'precision_cache_not_ready'
+        result = super()._execute_entries(snapshot, status, **kwargs)
+        self._entry_diagnostics['template_total'] = len(self._templates)
+        for symbol, reason in self._entry_diagnostics['filtered'].items():
+            if reason == 'missing_or_stale_price_or_invalid_limit':
+                limit = self._finite(self._templates.get(symbol, {}).get('limit_price'))
+                self._entry_diagnostics['filtered'][symbol] = (
+                    'invalid_limit' if limit <= 0 else self.market.quote_state(symbol))
+        return result
 
     def desired_snapshot(self, *, now):
         payload, status = super().desired_snapshot(now=now)
@@ -172,9 +190,11 @@ class DirectTrade(LiveTrade):
         if self.once:
             self.step()
             return 0
-        self.market.start()
+        metadata_sync = MetadataSync(cfg.EXCHANGE_INFO_CACHE_FILE)
+        metadata_sync.start()
         next_maintenance = time.monotonic()
         try:
+            self.market.start()
             while True:
                 now_mono = time.monotonic()
                 if now_mono >= next_maintenance:
@@ -207,4 +227,5 @@ class DirectTrade(LiveTrade):
             LOG.info('WS direct stopped')
             return 0
         finally:
+            metadata_sync.stop()
             self.market.close()

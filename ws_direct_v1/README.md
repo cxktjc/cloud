@@ -64,22 +64,35 @@ New writer-owned files default to this directory's var/:
 - var/state/execution_feedback.json, trade.log, signal.log
 - var/binance_ticker_price/latest.json (ONLY new trade writes it)
 
-Code defaults (even without .env) read completed-3m status, account stream and
-exchange filters from the parent deployment var/. V9711_WS_SHARED_ROOT can
-override that shared deployment root; individual read-path overrides still win.
-Price mirrors and state remain inside ws_direct_v1/var/. Existing .env or shell
-overrides are not changed by git pull: correct a stale V9711_LIVE_3M_STATUS_FILE
-to /opt/v9711-live/cloud/var/klines_3m_status.json, or remove that override.
+All runtime paths are derived from the installed code directory, never from
+.env path settings or the working directory:
 
-.env.example shares the existing completed-3m status/MySQL and live account
-stream in /opt/v9711-live/cloud/var. Adjust the READ paths to the actual running
-collectors. Keep the existing 3m/agg/account processes running. Do NOT start a
-second account writer or the copied ticker collector. The ticker module remains
-as the internal WS transport implementation, not an external price publisher.
+- Completed 3m status: ../var/klines_3m_status.json
+- Account stream: ../var/binance_account_stream
+- Symbols: config/symbols.txt
+- New price mirror: var/binance_ticker_price/latest.json
+- Precision filters: var/exchange_info_cache.json (new trade refreshes automatically)
+- Live/migrated state: var/state
+- Explicit --paper mode: var/paper_state (BOTH signal and trade need --paper)
 
-The new process rejects a legacy V9711_DEPLOY_ROOT or state/price writer override
-pointing outside this directory. Never copy an old .env unchanged. The process
-loads its own .env; shell variables override it and may need to be unset.
+Old V9711_* path settings are ignored; no private .env editing is needed to
+correct those paths. Credentials and other operational settings still use .env.
+The .env file itself is always loaded from this version's code directory.
+Existing files/ledgers are never moved or deleted. If previously running with
+V9711_LIVE_STATE_DIR pointing to var/paper_state, replace that environment
+override with --paper on BOTH launch commands to continue the same ledger.
+
+Keep the existing 3m/agg/account collectors running. Do NOT start a second
+account writer or an external ticker for this version. The new trade fetches
+public precision filters in a separate background thread at startup, then every
+6 hours (failure retry 60s). Failed fetches retain a valid old cache; missing or
+invalid filters block entry instead of guessing tick/step precision.
+
+Diagnostics aggregate first-tick/reconnect waits and stale quotes. Detailed
+plan dumps require --log-level DEBUG; real rejects and network errors remain
+visible. Internal WS prices=FRESH/SUBSCRIBED distinguishes partial coverage
+from an entirely disconnected feed. Group health alone does not mean every
+illiquid symbol has traded since startup.
 
 ## Server preparation (does not start a live trader)
 
@@ -90,10 +103,8 @@ cd ws_direct_v1
 # This version can reuse the existing interpreter/dependencies.
 cp -n .env.example .env
 chmod 600 .env
-# Edit .env: fill API keys, MySQL settings and real shared input paths.
-# Do NOT change this version's writer paths back to the legacy directory.
+# Edit .env: fill API keys and MySQL settings; no runtime paths needed.
 nano .env
-unset V9711_DEPLOY_ROOT V9711_LIVE_STATE_DIR V9711_LIVE_PRICE_FILE
 ../.venv/bin/python -B -m v9711_live.execution.runner --check-inputs
 ../.venv/bin/python -B -m v9711_live.run_signal --check-inputs
 ../.venv/bin/python -B -m scripts.refresh_exchange_info
@@ -110,12 +121,12 @@ Use a SEPARATE paper state directory in BOTH terminals. No --enable-live flag.
 Terminal A:
 ```bash
 cd /opt/v9711-live/cloud/ws_direct_v1
-V9711_LIVE_STATE_DIR="$PWD/var/paper_state" ../.venv/bin/python -B -u -m v9711_live.run_signal
+../.venv/bin/python -B -u -m v9711_live.run_signal --paper
 ```
 Terminal B:
 ```bash
 cd /opt/v9711-live/cloud/ws_direct_v1
-V9711_LIVE_STATE_DIR="$PWD/var/paper_state" ../.venv/bin/python -B -u -m v9711_live.execution.runner
+../.venv/bin/python -B -u -m v9711_live.execution.runner --paper
 ```
 
 Signal may start without a price file; trade establishes WS and publishes it.
@@ -150,7 +161,7 @@ successful WS_MIGRATION.json marker; it will not silently start an empty ledger.
 If a paper trial already used the LIVE var/state by mistake, do not delete it
 blindly: inspect it instead of forcing an overwrite.
 
-Then in separate terminals, without the paper STATE_DIR override:
+Then in separate terminals, without --paper:
 
 ```bash
 # New matching signal:

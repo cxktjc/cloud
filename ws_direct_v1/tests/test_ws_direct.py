@@ -129,6 +129,7 @@ class DirectAdmissionTests(unittest.TestCase):
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         values = dict(STATE_DIR=self.root/'state', DESIRED_FILE=self.root/'plans.json',
                       EXECUTION_INTENT_FILE=self.root/'intents.json', EXECUTION_LEDGER_FILE=self.root/'ledger.json',
+                      EXECUTION_FEEDBACK_FILE=self.root/'feedback.json',
                       SYMBOLS_FILE=self.root/'symbols.txt', EXCHANGE_INFO_CACHE_FILE=self.root/'filters.json',
                       PRICE_FILE=self.root/'latest.json', ACCOUNT_STREAM_DIR=self.root/'account')
         for key,value in values.items():
@@ -280,6 +281,50 @@ class DirectAdmissionTests(unittest.TestCase):
         # A new packet alone does not override signal readiness.
         self.event()
         self.assertEqual(self.trade.tracked,{})
+
+    def test_first_quote_wait_has_distinct_diagnostic(self):
+        snapshot, status = self.trade.desired_snapshot(now=self.now)
+        self.trade._execute_entries(snapshot, status, now=self.now, targets={}, final_exit_bar=False)
+        self.assertEqual(self.trade._entry_diagnostics['filtered']['TESTUSDT'],
+                         'quote_waiting_first_tick')
+        self.assertEqual(self.trade.tracked, {})
+
+    def test_missing_precision_cache_is_global_blocker_not_per_symbol_spam(self):
+        cfg.EXCHANGE_INFO_CACHE_FILE.unlink()
+        self.trade._refresh_precision_readiness()
+        with patch('v9711_live.execution.runner.LOG.warning') as warning:
+            self.event()
+        self.assertEqual(self.trade.tracked, {})
+        self.assertIn('desired_precision_cache_not_ready',
+                      self.trade._entry_diagnostics['blockers'])
+        warning.assert_not_called()
+
+    def test_precision_readiness_adds_no_cache_read_to_tick_path(self):
+        # Outside admission range, no local precision preflight is necessary.
+        with patch.object(self.trade.client._metadata_reader, 'read',
+                          side_effect=AssertionError('extra cache read on tick')):
+            self.event('.03')
+
+    def test_plan_dump_is_not_info_log(self):
+        self.event('.03')
+        with patch('v9711_live.execution.runner.LOG.info') as info:
+            self.trade.step()
+        self.assertFalse(any('entry diagnostics' in str(call) for call in info.call_args_list))
+
+
+    def test_panel_summarizes_waits_but_keeps_real_preflight_errors(self):
+        with patch.object(self.trade.view, 'render') as render:
+            self.trade.step()
+        fields = render.call_args.kwargs
+        fields['entry_diagnostics']['filtered'] = {
+            'WAITUSDT': 'quote_waiting_first_tick', 'STALEUSDT': 'quote_stale',
+            'BADUSDT': 'preflight: invalid precision'}
+        text = self.trade.view._format(fields)
+        self.assertNotIn('entry skipped WAITUSDT', text)
+        self.assertNotIn('entry skipped STALEUSDT', text)
+        self.assertIn('waiting first/reconnect tick=1 stale=1', text)
+        self.assertIn('entry skipped BADUSDT: preflight: invalid precision', text)
+
 
 
 class TemplateAndMigrationTests(unittest.TestCase):

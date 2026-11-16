@@ -13,6 +13,7 @@ The signal process has no websocket: it polls local JSON/MySQL only.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,16 +22,11 @@ from .environment import load_environment, MYSQL_DEFAULT_PASSWORD
 load_environment()
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-# This package is self-contained; never derive paths from the original D:\0606 tree.
-ROOT = Path(os.environ.get('V9711_DEPLOY_ROOT', str(PACKAGE_DIR.parent))).expanduser().resolve()
+# Paths are code-relative, never taken from a private .env or shell.
+ROOT = PACKAGE_DIR.parent.resolve()
 VAR_DIR = ROOT / 'var'
-if ROOT != PACKAGE_DIR.parent.resolve():
-    raise RuntimeError('WS-direct root mismatch: unset legacy V9711_DEPLOY_ROOT; use this version own .env')
-
-
-def env_path(name: str, default: Path) -> Path:
-    value = str(os.environ.get(name, '') or '').strip()
-    return Path(value) if value else default
+# Explicit paper mode retains the pre-existing paper ledger location.
+PAPER_MODE = '--paper' in sys.argv[1:]
 
 
 def env_float(name: str, default: float) -> float:
@@ -57,14 +53,14 @@ QV_WINDOW = 20
 QV_MIN_PERIODS = 10
 
 # Reuse parent deployment collectors by default; keep all new writers isolated.
-SHARED_ROOT = env_path("V9711_WS_SHARED_ROOT", ROOT.parent).expanduser().resolve()
+SHARED_ROOT = ROOT.parent
 SHARED_VAR_DIR = SHARED_ROOT / "var"
 
 # Local data files.
-STATUS_FILE = env_path('V9711_LIVE_3M_STATUS_FILE', SHARED_VAR_DIR / 'klines_3m_status.json')
-PRICE_FILE = env_path('V9711_LIVE_PRICE_FILE', VAR_DIR / 'binance_ticker_price' / 'latest.json')
-SYMBOLS_FILE = env_path('V9711_LIVE_SYMBOLS_FILE', ROOT / 'config' / 'symbols.txt')
-STATE_DIR = env_path('V9711_LIVE_STATE_DIR', VAR_DIR / 'state')
+STATUS_FILE = SHARED_VAR_DIR / 'klines_3m_status.json'
+PRICE_FILE = VAR_DIR / 'binance_ticker_price' / 'latest.json'
+SYMBOLS_FILE = ROOT / 'config' / 'symbols.txt'
+STATE_DIR = VAR_DIR / ('paper_state' if PAPER_MODE else 'state')
 DESIRED_FILE = STATE_DIR / 'desired_orders_ws.json'
 SIGNAL_BOOK_FILENAME = 'signal_portfolio.json'
 SIGNAL_CATCHUP_BARS = 40
@@ -137,12 +133,10 @@ REOPEN_PROTECTION_SECONDS = env_float('V9711_LIVE_REOPEN_PROTECTION_SECONDS', 60
 TRADE_POLL_SECONDS = env_float('V9711_LIVE_TRADE_POLL_SECONDS', 0.02)
 TRADE_MAINTENANCE_SECONDS = env_float('V9711_LIVE_TRADE_MAINTENANCE_SECONDS', 0.5)
 ORDER_RECONCILE_SECONDS = env_float('V9711_LIVE_ORDER_RECONCILE_SECONDS', 2.0)
-ACCOUNT_STREAM_DIR = env_path('V9711_LIVE_ACCOUNT_STREAM_DIR',
-                              SHARED_VAR_DIR / 'binance_account_stream')
+ACCOUNT_STREAM_DIR = SHARED_VAR_DIR / 'binance_account_stream'
 ACCOUNT_STREAM_MAX_AGE_SECONDS = env_float('V9711_LIVE_ACCOUNT_STREAM_MAX_AGE_SECONDS', 15.0)
 ACCOUNT_ID = os.environ.get('V9711_LIVE_ACCOUNT_ID', 'default') or 'default'
-EXCHANGE_INFO_CACHE_FILE = env_path('V9711_LIVE_EXCHANGE_INFO_CACHE_FILE',
-                                    SHARED_VAR_DIR / 'exchange_info_cache.json')
+EXCHANGE_INFO_CACHE_FILE = VAR_DIR / 'exchange_info_cache.json'
 ORDER_REST_FALLBACK_SECONDS = env_float('V9711_LIVE_ORDER_REST_FALLBACK_SECONDS', 300.0)
 # Fast lane is only for an unacknowledged submission still actionable now.
 # Stable/acknowledged orders keep ORDER_REST_FALLBACK_SECONDS above.

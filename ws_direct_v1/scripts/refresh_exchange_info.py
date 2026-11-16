@@ -42,14 +42,19 @@ def normalize(payload):
     return {'schema_version': 1, 'source': URL, 'updated_at_utc': utc_now_iso(), 'symbols': result}
 
 
+def refresh(output):
+    request = Request(URL, headers={'User-Agent': 'v9711-filter-sync/1.0', 'Accept': 'application/json'})
+    with binance_network.urlopen(request, timeout=20) as response:
+        payload = normalize(json.loads(response.read()))
+    atomic_write_json(output, payload)
+    return payload
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=cfg.EXCHANGE_INFO_CACHE_FILE)
     args = parser.parse_args()
-    request = Request(URL, headers={'User-Agent': 'v9711-filter-sync/1.0', 'Accept': 'application/json'})
-    with binance_network.urlopen(request, timeout=20) as response:
-        payload = normalize(json.loads(response.read()))
-    atomic_write_json(args.output, payload)
+    payload = refresh(args.output)
     print(f'wrote {len(payload["symbols"])} symbol filters to {args.output.resolve()}')
     for symbol in ('AGTUSDT', 'DOSUSDT'):
         print(symbol, payload['symbols'].get(symbol, 'NOT FOUND'))
