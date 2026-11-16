@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .. import config as cfg
+from .position_identity import is_manual_position
 
 
 def positive(value: Any) -> float:
@@ -42,7 +43,7 @@ class SessionEntryStats:
     def observe_fill(self, symbol: str, row: Mapping[str, Any], *, quantity: Any) -> None:
         """Caller supplies a booked, positive, exact-owned ENTRY fill only."""
         symbol = str(symbol).upper().strip()
-        if not symbol or not positive(quantity):
+        if is_manual_position(row) or not symbol or not positive(quantity):
             return
         identity = (row.get('entry_client_order_id') or row.get('client_order_id')
                     or row.get('entry_order_id') or row.get('order_id'))

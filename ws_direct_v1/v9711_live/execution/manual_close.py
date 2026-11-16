@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from .stream import StreamUnavailable
 from .. import config as cfg
+from .position_identity import position_identity
 
 LOG = logging.getLogger('v9711_live_trade')
 
@@ -15,7 +16,7 @@ class ManualCloseMixin:
         except StreamUnavailable:
             return
         key = (health.last_event_seq, int(now // 2), tuple(sorted(
-            (symbol, pos.get('entry_client_order_id'), pos.get('quantity'))
+            (symbol, position_identity(pos), pos.get('quantity'))
             for symbol, pos in self.positions.items())))
         if key == getattr(self, '_last_manual_flat_probe', None):
             return
@@ -23,7 +24,8 @@ class ManualCloseMixin:
             if pos.get('side') != 'LONG':
                 continue
             since_ms = int(max(self._finite(pos.get('order_bar_open_ms')),
-                               self._finite(pos.get('entry_epoch')) * 1000))
+                               self._finite(pos.get('entry_epoch')) * 1000,
+                               self._finite(pos.get('external_evidence_since_ms'))))
             own_close = str(pos.get('close_client_order_id') or '')
             try:
                 evidence = self.client.stream.manual_flat_evidence(
@@ -42,7 +44,9 @@ class ManualCloseMixin:
         if not pos:
             return
         state = self.ledger.state
-        identity = str(pos.get('entry_client_order_id') or '')
+        identity = position_identity(pos)
+        if not identity:
+            return
         history = state.setdefault('manual_close_history', {})
         if identity in history:
             return
@@ -52,7 +56,8 @@ class ManualCloseMixin:
         if quantity <= 0 or entry <= 0 or exit_price <= 0:
             return
         pnl = quantity * (exit_price-entry) - quantity * (entry+exit_price) * cfg.TRADE_FEE_RATE
-        history[identity] = dict(evidence, entry_client_order_id=identity,
+        history[identity] = dict(evidence, entry_client_order_id=pos.get('entry_client_order_id'),
+            position_identity=identity, position_origin=pos.get('position_origin', 'exact_fill'),
             owned_entry_price=entry, booked_pnl=pnl, processed_at_epoch=now,
             pnl_basis='external SELL fill VWAP/owned entry; configured entry+exit fee estimate')
         close_cid = str(pos.get('close_client_order_id') or '')

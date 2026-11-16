@@ -10,6 +10,7 @@ import math
 from typing import Any, Mapping
 
 from .. import config as cfg
+from .position_identity import is_manual_position
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -71,7 +72,8 @@ def _view_positions(raw: Any, price_map: Mapping[str, float], source: str) -> di
             unrealized = (mark - entry) * qty if entry > 0.0 and qty > 0.0 else 0.0
         out[symbol] = {
             'symbol': symbol,
-            'source': source,
+            'source': 'operator_imported_position' if source == 'exact_owned_trade' and is_manual_position(row) else source,
+            'position_origin': row.get('position_origin', 'exact_fill' if source == 'exact_owned_trade' else source),
             'side': str(row.get('side') or 'LONG').upper(),
             'entry_price': entry,
             'mark_price': mark,
@@ -188,6 +190,7 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
                        near_place_count: int = 0,
                        stats: Mapping[str, Any] | None = None,
                        equity0: float = cfg.EQUITY0,
+                       imported_baseline: bool = False,
                        max_pending_orders: int = cfg.MAX_PENDING_ORDERS,
                        max_positions: int = cfg.SLOTS) -> dict[str, Any]:
     """Compute the executor's actual PnL and its difference from signal model."""
@@ -196,6 +199,8 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
     actual = _view_positions(actual_positions, price_map, 'exact_owned_trade')
     signal = _signal_pnl(signal_book, signal_positions, equity0)
     trade = _actual_pnl(actual, realized_balance, equity0)
+    if imported_baseline:
+        trade['pnl_kind'] = 'operator_imported_baseline_plus_subsequent_execution'
 
     largest_difference, part = _difference_rows(
         signal_positions, actual, max(1, max_pending_orders))
@@ -271,7 +276,8 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
 
     return {
         'schema_version': 1,
-        'basis': 'signal_contract_v2_model_vs_exact_owned_trade_state',
+        'basis': ('signal_model_vs_operator_imported_baseline_plus_execution' if imported_baseline
+                  else 'signal_contract_v2_model_vs_exact_owned_trade_state'),
         'initial_equity': equity0,
         'actual': {**trade, 'pending_order_count': pending_count},
         'signal': signal,

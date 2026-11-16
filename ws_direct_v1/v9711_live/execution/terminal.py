@@ -97,7 +97,8 @@ class TradeTerminalView:
             f'signal_revision={f.get("signal_revision") if f.get("signal_revision") is not None else "-"}  '
             f'trade_cap={cfg.SLOTS}  pending_order_cap={cfg.MAX_PENDING_ORDERS}',
             '-' * 116,
-            '当前实际持仓（只含精确归属成交）: '
+            ('当前trade持仓（含手动导入的signal账本仓位）: '
+             if f.get('manual_signal_sync') else '当前实际持仓（只含精确归属成交）: ')
             + compact_positions(f['comparison']['positions']['actual'], self.max_rows),
             f'trade实际累计收益(已实现): {actual["realized_pnl"]:+.6f}  '
             f'trade当前收益(浮盈): {actual["unrealized_pnl"]:+.6f}  '
@@ -145,7 +146,9 @@ class TradeTerminalView:
             f'stream={f.get("stream_health", {}).get("fresh", False)}  '
             f'last_event_seq={f.get("stream_health", {}).get("last_event_seq", "-")}  '
             f'feedback_updated={f.get("updated_at_epoch")}',
-            'trade收益仅来自精确归属订单成交/平仓和当前实际持仓；差异按同价对比signal模型，不是交易所账户总收益。',
+            ('trade收益=手动导入的一次性账本基准+后续trade独立收益；导入仓位不代表实际入场成交。'
+             if f.get('manual_signal_sync') else
+             'trade收益仅来自精确归属订单成交/平仓和当前实际持仓；差异按同价对比signal模型，不是交易所账户总收益。'),
             '=' * 116,
         ])
         forced_count = len(f.get('forced_close_history') or {})
@@ -155,14 +158,6 @@ class TradeTerminalView:
             lines.insert(-1, f'Closed audit: forced={forced_count} manual/external={manual_count} '
                          f'old exact-order cleanup pending={cleanup_count} '
                          '(audit retained; not an open position)')
-        capital = f.get('signal_capital_sync') or {}
-        if capital:
-            trade_balance = actual.get('realized_balance', cfg.EQUITY0)
-            lines.insert(-1, f'Signal compounding capital synced: balance='
-                         f'{capital.get("realized_balance", 0):.6f} '
-                         f'notional/order={capital.get("notional_per_order", 0):.6f} '
-                         f'revision={capital.get("revision", "-")}; '
-                         f'trade actual realized balance remains {trade_balance:.6f} (not overwritten)')
         diagnostics = f.get('entry_diagnostics') or {}
         ws = diagnostics.get('ws_direct') or {}
         if ws:
@@ -170,6 +165,11 @@ class TradeTerminalView:
                          f'prices={ws.get("fresh_symbols", 0)}/{ws.get("subscribed", 0)} decided={ws.get("decided")} stale={ws.get("rejected_backlog")} '
                          f'overflow={ws.get("overflow")} p95_us={ws.get("receive_to_decision_us_p95")} '
                          '(decision/dispatch, not exchange ACK; mirror runs after decision)')
+        sync = f.get('manual_signal_sync') or {}
+        if sync:
+            lines.insert(-1, '账本模式: 手动同步一次后trade独立维护；'
+                         f'signal导入版本={sync.get("signal_revision", "-")} '
+                         f'导入仓位={sync.get("imported_position_count", 0)}；不自动重新同步')
         if diagnostics:
             lines.insert(-1, 'Entry plan: status={desired_status} signal_ready={signal_ready} '
                          'plan_ready={plan_ready} published={published} executable={priced_executable}'

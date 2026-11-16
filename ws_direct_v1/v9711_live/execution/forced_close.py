@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from .stream import StreamUnavailable
 from .. import config as cfg
+from .position_identity import is_manual_position, position_identity
 
 LOG = logging.getLogger('v9711_live_trade')
 
@@ -27,16 +28,18 @@ class ForcedCloseMixin:
             health = stream.health()
         except StreamUnavailable:
             return
-        key = (health.last_event_seq, int(now // 5), tuple(sorted((symbol, pos.get('entry_client_order_id'),
+        key = (health.last_event_seq, int(now // 5), tuple(sorted((symbol, position_identity(pos),
                 pos.get('quantity')) for symbol, pos in self.positions.items())))
         if key == getattr(self, '_last_forced_probe', None):
             return
         for symbol, pos in list(self.positions.items()):
             cid = str(pos.get('entry_client_order_id') or '')
-            if not cid.startswith(cfg.ORDER_CLIENT_PREFIX + '_') or pos.get('side') != 'LONG':
+            if (not (cid.startswith(cfg.ORDER_CLIENT_PREFIX + '_') or is_manual_position(pos))
+                    or pos.get('side') != 'LONG'):
                 continue
             since_ms = int(max(self._finite(pos.get('order_bar_open_ms')),
-                               self._finite(pos.get('entry_epoch')) * 1000))
+                               self._finite(pos.get('entry_epoch')) * 1000,
+                               self._finite(pos.get('external_evidence_since_ms'))))
             try:
                 evidence = stream.forced_flat_evidence(symbol=symbol, since_ms=since_ms,
                                                        owned_qty=self._finite(pos.get('quantity')))
@@ -65,14 +68,18 @@ class ForcedCloseMixin:
             return
         state = self.ledger.state
         audit = state.setdefault('forced_close_history', {})
-        identity = str(pos['entry_client_order_id'])
+        identity = position_identity(pos)
+        if not identity:
+            return
         if identity in audit:
             return
         quantity = self._finite(pos['quantity'])
         entry = self._finite(pos['entry_price'])
         exit_price = self._finite(evidence['average_price'])
         pnl = quantity * (exit_price-entry) - quantity * (entry+exit_price) * cfg.TRADE_FEE_RATE
-        record = dict(evidence, entry_client_order_id=identity, closed_owned_qty=quantity,
+        record = dict(evidence, entry_client_order_id=pos.get('entry_client_order_id'),
+                      position_identity=identity, position_origin=pos.get('position_origin', 'exact_fill'),
+                      closed_owned_qty=quantity,
                       owned_entry_price=entry, booked_pnl=pnl, processed_at_epoch=now,
                       previous_close_status=pos.get('close_status'),
                       pnl_basis='owned_entry/forced_average; configured entry+exit fee estimate')

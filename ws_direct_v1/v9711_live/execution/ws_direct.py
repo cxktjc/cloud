@@ -9,6 +9,7 @@ from .. import config as cfg
 from .runner import LiveTrade
 from .ws_market import DirectMarket
 from .metadata_sync import MetadataSync
+from .position_identity import CAPITAL_MODE
 from collectors.ticker_ws import load_symbols
 
 LOG = logging.getLogger('v9711.ws_direct')
@@ -62,6 +63,21 @@ class DirectTrade(LiveTrade):
         self._refresh_precision_readiness()
         return super().step(now=now)
 
+    def _entry_sizing_row(self, row):
+        if self.ledger.state.get('capital_mode') != CAPITAL_MODE:
+            return row
+        item = dict(row)
+        symbol = str(item.get('symbol') or '').upper()
+        old = self.tracked.get(symbol) or {}
+        if old and all(old.get(key) == item.get(key) for key in
+                       ('order_bar_open_ms', 'reference_bar_open_ms', 'limit_price')):
+            # Do not cancel an existing order merely because trade equity moved.
+            item['notional'] = old.get('notional', item.get('notional'))
+        else:
+            item['notional'] = self._finite(self.ledger.state.get('realized_balance'),
+                                             cfg.EQUITY0) / cfg.SIGNAL_SIZING_DIVISOR
+        return item
+
     def _execute_entries(self, snapshot, status, **kwargs):
         if status == 'valid':
             if not self.market.healthy():
@@ -70,6 +86,11 @@ class DirectTrade(LiveTrade):
                 status = 'account_not_ready'
         if status == 'valid' and not self._precision_ready:
             status = 'precision_cache_not_ready'
+        if self.ledger.state.get('capital_mode') == CAPITAL_MODE:
+            snapshot = dict(snapshot)
+            # Per-tick work is bounded by the fast shortlist, not the universe.
+            snapshot['desired'] = [self._entry_sizing_row(row)
+                                   for row in snapshot.get('desired', []) if isinstance(row, dict)]
         result = super()._execute_entries(snapshot, status, **kwargs)
         self._entry_diagnostics['template_total'] = len(self._templates)
         for symbol, reason in self._entry_diagnostics['filtered'].items():
@@ -140,7 +161,7 @@ class DirectTrade(LiveTrade):
                 self._eligible.pop(symbol, None)
                 continue
             restore.append(item)
-            row = self._templates[symbol]
+            row = self._entry_sizing_row(self._templates[symbol])
             if (symbol in self.positions or symbol in self.tracked
                     or now < self._finite(self.ledger.state['reopen_until_epoch'].get(symbol))
                     or self._entry_submission_blocked(row)):
@@ -186,7 +207,8 @@ class DirectTrade(LiveTrade):
         if self.client.enabled and not self.client.dry_run:
             from ..contracts import read_json
             marker = read_json(cfg.STATE_DIR / 'WS_MIGRATION.json') or {}
-            if ((cfg.STATE_DIR / '.migration_in_progress').exists() or not marker.get('completed')
+            if ((cfg.STATE_DIR / '.migration_in_progress').exists()
+                    or (cfg.STATE_DIR / '.manual_signal_sync_pending.json').exists() or not marker.get('completed')
                     or not cfg.EXECUTION_INTENT_FILE.is_file() or not cfg.EXECUTION_LEDGER_FILE.is_file()):
                 raise RuntimeError('live execution startup not prepared; launch execution.runner for automatic ledger detection; never delete existing ledgers')
         if self.once:

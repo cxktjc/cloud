@@ -59,6 +59,8 @@ TERMINAL = {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED',
 class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseLongMixin, NetworkTradeMixin):
     def __init__(self, *, once: bool = False, enabled: bool | None = None,
                  dry_run: bool | None = None, nonblocking_io: bool | None = None):
+        if (cfg.STATE_DIR / '.manual_signal_sync_pending.json').exists():
+            raise RuntimeError('manual signal ledger sync interrupted; rerun scripts.sync_signal_to_trade --apply')
         self.session_entries = SessionEntryStats(started_at=time.time())
         cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
         self.once = bool(once)
@@ -108,6 +110,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
     @property
     def positions(self) -> dict[str, dict[str, Any]]:
         return self.ledger.state['owned_positions']
+
+    def _book_initial_equity(self) -> float:
+        value = self._finite(self.ledger.state.get('book_initial_equity'), cfg.EQUITY0)
+        return value if value > 0 else cfg.EQUITY0
 
     @staticmethod
     def _finite(value: Any, default: float = 0.0) -> float:
@@ -622,19 +628,6 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self.ledger.state['signal_target_positions'] = targets
         portfolio = dict(snapshot.get('portfolio') or {})
         self.ledger.state['signal_portfolio'] = portfolio
-        # Force-sync the model's compounding capital separately from execution
-        # PnL. New candidate notionals already come from this same signal book;
-        # never overwrite actual realized_balance or claim model fills as trades.
-        self.ledger.state['signal_capital_sync'] = {
-            'session_id': snapshot.get('signal_session_id') or portfolio.get('session_id'),
-            'revision': snapshot.get('signal_revision', portfolio.get('revision')),
-            'initial_equity': self._finite(portfolio.get('initial_equity'), cfg.EQUITY0),
-            'realized_balance': self._finite(portfolio.get('realized_balance'), cfg.EQUITY0),
-            'notional_per_order': self._finite(portfolio.get('notional_per_order')),
-            'sizing_divisor': self._finite(portfolio.get('sizing_divisor'), cfg.SIGNAL_SIZING_DIVISOR),
-            'synced_at_epoch': time.time(),
-            'source': 'current_ready_signal_snapshot',
-        }
 
     def _comparison(self, *, snapshot: Mapping[str, Any], price_map: Mapping[str, float],
                     signal_desired_count: int, priced_desired_count: int,
@@ -652,7 +645,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             priced_desired_count=priced_desired_count,
             near_place_count=near_place_count,
             stats=self.stats,
-            equity0=cfg.EQUITY0,
+            equity0=self._book_initial_equity(),
+            imported_baseline=bool(self.ledger.state.get('manual_signal_sync')),
             max_pending_orders=cfg.MAX_PENDING_ORDERS,
             max_positions=cfg.SLOTS)
 
@@ -690,8 +684,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'updated_at_epoch': now,
             'realized_balance': self._finite(
                 self.ledger.state.get('realized_balance'), cfg.EQUITY0),
+            'initial_equity': self._book_initial_equity(),
             'cumulative_pnl': self._finite(
-                self.ledger.state.get('realized_balance'), cfg.EQUITY0) - cfg.EQUITY0,
+                self.ledger.state.get('realized_balance'), cfg.EQUITY0) - self._book_initial_equity(),
             'current_unrealized_pnl': current,
             'positions': positions,
             'open_orders': orders,
@@ -700,7 +695,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'signal_session_id': self.ledger.state.get('signal_session_id'),
             'signal_revision': self.ledger.state.get('last_signal_revision'),
             'signal_portfolio': self.ledger.state.get('signal_portfolio') or {},
-            'signal_capital_sync': self.ledger.state.get('signal_capital_sync') or {},
+            'capital_mode': self.ledger.state.get('capital_mode', 'execution_ledger'),
+            'manual_signal_sync': self.ledger.state.get('manual_signal_sync') or {},
             'manual_close_history': dict(self.ledger.state.get('manual_close_history', {})),
             'comparison': dict(comparison),
             'session_entry_stats': self.session_entries.snapshot(
@@ -718,7 +714,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'entry_diagnostics': getattr(self, '_entry_diagnostics', {}),
             'stream_health': dict(stream_health),
             'network_io': self._network_io.health() if self._network_io else {'enabled': False},
-            'note': ('Executor-owned exact-identity state. Aggregate account '
+            'note': ('Operator-imported signal baseline plus subsequent execution accounting; '
+                     'imported positions are not claimed as exchange entry fills.'
+                     if self.ledger.state.get('manual_signal_sync') else
+                     'Executor-owned exact-identity state. Aggregate account '
                      'positions are never adopted as v9711 positions.'),
         }
         atomic_write_json(cfg.EXECUTION_FEEDBACK_FILE, payload)
@@ -751,6 +750,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             entry_gap_policy=GapPolicy().describe(),
             current_admission_gap=self._current_admission_gap(),
             pending_rotation=self.ledger.state.get('pending_rotation'),
+            capital_mode=self.ledger.state.get('capital_mode', 'execution_ledger'),
+            manual_signal_sync=dict(self.ledger.state.get('manual_signal_sync') or {}),
+            manual_close_history=dict(self.ledger.state.get('manual_close_history', {})),
             forced_close_history=dict(self.ledger.state.get('forced_close_history', {})),
             forced_close_cleanup=dict(self.ledger.state.get('forced_close_cleanup', {})),
             entry_diagnostics=getattr(self, '_entry_diagnostics', {}),
@@ -996,11 +998,28 @@ def main() -> int:
                         help='Allow the exchange adapter to connect and submit exact orders.')
     parser.add_argument('--no-dry-run', action='store_true',
                         help='Disable local simulation; requires --enable-live.')
+    parser.add_argument('--sync-signal-ledger', action='store_true',
+                        help='MANUAL one-time signal funds/positions import, with backup, then EXIT; no orders. Stop signal/trade first.')
+    parser.add_argument('--sync-price', action='append', default=[], metavar='SYMBOL=PRICE',
+                        help='With --sync-signal-ledger: override imported entry price, preserving notional.')
+    parser.add_argument('--sync-symbol', action='append', default=None, metavar='SYMBOL',
+                        help='With --sync-signal-ledger: import only selected signal positions (repeatable).')
     parser.add_argument('--log-level', default='INFO')
     parser.add_argument('--check-inputs', action='store_true', help='Read-only WS-direct paths and contract diagnostics.')
     args = parser.parse_args()
     if args.paper and args.no_dry_run:
         parser.error('--paper cannot be combined with --no-dry-run')
+    if (args.sync_price or args.sync_symbol is not None) and not args.sync_signal_ledger:
+        parser.error('--sync-price/--sync-symbol require --sync-signal-ledger')
+    if args.sync_signal_ledger:
+        from .manual_sync import parse_prices, sync
+        try:
+            result = sync(cfg.STATE_DIR, prices=parse_prices(args.sync_price), symbols=args.sync_symbol,
+                          apply=True, paper=args.paper)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0  # Deliberately do NOT instantiate an exchange client or start trade.
     if args.check_inputs:
         from .ws_direct import check_inputs
         print(json.dumps(check_inputs(), indent=2, ensure_ascii=False))

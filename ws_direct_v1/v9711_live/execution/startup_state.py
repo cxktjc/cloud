@@ -199,6 +199,8 @@ def prepare_live_state(destination, candidates, leases):
             raise RuntimeError(f'invalid live takeover source: {path}')
         leases.enter_context(SingleWriter(path / 'trade.lock'))
         locked.add(path)
+    if (destination / '.manual_signal_sync_pending.json').exists():
+        raise RuntimeError('manual signal ledger sync interrupted; rerun scripts.sync_signal_to_trade --apply; no trade started')
     receipt_path = destination / 'WS_MIGRATION.json'
     journal_path = destination / '.migration_in_progress'
     journal = _json(journal_path) if journal_path.exists() else None
@@ -209,6 +211,29 @@ def prepare_live_state(destination, candidates, leases):
     receipt = _json(receipt_path) if receipt_path.exists() else None
     if receipt is not None and not receipt.get('completed'):
         raise RuntimeError(f'incomplete live receipt at {receipt_path}; preserving files')
+    if receipt and not journal_path.exists() and receipt.get('kind') == 'manual_signal_to_trade_v1':
+        pair = _read_pair(destination)
+        state = json.loads(pair[FILES[1]])['state']
+        if ((state.get('manual_signal_sync') or {}).get('sync_id') != receipt.get('sync_id')
+                or not receipt.get('sync_id')):
+            raise RuntimeError('manual signal ledger receipt/state mismatch; no overwrite')
+        paths = [*candidates, *receipt.get('sources', [])]
+        if receipt.get('source'):
+            paths.append(receipt['source'])
+        recorded = receipt.get('legacy_sha256') or {}
+        for path in dict.fromkeys(Path(p).resolve() for p in paths):
+            if path == destination or 'paper_state' in path.parts:
+                continue
+            if path.is_relative_to(destination) or destination.is_relative_to(path):
+                raise RuntimeError(f'overlapping execution directories: {path}, {destination}')
+            present = any((path/name).exists() for name in FILES)
+            if present or (path/'trade.lock').exists() or str(path) in recorded:
+                lease(path)
+                hashes = {name:hashlib.sha256((path/name).read_bytes()).hexdigest()
+                          for name in FILES if (path/name).exists()}
+                if hashes != recorded.get(str(path), {}):
+                    raise RuntimeError(f'legacy execution ledger changed after manual sync: {path}; no overwrite')
+        return receipt
     if receipt and not journal_path.exists():
         source = receipt.get('source')
         if source:
@@ -238,6 +263,8 @@ def prepare_live_state(destination, candidates, leases):
     paths = list(candidates)
     if receipt and receipt.get('source'):
         paths.append(Path(receipt['source']))
+    if receipt:
+        paths.extend(Path(path) for path in receipt.get('sources', []))
     if journal:
         paths = [Path(journal['source'])]
     for item in dict.fromkeys(Path(p).resolve() for p in paths):

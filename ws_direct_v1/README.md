@@ -215,7 +215,7 @@ orders, owned positions, unknown client identities or mixed real/simulated
 history are not erased. The backup location is printed at startup. No manual
 file removal or migration marker editing is required.
 
-### Manual external close and signal-capital synchronization
+### Manual external close
 
 The live executor retires an exact-owned LONG position after a manual/web close
 only when the account stream proves both (1) a post-entry explicit LONG=0 or a
@@ -224,14 +224,89 @@ trade fills. It records an estimated realized PnL from the fill VWAP and configu
 fees; it does not rely on a mark-price/position-absence guess. Until both proofs
 arrive, the owned position is retained.
 
-On every ready signal snapshot, execution force-syncs a separate
-signal_capital_sync ledger record (signal realized balance, per-order target,
-revision/session). The desired-order notional remains signal-authoritative.
-Trade realized_balance remains exact execution accounting and is intentionally
-NOT overwritten by model PnL. This keeps sizing synchronized without falsifying
-actual fills or trade returns.
-
 Resolved forced/manual closes stay in execution_ledger.json for audit. The panel
-shows only aggregate counts, not a repeated symbol-by-symbol history. An old
-exact close identity remains in cleanup until terminal exchange evidence; the
-summary is not an open position.
+shows aggregate counts, not a repeated symbol-by-symbol history. An old exact
+close identity remains in cleanup until terminal exchange evidence; the summary
+is not an open position.
+
+### MANUAL one-time signal-to-trade accounting sync (not automatic)
+
+Normal startup and normal signal reads NEVER import signal funds/positions.
+Only an explicit operator command below does this, once. This replaces the old
+trade accounting baseline with signal initial_equity, realized_balance, and the
+selected current LONG positions (entry price, quantity, identity and fixed exit
+time). Prior files are backed up; signal_portfolio.json is NEVER modified.
+
+IMPORTANT: This is a ledger operation, NOT a BUY/SELL or exchange position sync.
+Only import positions you have independently verified actually exist on Binance,
+with suitable quantity. Model quantities are copied exactly, not rounded like
+new exchange orders. If signal is flat, the command makes the trade book flat
+but DOES NOT sell any remaining exchange positions. Verify the preview first.
+Imported seeds are explicitly labelled and are NOT fabricated exchange fills.
+
+1. Stop the matching new signal, new trade and any legacy trade. Keep account,
+   3m/aggregation and other collectors running. Allow/cancel and reconcile all
+   outstanding entry orders/UNKNOWN closes before stopping; the command refuses
+   to overwrite them. Stop systemd-managed writers through systemd so they do
+   not automatically restart during the operation.
+2. Preview (no accounting or backup changes):
+
+```bash
+cd /opt/v9711-live/cloud/ws_direct_v1
+/opt/v9711-live/cloud/.venv/bin/python -B -m scripts.sync_signal_to_trade
+```
+
+3. Apply ONCE after checking the output:
+
+```bash
+/opt/v9711-live/cloud/.venv/bin/python -B -m v9711_live.execution.runner --sync-signal-ledger
+```
+
+This flag imports, prints the backup path and EXITS. It never starts an exchange
+client. The equivalent command is `-m scripts.sync_signal_to_trade --apply`.
+Do NOT put the sync flag in a service unit or your regular restart command.
+
+Optional explicit entry-price override (preserves original signal notional,
+recalculates quantity = notional / overridden entry price):
+
+```bash
+# Preview with price override (use a REAL symbol currently in your signal book):
+/opt/v9711-live/cloud/.venv/bin/python -B -m scripts.sync_signal_to_trade --price SYMBOLUSDT=0.1234
+# Apply the same override ONCE:
+/opt/v9711-live/cloud/.venv/bin/python -B -m v9711_live.execution.runner --sync-signal-ledger --sync-price SYMBOLUSDT=0.1234
+```
+
+If signal has more than three holdings, there is no silent truncation: select
+which verified actual holdings to adopt (repeat --symbol in the preview and
+--sync-symbol in the runner). Signal capital still imports in full; only the
+selected holdings import. Without selections, all signal holdings import if
+within the current trade cap. Due times are retained, even if already overdue;
+normal trade may immediately start an exit for an overdue imported holding.
+
+4. Restart signal and trade in separate terminals, WITHOUT any sync flag:
+
+```bash
+cd /opt/v9711-live/cloud/ws_direct_v1
+/opt/v9711-live/cloud/.venv/bin/python -B -u -m v9711_live.run_signal
+```
+
+```bash
+cd /opt/v9711-live/cloud/ws_direct_v1
+/opt/v9711-live/cloud/.venv/bin/python -B -u -m v9711_live.execution.runner --enable-live --no-dry-run
+```
+
+After import, trade independently persists its balance and positions. New entry
+notional uses TRADE realized_balance / 3 (existing exchange minimum sizing still
+applies); signal changes no longer resize trade orders or overwrite its capital
+or holdings. Existing order notionals remain fixed for their unchanged plan.
+Exits/fills/manual or forced-flat evidence update only trade's own ledger. Normal
+restarts retain this mode and never repeat the import. Signal snapshots remain
+available for strategy candidates, target comparison and model PnL display.
+
+Backup directory: `var/state/execution_backups/manual_signal_sync_<id>/`.
+It contains the original execution pair, feedback, receipt, signal checkpoint,
+and discovered legacy execution copies plus a manifest. No source file is
+deleted. Legacy executors remain locked while the new live trader is running.
+If application was interrupted, trade startup is blocked: rerun the same manual
+apply command to finish the frozen transaction. Do not delete the pending journal
+or ledgers. Changed/conflicting files stop recovery rather than being discarded.

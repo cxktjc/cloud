@@ -328,14 +328,15 @@ class DirectAdmissionTests(unittest.TestCase):
             'symbol': 'BULLAUSDT', 'closed_owned_qty': 192}}
         fields['forced_close_cleanup'] = {'BULLAUSDT': {'reason': 'confirmed_forced_flat'}}
         fields['manual_close_history'] = {}
-        fields['signal_capital_sync'] = {'realized_balance': 14.9,
-            'notional_per_order': 14.9/3, 'revision': 42}
+        fields['manual_signal_sync'] = {'signal_revision': 42, 'imported_position_count': 1}
         text = self.trade.view._format(fields)
         self.assertNotIn('BULLAUSDT', text)
         self.assertIn('Closed audit: forced=1 manual/external=0 old exact-order cleanup pending=1', text)
-        self.assertIn('Signal compounding capital synced: balance=14.900000', text)
+        self.assertNotIn('Signal compounding capital synced', text)
+        self.assertIn('signal\u5bfc\u5165\u7248\u672c=42', text)
+        self.assertNotIn('????', text)
 
-    def test_signal_capital_sync_does_not_overwrite_actual_trade_balance(self):
+    def test_signal_updates_are_comparison_only_not_automatic_ledger_sync(self):
         self.trade.ledger.state['realized_balance'] = 12.3
         snapshot = {'signal_ready': True, 'signal_session_id': 'fresh-session',
             'signal_revision': 42, 'target_positions': [], 'portfolio': {
@@ -343,11 +344,49 @@ class DirectAdmissionTests(unittest.TestCase):
                 'realized_balance': 14.9, 'notional_per_order': 14.9/3,
                 'sizing_divisor': 3, 'positions': {}}}
         self.trade._apply_signal_targets(snapshot)
-        sync = self.trade.ledger.state['signal_capital_sync']
-        self.assertEqual(sync['realized_balance'], 14.9)
-        self.assertEqual(sync['notional_per_order'], 14.9/3)
+        self.assertNotIn('signal_capital_sync', self.trade.ledger.state)
+        self.assertEqual(self.trade.positions, {})
         self.assertEqual(self.trade.ledger.state['realized_balance'], 12.3)
         self.assertEqual(self.trade.ledger.state['signal_portfolio']['revision'], 42)
+
+
+    def test_manual_import_mode_sizes_new_tick_orders_from_trade_not_signal(self):
+        self.trade.ledger.state.update(capital_mode='trade_owned_after_manual_signal_sync',
+                                       realized_balance=21.)
+        self.payload['candidate_templates'][0]['notional'] = 100.
+        self.save_plan()
+        self.event()
+        self.assertEqual(self.trade.tracked['TESTUSDT']['notional'], 7.)
+        self.trade.ledger.state['realized_balance'] = 24.
+        self.event()
+        self.assertEqual(self.trade.tracked['TESTUSDT']['notional'], 7.)
+        self.assertFalse(self.trade.tracked['TESTUSDT'].get('cancel_requested'))
+
+    def test_manual_import_mode_sizes_new_maintenance_orders_from_trade(self):
+        self.trade.ledger.state.update(capital_mode='trade_owned_after_manual_signal_sync',
+                                       realized_balance=24.)
+        self.trade.market.update('TESTUSDT', '.01734', int(time.time()*1000))
+        self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        with patch.object(self.trade.view, 'render'):
+            self.trade.step()
+        self.assertEqual(self.trade.tracked['TESTUSDT']['notional'], 8.)
+
+    def test_trade_baseline_feedback_and_comparison_survive_signal_balance_changes(self):
+        self.trade.ledger.state.update(capital_mode='trade_owned_after_manual_signal_sync',
+            book_initial_equity=20., realized_balance=21.,
+            manual_signal_sync={'sync_id':'manual-once', 'signal_revision':4})
+        self.payload['portfolio'] = dict(initial_equity=15., realized_balance=1000., positions={})
+        self.save_plan()
+        with patch.object(self.trade.view, 'render') as render:
+            self.trade.step()
+        feedback = json.loads(cfg.EXECUTION_FEEDBACK_FILE.read_text())
+        self.assertEqual(feedback['realized_balance'], 21.)
+        self.assertEqual(feedback['cumulative_pnl'], 1.)
+        self.assertEqual(feedback['comparison']['actual']['realized_pnl'], 1.)
+        self.assertEqual(feedback['comparison']['actual']['initial_equity'], 20.)
+        self.assertEqual(feedback['comparison']['actual']['pnl_kind'],
+                         'operator_imported_baseline_plus_subsequent_execution')
+        self.assertEqual(render.call_args.kwargs['manual_signal_sync']['sync_id'], 'manual-once')
 
 
 
@@ -398,9 +437,12 @@ class TemplateAndMigrationTests(unittest.TestCase):
         import hashlib
         root = Path(__file__).resolve().parents[1]
         baseline = json.loads((root/'BASELINE.json').read_text())['source_normalized_sha256']
+        # Forced-exit reconciliation now also accepts explicitly adopted seeds;
+        # its exact-fill behavior is covered by test_forced_close. Frozen model,
+        # selection and close-order policy sources below remain unchanged.
         for name in ('v9711_live/signal_logic.py','v9711_live/signal_portfolio.py',
                      'v9711_live/entry_policy.py','v9711_live/execution/logic.py',
-                     'v9711_live/execution/forced_close.py','v9711_live/execution/close_ladder.py'):
+                     'v9711_live/execution/close_ladder.py'):
             self.assertEqual(hashlib.sha256((root/name).read_bytes().replace(b'\r\n',b'\n')).hexdigest(),baseline[name],name)
 
     def ledgers(self, source):
