@@ -1,0 +1,18 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+var/*.json
+var/*.trigger
+var/state/*
+var/binance_ticker_price/*
+var/binance_account_stream/*
+var/log/
+*.log
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# All runtime snapshots, ledgers, test output and metrics are local only.
+/var/

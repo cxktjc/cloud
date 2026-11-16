@@ -1,0 +1,16 @@
+[Unit]
+Description=v9711 WS-direct signal (new version; never run beside legacy trader)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/v9711-live/cloud/ws_direct_v1
+EnvironmentFile=/opt/v9711-live/cloud/ws_direct_v1/.env
+ExecStart=/opt/v9711-live/cloud/.venv/bin/python -B -u -m v9711_live.run_signal
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

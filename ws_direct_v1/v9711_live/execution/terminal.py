@@ -1,0 +1,242 @@
+"""Trade-side terminal display: actual fills/PnL versus signal model.
+
+Only changed content redraws the terminal. All values are computed by
+``execution.stats`` from execution-owned state and signal-owned snapshots.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any, Mapping
+
+from .. import config as cfg
+
+
+def iso(ms: Any) -> str:
+    value = 0.0
+    try:
+        value = float(ms)
+    except (TypeError, ValueError):
+        return '-'
+    if not value:
+        return '-'
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat(timespec='seconds')
+
+
+def compact_positions(rows: Any, limit: int) -> str:
+    if isinstance(rows, Mapping):
+        source: Any = rows.values()
+    elif isinstance(rows, list):
+        source = rows
+    else:
+        source = ()
+    parts = []
+    for row in source:
+        if not isinstance(row, Mapping):
+            continue
+        symbol = str(row.get('symbol') or '').upper()
+        qty = row.get('quantity')
+        mark = row.get('mark_price')
+        pnl = row.get('unrealized_pnl')
+        parts.append(f'{symbol} qty={qty} mark={mark} pnl={pnl}')
+        if len(parts) >= limit:
+            break
+    if not parts:
+        return '(空)'
+    return ', '.join(parts)
+
+
+class TradeTerminalView:
+    def __init__(self, *, min_refresh_seconds: float = cfg.TradeViewConfig().min_refresh_seconds,
+                 heartbeat_seconds: float = 60.0, max_rows: int = 12):
+        self.min_refresh_seconds = float(min_refresh_seconds)
+        self.heartbeat_seconds = float(heartbeat_seconds)
+        self.max_rows = int(max_rows)
+        self.last_key = ''
+        self.last_render = float('-inf')
+
+    def _key(self, fields: Mapping[str, Any]) -> str:
+        stable = {key: value for key, value in fields.items()
+                  if key not in {'clock_utc', 'updated_at_epoch', 'stream_health'}}
+        health = fields.get('stream_health') or {}
+        stable['stream_health'] = {key: health.get(key) for key in ('fresh', 'reason')}
+        return json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
+
+    def render(self, *, now: float | None = None, force: bool = False,
+               **fields: Any) -> bool:
+        now = time.monotonic() if now is None else float(now)
+        key = self._key(fields)
+        if not (force or key != self.last_key):
+            return False
+        if not force and now - self.last_render < self.min_refresh_seconds:
+            return False
+        self.last_key, self.last_render = key, now
+        try:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            sys.stdout.reconfigure(encoding='utf-8')
+        except (AttributeError, OSError, ValueError):
+            pass
+        print(self._format(fields), flush=True)
+        return True
+
+    def _format(self, f: Mapping[str, Any]) -> str:
+        actual = f['comparison']['actual']
+        signal = f['comparison']['signal']
+        diff = f['comparison']['difference']
+        capacity = f['comparison']['capacity']
+        parts = diff['difference_part_pnl']
+        gap = diff['signal_minus_trade']
+        mode = 'live' if f.get('enabled') and not f.get('dry_run') else 'dry_run'
+        lines = [
+            '=' * 116,
+            f'v9711 WS-DIRECT v1 TRADE  {f["clock_utc"]}  mode={mode}  authority=execution',
+            f'signal_session={f.get("signal_session_id") or "-"}  '
+            f'signal_revision={f.get("signal_revision") if f.get("signal_revision") is not None else "-"}  '
+            f'trade_cap={cfg.SLOTS}  pending_order_cap={cfg.MAX_PENDING_ORDERS}',
+            '-' * 116,
+            '当前实际持仓（只含精确归属成交）: '
+            + compact_positions(f['comparison']['positions']['actual'], self.max_rows),
+            f'trade实际累计收益(已实现): {actual["realized_pnl"]:+.6f}  '
+            f'trade当前收益(浮盈): {actual["unrealized_pnl"]:+.6f}  '
+            f'trade总收益: {actual["total_pnl"]:+.6f} ({actual["return_pct"]:+.4f}%)',
+            f'signal模型累计收益(已实现): {signal["realized_pnl"]:+.6f}  '
+            f'signal当前收益(浮盈): {signal["unrealized_pnl"]:+.6f}  '
+            f'signal总收益: {signal["total_pnl"]:+.6f} ({signal["return_pct"]:+.4f}%)',
+            f'差异 signal-trade: 已实现={gap["realized_pnl"]:+.6f}  '
+            f'浮动={gap["unrealized_pnl"]:+.6f}  总计={gap["total_pnl"]:+.6f} '
+            f'({gap["return_pct"]:+.4f}%)',
+            f'区别部分收益: signal-only浮动={parts["signal_only_unrealized_pnl"]:+.6f}  '
+            f'trade-only浮动={parts["trade_only_unrealized_pnl"]:+.6f}  '
+            f'匹配仓浮动差={parts["matched_unrealized_difference_signal_minus_trade"]:+.6f}',
+            f'6挂单/3仓限制: signal目标={capacity["signal_target_count"]} '
+            f'trade持仓={capacity["actual_position_count"]} '
+            f'当前挂单={capacity["pending_order_count"]} '
+            f'signal应挂单={capacity["signal_desired_count"]} '
+            f'有价可评估={capacity["priced_desired_count"]} '
+            f'近阈值={capacity["near_place_count"]}',
+            f'容量排除/缺口: 超出3仓目标={capacity["signal_targets_over_position_cap"]} '
+            f'未实际持有signal目标={capacity["signal_targets_not_held"]} '
+            f'应挂单超6={capacity["signal_desired_over_pending_cap"]} '
+            f'有价候选超6={capacity["priced_desired_over_pending_cap"]} '
+            f'近阈值超6={capacity["near_place_over_pending_cap"]} '
+            f'rotation_defer={capacity["rotation_defer_count"]}',
+            f'容量排除浮动收益估计: {parts["capacity_excluded_unrealized_pnl"]:+.6f} '
+            f'({parts["capacity_excluded_return_pct"]:+.4f}%)  '
+            '说明：这是signal-only当前目标按同价估算，不是已实现收益。',
+            '-' * 116,
+            '最大差异持仓（signal-trade，正=signal领先）:',
+        ]
+        rows = f['comparison']['positions']['largest_difference'][:self.max_rows]
+        if not rows:
+            lines.append('  （暂无差异）')
+        for row in rows:
+            lines.append(
+                f'  {row["symbol"]} [{row["kind"]}] signal_pnl={row["signal_unrealized_pnl"]:+.6f} '
+                f'trade_pnl={row["trade_unrealized_pnl"]:+.6f} '
+                f'diff={row["difference_signal_minus_trade"]:+.6f}')
+        lines.extend([
+            '-' * 116,
+            '当前挂单: ' + compact_positions(f.get('open_orders', {}), self.max_rows),
+            'signal-only目标（按名义金额最大）: '
+            + compact_positions(f['comparison']['positions']['signal_only_top'], self.max_rows),
+            f'stream={f.get("stream_health", {}).get("fresh", False)}  '
+            f'last_event_seq={f.get("stream_health", {}).get("last_event_seq", "-")}  '
+            f'feedback_updated={f.get("updated_at_epoch")}',
+            'trade收益仅来自精确归属订单成交/平仓和当前实际持仓；差异按同价对比signal模型，不是交易所账户总收益。',
+            '=' * 116,
+        ])
+        forced = sorted((f.get('forced_close_history') or {}).values(),
+                        key=lambda row: row.get('processed_at_epoch', 0), reverse=True)
+        for row in forced[:3]:
+            lines.insert(-1, f'Exchange forced close: {row["symbol"]} '
+                         f'qty={row["closed_owned_qty"]:g} price={row["average_price"]:g} '
+                         f'booked_pnl={row["booked_pnl"]:+.6f} '
+                         f'event_UTC={iso(max(o["event_ms"] for o in row["orders"]))} '
+                         '(fee estimate; not an open position; no replenishment)')
+        cleanup = f.get('forced_close_cleanup') or {}
+        if cleanup:
+            lines.insert(-1, 'Forced-flat old exact-order cleanup (NOT holdings): '
+                         + ', '.join(cleanup) + '; same-symbol entries blocked until resolved')
+        diagnostics = f.get('entry_diagnostics') or {}
+        ws = diagnostics.get('ws_direct') or {}
+        if ws:
+            lines.insert(-1, f'Internal WS: healthy={ws.get("healthy")} queue={ws.get("queue")} '
+                         f'decided={ws.get("decided")} stale={ws.get("rejected_backlog")} '
+                         f'overflow={ws.get("overflow")} p95_us={ws.get("receive_to_decision_us_p95")} '
+                         '(decision/dispatch, not exchange ACK; mirror runs after decision)')
+        if diagnostics:
+            lines.insert(-1, 'Entry plan: status={desired_status} signal_ready={signal_ready} '
+                         'plan_ready={plan_ready} published={published} executable={priced_executable}'
+                         .format(**diagnostics))
+            lines.insert(-1, '  blockers=' + ','.join(diagnostics.get('blockers') or ['none'])
+                         + ' selected=' + ','.join(diagnostics.get('selected_to_place') or ['none']))
+            lines.insert(-1, '  signal file: ' + str(diagnostics.get('desired_file')))
+            for symbol, reason in list((diagnostics.get('filtered') or {}).items())[:self.max_rows]:
+                lines.insert(-1, f'  entry skipped {symbol}: {reason}')
+        rejections = sorted((f.get('entry_rejections') or {}).values(),
+                            key=lambda row: row.get('rejected_at_epoch', 0), reverse=True)
+        for row in rejections[:3]:
+            lines.insert(-1, f'  ENTRY REJECTED {row.get("symbol")}: {row.get("error")}')
+        session = f.get('session_entry_stats')
+        if session is not None:
+            block = [
+                '-' * 116,
+                '本次启动漏开统计（重启清零；时间UTC）:',
+                f'  启动={iso(session["started_at_epoch"] * 1000)}  '
+                f'signal累计开仓={session["signal_entries"]}  '
+                f'trade已开仓（有成交）={session["trade_filled_entries"]}  '
+                f'未见trade成交={session["unfilled_entries"]}',
+                f'  未成交分项: signal仍持仓={session["active_unfilled_entries"]}  '
+                f'signal已结束/撤回={session["ended_unfilled_entries"]}',
+            ]
+            rows = session['recent_unfilled_entries'][:self.max_rows]
+            if rows:
+                block.append(f'  未成交明细（最近{len(rows)}笔；按入场确认时间倒序）:')
+                for row in rows:
+                    state = 'signal仍持仓' if row['signal_active'] else 'signal已结束/撤回'
+                    block.append(f'    {row["symbol"]} 入场bar={iso(row["entry_bar_open_ms"])} '
+                                 f'确认={iso(row["entry_available_ms"])} [{state}]')
+            else:
+                block.append('  未成交明细: （暂无）')
+            block.append('  口径: 只计启动后完成3m确认的signal入场；部分成交算已开仓；'
+                         '延迟成交回报会修正未成交数，实际平仓不会重新算漏开。')
+            lines[-1:-1] = block
+        policy = f.get('entry_gap_policy') or {}
+        if policy:
+            lines.insert(-1, f'当前准入价差上限={100*f.get("current_admission_gap", policy["fill_gap"]):g}%（挂单计数，非持仓数）')
+            lines.insert(-1, f'挂单分档: 不足3≤{100*policy["bootstrap_gap"]:g}% / 第4～6≤{100*policy["fill_gap"]:g}% / '
+                         f'满6替换≤{100*policy["full_rotation_gap"]:g}%；3～5单先换旧；优势>0.5个百分点或新<1.8%换旧>2%。')
+        rotation = f.get('pending_rotation') or {}
+        if rotation:
+            lines.insert(-1, f'换单保留名额: 撤{rotation.get("victim")} → {rotation.get("challenger")} '
+                         f'原挂单数={rotation.get("original_order_count")} '
+                         f'旧单终态确认={rotation.get("victim_terminal", False)}；确认前不另占空位。')
+        io = f.get('network_io') or {}
+        if io.get('enabled'):
+            lines.insert(-1, f'网络I/O: 后台运行={io.get("running", 0)} '
+                         f'排队={io.get("queued", 0)} 待主循环确认={io.get("completed", 0)} '
+                         '（信号轮询不等待网络响应）')
+        pacing = io.get('entry_cancel_pacing') or {}
+        if pacing:
+            active = ', '.join(pacing.get('active', ())) or '(空)'
+            queued = pacing.get('queued') or []
+            lines.insert(-1, f'入场撤单队列: 执行中={active} 等待={len(queued)}；'
+                         f'按绝对相对价差近→远，前笔返回后间隔{pacing["interval_seconds"]:g}s；'
+                         '不阻塞下单/信号/平仓，平仓撤单不排此队列。')
+            if queued:
+                parts = [f'{row["symbol"]} 距离={row["distance_pct"]:.4f}%'
+                         if row['distance_pct'] is not None else f'{row["symbol"]} 距离=未知'
+                         for row in queued[:self.max_rows]]
+                lines.insert(-1, '  待撤顺序: ' + ' → '.join(parts))
+        closes = f.get('close_orders') or {}
+        if closes:
+            lines.insert(-1, '在途平多（不占6个入场挂单名额；确认成交前仍计持仓）:')
+            for symbol, row in list(closes.items())[:self.max_rows]:
+                deadline = iso(float(row.get('deadline_epoch') or 0) * 1000)
+                lines.insert(-1, f'  {symbol} {row.get("phase")} status={row.get("status")} '
+                             f'剩余={row.get("remaining_owned_qty")} 到期UTC={deadline} '
+                             f'撤单确认中={row.get("cancel_requested", False)}')
+        return '\n'.join(lines)

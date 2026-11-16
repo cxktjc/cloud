@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "v9711-live-ws-direct"
+version = "1.1.0"
+description = "Standalone v9711 signal, execution, and Binance market collectors"
+requires-python = ">=3.10"
+dependencies = [
+  "websockets>=17.0,<18",
+  "aiomysql>=0.2.0",
+  "PyMySQL>=1.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["v9711_live*", "collectors*"]
