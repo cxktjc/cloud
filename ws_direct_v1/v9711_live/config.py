@@ -56,8 +56,12 @@ TRADE_FEE_RATE = 0.0005
 QV_WINDOW = 20
 QV_MIN_PERIODS = 10
 
+# Reuse parent deployment collectors by default; keep all new writers isolated.
+SHARED_ROOT = env_path("V9711_WS_SHARED_ROOT", ROOT.parent).expanduser().resolve()
+SHARED_VAR_DIR = SHARED_ROOT / "var"
+
 # Local data files.
-STATUS_FILE = env_path('V9711_LIVE_3M_STATUS_FILE', VAR_DIR / 'klines_3m_status.json')
+STATUS_FILE = env_path('V9711_LIVE_3M_STATUS_FILE', SHARED_VAR_DIR / 'klines_3m_status.json')
 PRICE_FILE = env_path('V9711_LIVE_PRICE_FILE', VAR_DIR / 'binance_ticker_price' / 'latest.json')
 SYMBOLS_FILE = env_path('V9711_LIVE_SYMBOLS_FILE', ROOT / 'config' / 'symbols.txt')
 STATE_DIR = env_path('V9711_LIVE_STATE_DIR', VAR_DIR / 'state')
@@ -134,11 +138,11 @@ TRADE_POLL_SECONDS = env_float('V9711_LIVE_TRADE_POLL_SECONDS', 0.02)
 TRADE_MAINTENANCE_SECONDS = env_float('V9711_LIVE_TRADE_MAINTENANCE_SECONDS', 0.5)
 ORDER_RECONCILE_SECONDS = env_float('V9711_LIVE_ORDER_RECONCILE_SECONDS', 2.0)
 ACCOUNT_STREAM_DIR = env_path('V9711_LIVE_ACCOUNT_STREAM_DIR',
-                              VAR_DIR / 'binance_account_stream')
+                              SHARED_VAR_DIR / 'binance_account_stream')
 ACCOUNT_STREAM_MAX_AGE_SECONDS = env_float('V9711_LIVE_ACCOUNT_STREAM_MAX_AGE_SECONDS', 15.0)
 ACCOUNT_ID = os.environ.get('V9711_LIVE_ACCOUNT_ID', 'default') or 'default'
 EXCHANGE_INFO_CACHE_FILE = env_path('V9711_LIVE_EXCHANGE_INFO_CACHE_FILE',
-                                    VAR_DIR / 'exchange_info_cache.json')
+                                    SHARED_VAR_DIR / 'exchange_info_cache.json')
 ORDER_REST_FALLBACK_SECONDS = env_float('V9711_LIVE_ORDER_REST_FALLBACK_SECONDS', 300.0)
 # Fast lane is only for an unacknowledged submission still actionable now.
 # Stable/acknowledged orders keep ORDER_REST_FALLBACK_SECONDS above.

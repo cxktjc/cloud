@@ -7,7 +7,6 @@ from v9711_live import config as cfg
 from v9711_live.input_diagnostics import status_reason, check_inputs
 from v9711_live.market_data import KlineStatus, StatusReader
 from collectors.kline_status import write_3m_status
-from collectors import binance_futures_3m_ws
 
 class InputPathsTests(unittest.TestCase):
     def test_server_templates_use_cloud_checkout(self):
@@ -22,11 +21,45 @@ class InputPathsTests(unittest.TestCase):
         template=(root/".env.example").read_text(encoding="utf-8")
         self.assertIn("V9711_LIVE_3M_STATUS_FILE=/opt/v9711-live/cloud/var/klines_3m_status.json", template)
 
-    def test_collector_default_matches_signal_path(self):
-        import os
-        env=dict(os.environ); env.pop("KLINE_3M_STATUS_FILE",None)
-        with patch.dict(os.environ,env,clear=True), patch.object(sys,"argv",["collector"]):
-            self.assertEqual(Path(binance_futures_3m_ws.parse_args().status_file).resolve(),cfg.STATUS_FILE.resolve())
+    def _read_config(self, overrides=None):
+        import json, os, subprocess
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("V9711_", "KLINE_"))}
+        env.update(overrides or {})
+        code = """
+import json
+from unittest.mock import patch
+with patch('v9711_live.environment.load_environment'):
+    from v9711_live import config as c
+print(json.dumps({name: str(getattr(c, name).resolve()) for name in
+    ('ROOT', 'SHARED_ROOT', 'STATUS_FILE', 'ACCOUNT_STREAM_DIR',
+     'EXCHANGE_INFO_CACHE_FILE', 'PRICE_FILE', 'STATE_DIR')}))
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", code],
+            cwd=Path(__file__).resolve().parents[1], env=env,
+            check=True, capture_output=True, text=True)
+        return {k: Path(v) for k, v in json.loads(result.stdout).items()}
+
+    def test_default_shared_reads_and_isolated_writes(self):
+        paths = self._read_config()
+        root = Path(__file__).resolve().parents[1]
+        self.assertEqual(paths['ROOT'], root)
+        self.assertEqual(paths['SHARED_ROOT'], root.parent)
+        shared = root.parent / 'var'
+        self.assertEqual(paths['STATUS_FILE'], shared / 'klines_3m_status.json')
+        self.assertEqual(paths['ACCOUNT_STREAM_DIR'], shared / 'binance_account_stream')
+        self.assertEqual(paths['EXCHANGE_INFO_CACHE_FILE'], shared / 'exchange_info_cache.json')
+        self.assertEqual(paths['STATE_DIR'], root / 'var/state')
+        self.assertEqual(paths['PRICE_FILE'], root / 'var/binance_ticker_price/latest.json')
+
+    def test_explicit_shared_read_overrides_win(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            paths = self._read_config({'V9711_WS_SHARED_ROOT': str(base),
+                'V9711_LIVE_3M_STATUS_FILE': str(base / 'custom.json')})
+            self.assertEqual(paths['STATUS_FILE'], base / 'custom.json')
+            self.assertEqual(paths['ACCOUNT_STREAM_DIR'], base / 'var/binance_account_stream')
+            self.assertEqual(paths['EXCHANGE_INFO_CACHE_FILE'], base / 'var/exchange_info_cache.json')
 
     def test_missing_status_diagnostic_is_read_only(self):
         with tempfile.TemporaryDirectory() as directory:

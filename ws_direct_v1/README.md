@@ -64,6 +64,13 @@ New writer-owned files default to this directory's var/:
 - var/state/execution_feedback.json, trade.log, signal.log
 - var/binance_ticker_price/latest.json (ONLY new trade writes it)
 
+Code defaults (even without .env) read completed-3m status, account stream and
+exchange filters from the parent deployment var/. V9711_WS_SHARED_ROOT can
+override that shared deployment root; individual read-path overrides still win.
+Price mirrors and state remain inside ws_direct_v1/var/. Existing .env or shell
+overrides are not changed by git pull: correct a stale V9711_LIVE_3M_STATUS_FILE
+to /opt/v9711-live/cloud/var/klines_3m_status.json, or remove that override.
+
 .env.example shares the existing completed-3m status/MySQL and live account
 stream in /opt/v9711-live/cloud/var. Adjust the READ paths to the actual running
 collectors. Keep the existing 3m/agg/account processes running. Do NOT start a
