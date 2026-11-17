@@ -153,7 +153,7 @@ class DirectAdmissionTests(unittest.TestCase):
     def save_plan(self):
         cfg.DESIRED_FILE.write_text(json.dumps(self.payload))
 
-    def event(self, price='.01734'):
+    def event(self, price='.01730'):
         self.assertTrue(self.trade.market.update('TESTUSDT',price,int(time.time()*1000)))
         tick = self.trade.market.events.get_nowait()
         return self.trade.market.decide(tick,self.trade.on_tick)
@@ -165,6 +165,16 @@ class DirectAdmissionTests(unittest.TestCase):
         self.assertIn('TESTUSDT',self.trade.tracked)
         self.assertFalse(cfg.PRICE_FILE.exists())
         self.assertEqual(self.trade.tracked['TESTUSDT']['limit_price'],.0170041)
+
+    def test_tightened_gap_waits_for_closer_quote_before_registering_order(self):
+        # This ~1.975% quote passed the former wider gate. With 1.85%,
+        # no exchange intent should be registered until price gets closer.
+        self.event('.01734')
+        self.assertFalse(self.trade.tracked)
+        self.assertEqual(self.trade.stats['place'], 0)
+        self.event('.01730')
+        self.assertIn('TESTUSDT', self.trade.tracked)
+        self.assertEqual(self.trade.stats['place'], 1)
 
     def test_incremental_shortlist_matches_full_selector_with_rotation(self):
         symbols = ['S%02dUSDT'%i for i in range(30)]
@@ -365,7 +375,7 @@ class DirectAdmissionTests(unittest.TestCase):
     def test_manual_import_mode_sizes_new_maintenance_orders_from_trade(self):
         self.trade.ledger.state.update(capital_mode='trade_owned_after_manual_signal_sync',
                                        realized_balance=24.)
-        self.trade.market.update('TESTUSDT', '.01734', int(time.time()*1000))
+        self.trade.market.update('TESTUSDT', '.01730', int(time.time()*1000))
         self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
         with patch.object(self.trade.view, 'render'):
             self.trade.step()

@@ -7,7 +7,7 @@ reference's 25% hard stop. This is engineering verification, not a new backtest.
 
 ## Result
 
-- `D:\program\python.exe -B -m unittest discover -s tests -q`: **280 passed**.
+- `D:\program\python.exe -B -m unittest discover -s tests -q`: **281 passed**.
 - Independently imported the supplied reference and compared its numpy/pandas
   QV functions with the standard-library live implementation on synthetic
   180-bar × 647-symbol quote volumes, including 2% missing cells.
@@ -26,9 +26,11 @@ reference's 25% hard stop. This is engineering verification, not a new backtest.
 - Full configured universe remains in QV even when status initially reports only
   one completed symbol; diagnostics are published in `portfolio.qv`.
 - Old `HISTORY_BARS=40` upgrades to 96; old gap overrides cannot restore the old
-  2.2/2.0/1.8 tiers. Latest follow-up adds 0.15pp to the previous 2.0/1.8/1.6:
-  tiers are 2.15/1.95/1.75, strict >0.5pp advantage and strict
-  new<1.75 / old>1.95 exception. Incumbents are not price-canceled for gap alone.
+  2.2/2.0/1.8 tiers. Latest user correction tightens the ordinary tiers to
+  1.85/1.65/1.45, strict >0.5pp advantage and strict
+  new<1.45 / old>1.65 exception. Incumbents are not price-canceled for gap alone.
+- WS admission regression: a formerly admitted ~1.975% quote does not register
+  an order; a subsequent ~1.740% quote can register exactly one order.
 - Legacy book validation and original-byte backup; preserve session, funds,
   positions, quantities, original due times and records; cut over on the next
   full bar. Already processed legacy checkpoints do not get repriced.

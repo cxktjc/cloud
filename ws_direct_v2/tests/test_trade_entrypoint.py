@@ -70,7 +70,7 @@ class TradeEntrypointTests(unittest.TestCase):
                         limit_price=0.0170041, notional=5, order_bar_open_ms=bar,
                         exit_due_epoch=now+900)]}
             trade.desired_snapshot = Mock(return_value=(snapshot, 'valid'))
-            trade.refresh_prices = Mock(return_value={'LYNUSDT': 0.01734} if quote else {})
+            trade.refresh_prices = Mock(return_value={'LYNUSDT': 0.01730} if quote else {})
             trade._comparison = Mock(return_value={})
             trade._place_order = Mock()
             trade._step(now=now)

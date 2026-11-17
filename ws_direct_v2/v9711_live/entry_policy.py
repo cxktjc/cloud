@@ -43,7 +43,7 @@ class GapPolicy:
 
     def beats(self, old_gap: float, new_gap: float) -> bool:
         # Strict >0.5 percentage point; equality must NOT rotate. The exception
-        # is strict on both ends too: new <1.75%, old >1.95%.
+        # is strict on both ends too: new <1.45%, old >1.65%.
         exception = (strictly_above(self.strict_gap, new_gap)
                      and strictly_above(old_gap, self.fill_gap))
         return exception or strictly_above(old_gap - new_gap, self.improvement)
@@ -52,7 +52,7 @@ class GapPolicy:
         return at_most(new_gap, ceiling) and self.beats(old_gap, new_gap)
 
     def describe(self) -> dict:
-        return dict(version=5, bootstrap_order_count=self.bootstrap_orders,
+        return dict(version=6, bootstrap_order_count=self.bootstrap_orders,
                     bootstrap_gap=self.bootstrap_gap, fill_gap=self.fill_gap,
                     full_rotation_gap=self.strict_gap,
                     improvement_strictly_greater_than=self.improvement,
