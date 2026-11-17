@@ -138,7 +138,7 @@ def select_orders(candidates: Iterable[Candidate], prices: Mapping[str, SignalIn
                   incumbent_symbols: Iterable[str] = (),
                   place_gap: float = cfg.SIGNAL_DISCOVERY_GAP,
                   cancel_gap: float | None = None) -> SignalPlan:
-    """Publish the complete <=2.0% discovery envelope for tiered trade admission.
+    """Publish the complete <=2.15% discovery envelope for tiered trade admission.
 
     Signal does not cap pending intents at six and does not price-cancel a
     valid incumbent. Trade owns the eight physical slots and applies count-based

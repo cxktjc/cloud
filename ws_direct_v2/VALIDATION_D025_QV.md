@@ -26,8 +26,9 @@ reference's 25% hard stop. This is engineering verification, not a new backtest.
 - Full configured universe remains in QV even when status initially reports only
   one completed symbol; diagnostics are published in `portfolio.qv`.
 - Old `HISTORY_BARS=40` upgrades to 96; old gap overrides cannot restore the old
-  2.2/2.0/1.8 tiers. New tiers: 2.0/1.8/1.6, strict >0.5pp advantage and strict
-  new<1.6 / old>1.8 exception. Incumbents are not price-canceled for gap alone.
+  2.2/2.0/1.8 tiers. Latest follow-up adds 0.15pp to the previous 2.0/1.8/1.6:
+  tiers are 2.15/1.95/1.75, strict >0.5pp advantage and strict
+  new<1.75 / old>1.95 exception. Incumbents are not price-canceled for gap alone.
 - Legacy book validation and original-byte backup; preserve session, funds,
   positions, quantities, original due times and records; cut over on the next
   full bar. Already processed legacy checkpoints do not get repriced.

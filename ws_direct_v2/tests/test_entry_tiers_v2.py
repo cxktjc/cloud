@@ -21,35 +21,35 @@ def select(count, old_gap, new_gap):
 
 
 class EntryTierTests(unittest.TestCase):
-    def test_first_five_admit_two_percent_inclusive(self):
-        self.assertEqual([r.symbol for r in select(4, .01, .02).place], ['NEW'])
-        self.assertFalse(select(4, .01, .020001).place)
+    def test_first_five_admit_2p15_percent_inclusive(self):
+        self.assertEqual([r.symbol for r in select(4, .01, .0215).place], ['NEW'])
+        self.assertFalse(select(4, .01, .021501).place)
 
-    def test_sixth_to_eighth_admit_one_point_eight_percent(self):
+    def test_sixth_to_eighth_admit_1p95_percent(self):
         for count in (5, 6, 7):
-            self.assertEqual([r.symbol for r in select(count, .01, .018).place], ['NEW'])
-            self.assertFalse(select(count, .01, .018001).place)
+            self.assertEqual([r.symbol for r in select(count, .01, .0195).place], ['NEW'])
+            self.assertFalse(select(count, .01, .019501).place)
 
-    def test_full_book_one_point_six_ceiling_and_cancel_before_place(self):
-        plan = select(8, .03, .016)
+    def test_full_book_1p75_ceiling_and_cancel_before_place(self):
+        plan = select(8, .03, .0175)
         self.assertEqual(len(plan.cancel), 1)
         self.assertFalse(plan.place)
-        self.assertEqual(plan.rotation['admission_gap'], .016)
-        self.assertFalse(select(8, .03, .016001).cancel)
+        self.assertEqual(plan.rotation['admission_gap'], .0175)
+        self.assertFalse(select(8, .03, .017501).cancel)
 
-    def test_exception_new_below_1p6_old_above_1p8_is_strict(self):
+    def test_exception_new_below_1p75_old_above_1p95_is_strict(self):
         policy = GapPolicy()
-        self.assertTrue(policy.beats(.01801, .01599))
-        self.assertFalse(policy.beats(.018, .01599))
-        self.assertFalse(policy.beats(.01801, .016))
+        self.assertTrue(policy.beats(.01951, .01749))
+        self.assertFalse(policy.beats(.0195, .01749))
+        self.assertFalse(policy.beats(.01951, .0175))
 
     def test_half_percentage_point_equality_still_does_not_rotate(self):
         policy = GapPolicy()
-        self.assertFalse(policy.beats(.021, .016))
-        self.assertTrue(policy.beats(.021001, .016))
+        self.assertFalse(policy.beats(.0225, .0175))
+        self.assertTrue(policy.beats(.022501, .0175))
 
     def test_underfilled_rotation_precedes_vacancy_fill(self):
-        plan = select(5, .020, .015)
+        plan = select(5, .0215, .0165)
         self.assertEqual(len(plan.cancel), 1)
         self.assertFalse(plan.place)
         self.assertEqual(plan.rotation['original_order_count'], 5)
@@ -68,4 +68,4 @@ class EntryTierTests(unittest.TestCase):
                   'print(json.dumps([c.HISTORY_BARS,c.BOOTSTRAP_PLACE_GAP,c.FILL_PLACE_GAP,c.PLACE_GAP]))')
         result = subprocess.run([sys.executable, '-B', '-c', script], env=env,
                                 check=True, capture_output=True, text=True)
-        self.assertEqual(json.loads(result.stdout), [96, .020, .018, .016])
+        self.assertEqual(json.loads(result.stdout), [96, .0215, .0195, .0175])

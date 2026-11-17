@@ -1,9 +1,9 @@
 """Pure tiered execution selection; exact-cancel-first rotation reservations.
 
-The first five physical pending entries admit <=2.0%, orders 6-8 admit <=1.8%.
+The first five physical pending entries admit <=2.15%, orders 6-8 admit <=1.95%.
 At 5..7 orders a qualifying improvement rotates BEFORE filling a free slot.
-At eight, replacement must pass <=1.6%; >0.5pp advantage is normally required,
-except a new <1.6% candidate may replace an incumbent >1.8% without that margin.
+At eight, replacement must pass <=1.75%; >0.5pp advantage is normally required,
+except a new <1.75% candidate may replace an incumbent >1.95% without that margin.
 """
 from __future__ import annotations
 
