@@ -120,6 +120,8 @@ SIGNAL_DISCOVERY_GAP = BOOTSTRAP_PLACE_GAP
 if not (0 <= PLACE_GAP <= FILL_PLACE_GAP <= BOOTSTRAP_PLACE_GAP < 1):
     raise ValueError('Require strict <= fill <= bootstrap pending-entry gaps')
 MAX_PENDING_ORDERS = env_int('V9711_LIVE_MAX_PENDING_ORDERS', 8)
+SIGNAL_FOLLOW_MAX_PENDING_ORDERS = 2
+SIGNAL_FOLLOW_POSITION_STOP = 6
 SWITCH_TOLERANCE = env_float('V9711_LIVE_SWITCH_TOLERANCE', 0.005)
 # Kept as numeric compatibility/diagnostic constants for older readers.
 # Current eight-slot policy does not use an upward price gap to auto-cancel.

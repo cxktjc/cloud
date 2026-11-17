@@ -41,7 +41,8 @@ def compact_positions(rows: Any, limit: int) -> str:
         qty = row.get('quantity')
         mark = row.get('mark_price')
         pnl = row.get('unrealized_pnl')
-        parts.append(f'{symbol} qty={qty} mark={mark} pnl={pnl}')
+        label = '[补挂]' if row.get('signal_follow') else ''
+        parts.append(f'{symbol}{label} qty={qty} mark={mark} pnl={pnl}')
         if len(parts) >= limit:
             break
     if not parts:
@@ -114,10 +115,13 @@ class TradeTerminalView:
             f'匹配仓浮动差={parts["matched_unrealized_difference_signal_minus_trade"]:+.6f}',
             f'8挂单/3仓限制: signal目标={capacity["signal_target_count"]} '
             f'trade持仓={capacity["actual_position_count"]} '
-            f'当前挂单={capacity["pending_order_count"]} '
+            f'普通挂单={capacity["pending_order_count"]} '
+            f'补挂单={capacity.get("signal_follow_order_count", 0)}/{cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS} '
             f'signal应挂单={capacity["signal_desired_count"]} '
             f'有价可评估={capacity["priced_desired_count"]} '
             f'近阈值={capacity["near_place_count"]}',
+            f'补挂规则: signal原入场限价，最多额外{cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS}单；'
+            f'trade持仓≥{cfg.SIGNAL_FOLLOW_POSITION_STOP}时撤补挂单；普通挂单数不含补挂单。',
             f'容量排除/缺口: 超出3仓目标={capacity["signal_targets_over_position_cap"]} '
             f'未实际持有signal目标={capacity["signal_targets_not_held"]} '
             f'应挂单超8={capacity["signal_desired_over_pending_cap"]} '

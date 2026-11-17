@@ -12,7 +12,9 @@ Writes (execution-owned only):
 Safety:
     - no aggregate positionRisk ownership inference;
     - only exact ``cfg.ORDER_CLIENT_PREFIX_*`` client/order identities are cancelled or closed;
-    - at most eight physical pending orders; normally three owned LONG positions, with pending entry admissions allowed during a position's final pre-exit 3m bar;
+    - eight ordinary pending entries plus two signal-follow entries; ordinary
+      entries use the three-position limit and final pre-exit bar exception;
+      signal-follow entries stop and cancel at six owned positions;
     - timed QUEUE close starts 1s before the signal-provided ``exit_due_epoch``;
       up to twelve 5s rounds, each cancelled and confirmed before replacement,
       then MARKET for the owned residual;
@@ -108,6 +110,13 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
     def tracked(self) -> dict[str, dict[str, Any]]:
         return self.ledger.state['tracked_orders']
 
+    def _ordinary_pending_count(self) -> int:
+        return sum(not row.get('signal_follow') for row in self.tracked.values())
+
+    def _entry_client_id(self, row: Mapping[str, Any]) -> str:
+        return self.ledger.client_id(str(row.get('symbol') or '').upper(),
+                                    int(self._finite(row.get('order_bar_open_ms'))), 'entry')
+
     @property
     def positions(self) -> dict[str, dict[str, Any]]:
         return self.ledger.state['owned_positions']
@@ -198,6 +207,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     qty=self._finite(row.get('qty')),
                     exit_due_epoch=self._finite(row.get('exit_due_epoch')))
             status = str(order.get('status') or '').upper()
+            if row.get('signal_follow') and not self._follow_fill_evidence(row, order):
+                continue
             qty = self._finite(order.get('executedQty'))
             avg = self._finite(order.get('avgPrice'))
             row['last_status'] = status
@@ -308,6 +319,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 LOG.warning('cancel uncertain symbol=%s reason=%s err=%s', symbol, reason, error)
                 return
             result = result if isinstance(result, Mapping) else {}
+            if current.get('signal_follow') and not self._follow_fill_evidence(current, result):
+                return
             filled_qty = self._finite(result.get('executedQty'))
             current['confirmed_filled_qty'] = max(filled_qty, self._finite(current.get('confirmed_filled_qty')))
             if filled_qty + 1e-12 < self._finite(current.get('accounted_entry_qty')):
@@ -388,6 +401,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         if len(self.positions) < cfg.SLOTS or self._in_final_pre_exit_bar(now=now):
             return
         for symbol, row in list(self.tracked.items()):
+            if row.get('signal_follow'):
+                continue
             self._request_cancel(symbol, row, 'position_capacity_full_cancel_all')
 
     def _entry_plan_signature(self, row: Mapping[str, Any]) -> list[Any]:
@@ -421,8 +436,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         symbol = str(row.get('symbol') or '').upper()
         if self._forced_entry_blocked(symbol, now=time.time()):
             return True
-        cid = self.ledger.client_id(
-            symbol, int(self._finite(row.get('order_bar_open_ms'))), 'entry')
+        cid = self._entry_client_id(row)
         rotated = self.ledger.state.get('rotated_out_plans', {}).get(cid)
         if isinstance(rotated, Mapping) and rotated.get('plan_signature') == self._entry_plan_signature(row):
             return True  # do not re-add the exact old plan into a spare slot after rotating it out
@@ -479,19 +493,24 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         if not symbol or symbol in self.tracked or symbol in self.positions:
             return skipped('missing_symbol_or_already_tracked_or_held')
         submit_now = time.time()
+        following = bool(row.get('signal_follow'))
         bar_ms = int(self._finite(row.get('order_bar_open_ms')))
-        if bar_ms > 0 and not bar_ms <= submit_now * 1000 < bar_ms + cfg.BAR_MS:
+        if not following and bar_ms > 0 and not bar_ms <= submit_now * 1000 < bar_ms + cfg.BAR_MS:
             return skipped('order_bar_expired_before_submit')
         reopen_until = self._finite(
             self.ledger.state['reopen_until_epoch'].get(symbol))
         if submit_now < reopen_until:
             return skipped('post_close_reopen_cooldown')
         final_exit_bar = self._in_final_pre_exit_bar(now=submit_now)
-        if ((len(self.positions) >= cfg.SLOTS and not final_exit_bar)
-                or len(self.tracked) >= cfg.MAX_PENDING_ORDERS):
+        from .signal_follow import FOLLOW_ORDER_CAP, FOLLOW_POSITION_CAP
+        if following:
+            if (len(self.positions) >= FOLLOW_POSITION_CAP
+                    or sum(bool(p.get('signal_follow')) for p in self.tracked.values()) >= FOLLOW_ORDER_CAP):
+                return skipped('signal_follow_capacity_full')
+        elif ((len(self.positions) >= cfg.SLOTS and not final_exit_bar)
+                or self._ordinary_pending_count() >= cfg.MAX_PENDING_ORDERS):
             return skipped('position_or_pending_capacity_full')
-        client_id = self.ledger.client_id(
-            symbol, int(self._finite(row.get('order_bar_open_ms'))), 'entry')
+        client_id = self._entry_client_id(row)
         if self.ledger.owns_client(client_id) or self._entry_submission_blocked(row):
             return skipped('exact_client_identity_already_used_or_plan_rejected')
         price = self._finite(row.get('limit_price'))
@@ -534,6 +553,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'reference_bar_open_ms': int(self._finite(row.get('reference_bar_open_ms'))),
             'order_bar_open_ms': int(self._finite(row.get('order_bar_open_ms'))),
             'position_id': str(row.get('position_id') or ''),
+            **{k: row[k] for k in ('signal_follow', 'signal_follow_position_id') if k in row},
             'observed_price': self._finite(row.get('observed_price'), price),
             'gap': self._finite(row.get('gap'), 0.0),
             'placed_at_epoch': submit_now, 'last_status': 'SUBMITTING',
@@ -605,8 +625,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                      notional, sizing_details['submitted_notional'], qty_text, client_id, order_id)
             self.ledger.save()
         self._run_network(('entry', symbol, client_id), send, complete, priority=10,
-            entry_request=dict(symbol=symbol, client_order_id=client_id, limit_price=price,
-                               notional=notional, order_bar_open_ms=bar_ms))
+            entry_request=None if following else dict(symbol=symbol, client_order_id=client_id, limit_price=price,
+                                                     notional=notional, order_bar_open_ms=bar_ms))
 
     def _target_positions(self, snapshot: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         rows = snapshot.get('target_positions')
@@ -680,6 +700,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 'notional': row.get('notional'),
                 'qty': row.get('qty'),
                 'status': row.get('last_status', 'NEW'),
+                'signal_follow': bool(row.get('signal_follow')),
+                'signal_follow_position_id': row.get('signal_follow_position_id'),
             }
         payload = {
             'schema_version': 1,
@@ -872,6 +894,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     'order_bar_mismatch' if row_bar != bar_ms else 'missing_or_stale_price_or_invalid_limit')
         tracked_view = {}
         for symbol, old in self.tracked.items():
+            if old.get('signal_follow'):
+                continue
             item = dict(old)
             price = self._finite(price_map.get(symbol), float('nan'))
             limit = self._finite(item.get('limit_price'), float('nan'))

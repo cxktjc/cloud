@@ -26,6 +26,7 @@ from .stream import AccountStreamView, StreamUnavailable
 from .submit_errors import ConfirmedSubmitRejection, is_transport_error
 from .nonblocking_io import NetworkPending
 from .batch_entry import BatchEntryMixin
+from .signal_follow import follow_send_allowed
 
 LOG = logging.getLogger('v9711_live_trade.client')
 
@@ -443,9 +444,11 @@ class ExchangeClient(BatchEntryMixin):
             market_guard = getattr(self, 'market_guard', None)
             if callable(market_guard) and not market_guard(symbol.upper()):
                 raise ConfirmedSubmitRejection('internal WS quote/group not ready before send')
+            following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, client_order_id,
+                                            int(order_bar_open_ms or 0), now=time.time())
             if self.network_io is not None:
-                self.network_io.check_entry(symbol, client_order_id, int(order_bar_open_ms or 0))
-            if order_bar_open_ms is not None and not (
+                following = self.network_io.check_entry(symbol, client_order_id, int(order_bar_open_ms or 0))
+            if not following and order_bar_open_ms is not None and not (
                     order_bar_open_ms > 0
                     and order_bar_open_ms <= time.time() * 1000 < order_bar_open_ms + cfg.BAR_MS):
                 raise ConfirmedSubmitRejection('entry order bar expired/not active before send')
@@ -549,7 +552,8 @@ class ExchangeClient(BatchEntryMixin):
             bar_ms = _finite(row.get('order_bar_open_ms'))
             failed = _finite(row.get('submit_failed_at_epoch'),
                              _finite(intent.get('registered_at_epoch')))
-            if bar_ms > 0 and bar_ms <= now * 1000 < bar_ms + cfg.BAR_MS and 0 < failed <= now:
+            active_follow = row.get('signal_follow') and failed > 0 and now < failed + cfg.DESIRED_TTL_SECONDS
+            if (active_follow or bar_ms > 0 and bar_ms <= now * 1000 < bar_ms + cfg.BAR_MS) and 0 < failed <= now:
                 return failed
         elif (intent.get('kind') == 'close'
               and order_id in (None, '', 0, '0')

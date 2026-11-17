@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from .. import config as cfg
 from .submit_errors import ConfirmedSubmitRejection
+from .signal_follow import follow_send_allowed, FOLLOW_POSITION_CAP
 from .cancel_pacing import (EntryCancelPacing, ENTRY_CANCEL_INTERVAL_SECONDS,
                             exact_entry_cancel_key)
 
@@ -146,9 +147,11 @@ class NetworkIO(EntryCancelPacing):
         # Replace a snapshot; no ledger/state lock spans any network call.
         self._entry_gate = gate
 
-    def check_entry(self, symbol: str, cid: str, bar_ms: int) -> None:
+    def check_entry(self, symbol: str, cid: str, bar_ms: int) -> bool:
         gate = self._entry_gate
         now = time.time()
+        if not self._closed and follow_send_allowed(gate, symbol, cid, bar_ms, now=now):
+            return True
         # Match the owner's final-pre-exit-bar admission at the actual send
         # time. Use immutable due times, not a latched allow-full boolean:
         # queued work/reconnects must not extend the exception past its end.
@@ -163,6 +166,7 @@ class NetworkIO(EntryCancelPacing):
                 or (gate.get('held', 0) >= gate.get('position_cap', 0) and not final_exit_bar)
                 or cid not in gate.get('allowed', ())):
             raise ConfirmedSubmitRejection('queued entry no longer valid/full/expired before send; request never sent')
+        return False
 
     def health(self) -> dict[str, Any]:
         with self._condition:
@@ -252,23 +256,28 @@ class NetworkTradeMixin:
 
     def _publish_entry_gate(self) -> None:
         io = self._network_io
-        if io is None:
-            return
         snapshot, status = self._io_signal
-        io.set_entry_gate(dict(ready=status == 'valid' and bool(snapshot.get('signal_ready')),
+        now = time.time()
+        follow_entries = (self._follow_gate_entries(snapshot, now=now)
+                          if hasattr(self, '_follow_gate_entries') and len(self.positions) < FOLLOW_POSITION_CAP else {})
+        gate = dict(ready=status == 'valid' and bool(snapshot.get('signal_ready')),
             bar_ms=int(self._finite(snapshot.get('bar_open_ms'))), bar_length_ms=cfg.BAR_MS,
             generated=self._finite(snapshot.get('generated_at_epoch')),
             expires=self._finite(snapshot.get('expires_at_epoch')), ttl=cfg.DESIRED_TTL_SECONDS,
-            refreshed=time.time(), held=len(self.positions), position_cap=cfg.SLOTS,
+            refreshed=now, held=len(self.positions), position_cap=cfg.SLOTS,
+            follow_entries=follow_entries,
             # Only the owner reads positions. Workers receive a normalized,
             # immutable snapshot, never signal targets or a mutable ledger.
             position_exit_due_epochs=tuple(self._finite(pos.get('exit_due_epoch'))
                                            for pos in self.positions.values()),
-            allowed=frozenset(str(p.get('client_order_id')) for p in self.tracked.values()
-                              if not p.get('cancel_requested')
+            allowed=frozenset(follow_entries) | frozenset(str(p.get('client_order_id')) for p in self.tracked.values()
+                              if not p.get('signal_follow') and not p.get('cancel_requested')
                               and (p.get('sizing_weight') is None
                                    or p.get('sizing_weight') == cfg.SLOT_WEIGHTS[min(len(self.positions), 2)])
-                              and not self._forced_entry_blocked(str(p.get('symbol') or ''), now=time.time()))))
+                              and not self._forced_entry_blocked(str(p.get('symbol') or ''), now=now)))
+        self.client.entry_gate = gate
+        if io is not None:
+            io.set_entry_gate(gate)
 
     @contextmanager
     def entry_cancel_plan(self):
@@ -336,6 +345,7 @@ class NetworkTradeMixin:
         if entry_request is not None and self._entry_plan_buffer is not None:
             self._entry_plan_buffer.append((key, work, done, dict(entry_request)))
             return
+        self._publish_entry_gate()
         if self._network_io is None:
             try:
                 result = work()
@@ -344,7 +354,6 @@ class NetworkTradeMixin:
             else:
                 done(result, None)
             return
-        self._publish_entry_gate()
         def complete(value, error):
             try:
                 done(value, error)

@@ -224,7 +224,9 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
     signal_desired_count = max(0, _as_int(signal_desired_count))
     priced_desired_count = max(0, _as_int(priced_desired_count))
     near_place_count = max(0, _as_int(near_place_count))
-    pending_count = len(_position_rows(open_orders))
+    pending_rows = _position_rows(open_orders)
+    follow_count = sum(bool(row.get('signal_follow')) for row in pending_rows.values())
+    pending_count = len(pending_rows) - follow_count
 
     difference = {
         'sign_convention': 'signal_minus_trade; positive means signal model is ahead',
@@ -258,10 +260,14 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
 
     capacity = {
         'max_pending_orders': int(max_pending_orders),
+        'signal_follow_max_pending_orders': cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS,
+        'signal_follow_position_stop': cfg.SIGNAL_FOLLOW_POSITION_STOP,
         'actual_position_cap': int(max_positions),
         'signal_target_count': len(signal_positions),
         'actual_position_count': len(actual),
         'pending_order_count': pending_count,
+        'signal_follow_order_count': follow_count,
+        'total_pending_order_count': pending_count + follow_count,
         'signal_desired_count': signal_desired_count,
         'priced_desired_count': priced_desired_count,
         'near_place_count': near_place_count,
@@ -279,7 +285,9 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
         'basis': ('signal_model_vs_operator_imported_baseline_plus_execution' if imported_baseline
                   else 'signal_contract_v2_model_vs_exact_owned_trade_state'),
         'initial_equity': equity0,
-        'actual': {**trade, 'pending_order_count': pending_count},
+        'actual': {**trade, 'pending_order_count': pending_count,
+                   'signal_follow_order_count': follow_count,
+                   'total_pending_order_count': pending_count + follow_count},
         'signal': signal,
         'difference': difference,
         'capacity': capacity,

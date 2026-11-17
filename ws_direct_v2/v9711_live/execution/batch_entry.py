@@ -11,6 +11,7 @@ import time
 from typing import Any, Mapping
 
 from .submit_errors import ConfirmedSubmitRejection, require_submit_ack
+from .signal_follow import follow_send_allowed
 
 
 class BatchEntryMixin:
@@ -29,10 +30,11 @@ class BatchEntryMixin:
         market_guard = getattr(self, 'market_guard', None)
         if callable(market_guard) and not market_guard(symbol):
             raise ConfirmedSubmitRejection('internal WS quote/group not ready before batch send')
+        following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, cid, bar, now=time.time())
         if self.network_io is not None:
-            self.network_io.check_entry(symbol, cid, bar)
+            following = self.network_io.check_entry(symbol, cid, bar)
         from .. import config as cfg
-        if not bar <= time.time() * 1000 < bar + cfg.BAR_MS:
+        if not following and not bar <= time.time() * 1000 < bar + cfg.BAR_MS:
             raise ConfirmedSubmitRejection('entry order bar expired/not active before batch send')
         if time.monotonic() < self._broker_rate_limit_until_mono:
             raise ConnectionError('trade broker rate limit cooldown; no batch request sent')

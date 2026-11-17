@@ -13,7 +13,7 @@ LOG = logging.getLogger('v9711_live_trade')
 class PendingRotationMixin:
     def _current_admission_gap(self) -> float:
         policy = GapPolicy()
-        count = len(self.tracked)
+        count = self._ordinary_pending_count()
         ceiling = policy.strict_gap if count >= cfg.MAX_PENDING_ORDERS else policy.admission_gap(count)
         pending = self.ledger.state.get('pending_rotation')
         if pending:

@@ -11,6 +11,7 @@ from .ws_market import DirectMarket
 from .metadata_sync import MetadataSync
 from .position_identity import CAPITAL_MODE
 from .sizing import CountSizingMixin
+from .signal_follow import SignalFollowMixin
 from collectors.ticker_ws import load_symbols
 
 LOG = logging.getLogger('v9711.ws_direct')
@@ -27,7 +28,7 @@ def check_inputs():
                 order='receive -> decision/durable registration/dispatch -> mirror commit -> asynchronous file')
 
 
-class DirectTrade(CountSizingMixin, LiveTrade):
+class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def __init__(self, **kwargs):
         self.market = DirectMarket(load_symbols(cfg.SYMBOLS_FILE), cfg.PRICE_FILE)
         self._fast_tick = False
@@ -65,6 +66,8 @@ class DirectTrade(CountSizingMixin, LiveTrade):
         return super().step(now=now)
 
     def _execute_entries(self, snapshot, status, **kwargs):
+        snapshot = dict(snapshot)
+        snapshot['_signal_snapshot_valid'] = status == 'valid'
         if status == 'valid':
             if not self.market.healthy():
                 status = 'ws_not_ready'
@@ -100,14 +103,13 @@ class DirectTrade(CountSizingMixin, LiveTrade):
             for symbol, price in self.market.prices().items():
                 self._update_rank(symbol, price)
             self._template_revision = self._desired_reader.revision
+        self._promote_signal_follow_orders(payload, now=now)
         return payload, status
 
     def refresh_prices(self, *, now=None):
         return self.market.prices(self._active_price_symbols if self._fast_tick else None)
 
     def _publish_entry_gate(self):
-        if getattr(self, '_network_io', None) is None:
-            return
         snapshot, status = self._io_signal
         if not self.market.healthy() or (self.client.enabled and not self.client.dry_run
                                          and time.time() > self._account_deadline):
@@ -134,7 +136,8 @@ class DirectTrade(CountSizingMixin, LiveTrade):
 
     def _fast_snapshot(self, snapshot, tick, now):
         self._update_rank(tick.symbol, float(tick.price))
-        selected, restore = set(self.tracked), []
+        target_symbols = set(self._target_positions(snapshot))
+        selected, restore = set(self.tracked) | target_symbols, []
         valid = 0
         while self._rank_heap and valid < cfg.MAX_PENDING_ORDERS:
             item = heapq.heappop(self._rank_heap)
@@ -146,7 +149,7 @@ class DirectTrade(CountSizingMixin, LiveTrade):
                 continue
             restore.append(item)
             row = self._entry_sizing_row(self._templates[symbol])
-            if (symbol in self.positions or symbol in self.tracked
+            if (symbol in target_symbols or symbol in self.positions or symbol in self.tracked
                     or now < self._finite(self.ledger.state['reopen_until_epoch'].get(symbol))
                     or self._entry_submission_blocked(row)):
                 continue
