@@ -13,8 +13,9 @@ Safety:
     - no aggregate positionRisk ownership inference;
     - only exact ``cfg.ORDER_CLIENT_PREFIX_*`` client/order identities are cancelled or closed;
     - at most eight physical pending orders; normally three owned LONG positions, with pending entry admissions allowed during a position's final pre-exit 3m bar;
-    - normal QUEUE close starts at the signal-provided ``exit_due_epoch``;
-      after 60s, confirmed cancellation permits MARKET for the owned residual;
+    - timed QUEUE close starts 3s before the signal-provided ``exit_due_epoch``;
+      up to twelve 5s rounds, each cancelled and confirmed before replacement,
+      then MARKET for the owned residual;
     - a symbol is blocked from reopening for 60s after a close;
     - persistent live mode polls signal/local fills on the state-owner thread;
       independent broker I/O runs on bounded workers, never under a state lock.
@@ -371,7 +372,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
     def _timed_exits(self, *, now: float) -> None:
         for symbol, pos in list(self.positions.items()):
             due = self._finite(pos.get('exit_due_epoch'), float('nan'))
-            if math.isfinite(due) and now >= due:
+            if math.isfinite(due) and now >= due - close_policy.TIMED_EXIT_LEAD_SECONDS:
                 self._close_position(symbol, 'fixed_bar_exit', now=now)
 
     def _in_final_pre_exit_bar(self, *, now: float) -> bool:
@@ -967,10 +968,11 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         LOG.info('entry plans: singleton=WS multi=REST batchOrders chunks<=5; independent plans do not await previous ACK')
         LOG.info('entry cancels: nearest absolute relative gap first; one at a time; '
                  '1.5s after previous response; exit/QUEUE cancels and other I/O bypass this lane')
-        LOG.info('close policy normal=%s wait=%.1fs cancel_retry=%.1fs '
-                 'fallback=confirmed_cancel_then_market_residual; unknown_fate=query_only',
+        LOG.info('close policy normal=%s wait=%.1fs rounds=%d timed_exit_lead=%.1fs cancel_retry=%.1fs '
+                 'fallback=confirmed_cancel_after_last_round_then_market_residual; unknown_fate=query_only',
                  'LIMIT/GTC/QUEUE' if close_policy.LIMIT_ENABLED else 'MARKET',
-                 close_policy.LIMIT_SECONDS, close_policy.CANCEL_RETRY_SECONDS)
+                 close_policy.LIMIT_SECONDS, close_policy.LIMIT_ATTEMPTS,
+                 close_policy.TIMED_EXIT_LEAD_SECONDS, close_policy.CANCEL_RETRY_SECONDS)
         if self.once:
             self.step()
             return 0

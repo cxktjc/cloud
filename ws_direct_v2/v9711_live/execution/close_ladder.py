@@ -1,7 +1,8 @@
 """Durable, non-blocking LONG close ladder, adapted from trade1026/0930.
 
-Normal exits: SELL LIMIT/GTC priceMatch=QUEUE -> wait -> exact cancel
-confirmation -> MARKET for the still-owned residual. Unknown order fate never
+Normal exits: up to 12 SELL LIMIT/GTC priceMatch=QUEUE rounds, each resting
+5s before exact cancel confirmation, then MARKET for the still-owned residual.
+Unknown order fate never
 permits a second close. No strategy decisions, exchange imports or background
 threads live here. Existing pre-ladder market close identities remain valid.
 """
@@ -18,13 +19,16 @@ from .client import DisabledExchange
 from .submit_errors import require_submit_ack, submit_error_is_ambiguous
 
 LOG = logging.getLogger('v9711_live_trade')
+_monotonic = time.monotonic
 LIMIT_ENABLED = os.environ.get('V9711_LIVE_CLOSE_LIMIT_ENABLED', '1').strip().lower() in {
     '1', 'true', 'yes', 'on'}
-LIMIT_SECONDS = cfg.env_float('V9711_LIVE_CLOSE_LIMIT_SECONDS', 60.0)
+# Fixed v2 policy: copied v1 .env files must not restore the old 60s wait.
+LIMIT_SECONDS = 5.0
+LIMIT_ATTEMPTS = 12
+TIMED_EXIT_LEAD_SECONDS = 3.0
 CANCEL_RETRY_SECONDS = cfg.env_float('V9711_LIVE_CLOSE_CANCEL_RETRY_SECONDS', 5.0)
-if not (math.isfinite(LIMIT_SECONDS) and 1.0 <= LIMIT_SECONDS <= 600.0
-        and math.isfinite(CANCEL_RETRY_SECONDS) and 1.0 <= CANCEL_RETRY_SECONDS <= 60.0):
-    raise ValueError('Invalid QUEUE close wait / cancel retry seconds')
+if not (math.isfinite(CANCEL_RETRY_SECONDS) and 1.0 <= CANCEL_RETRY_SECONDS <= 60.0):
+    raise ValueError('Invalid QUEUE close cancel retry seconds')
 QUEUE_REASONS = frozenset({'fixed_bar_exit', 'over_capacity_3m_edge'})
 TERMINAL = frozenset({'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED',
                       'EXPIRED_IN_MATCH', 'REJECTED'})
@@ -52,8 +56,8 @@ class CloseLongMixin:
         """Checkpoint residual/accounting BEFORE removing the old exact intent."""
         pos = self.positions[symbol]
         cid, oid = str(pos.get('close_client_order_id') or ''), pos.get('close_order_id')
-        control = {k: pos[k] for k in ('close_started_epoch', 'close_deadline_epoch',
-                                       'close_reason') if k in pos}
+        control = {k: pos[k] for k in ('close_started_epoch', 'close_reason',
+                                       'close_queue_rounds', 'close_urgent') if k in pos}
         attempt = int(self._finite(pos.get('close_attempt'))) + 1
         for key in tuple(pos):
             if key.startswith('close_'):
@@ -65,6 +69,31 @@ class CloseLongMixin:
         # until the residual and next attempt have reached the position file.
         self.ledger.save()
         self.ledger.forget(symbol=symbol, client_order_id=cid, order_id=oid)
+
+    def _queue_close_rounds(self, pos: Mapping[str, Any]) -> int:
+        # Legacy in-flight QUEUE identities already consumed their first round.
+        legacy_round = int(pos.get('close_phase') == QUEUE
+                           and bool(pos.get('close_client_order_id')))
+        return max(legacy_round, int(self._finite(pos.get('close_queue_rounds'))))
+
+    def _restore_queue_close_policy(self, symbol: str) -> None:
+        """Resume old 60s QUEUE orders without resending or restarting a timer."""
+        pos = self.positions[symbol]
+        if pos.get('close_phase') != QUEUE or not pos.get('close_client_order_id'):
+            return
+        before = dict(pos)
+        pos['close_queue_rounds'] = self._queue_close_rounds(pos)
+        if (pos.get('close_order_id') not in (None, '', 0, '0')
+                and not pos.get('close_timer_pending')):
+            ack = self._finite(pos.get('close_ack_epoch'))
+            if ack <= 0:
+                ack = self._finite(pos.get('close_requested_epoch'))
+            if ack > 0:
+                pos['close_deadline_epoch'] = min(
+                    self._finite(pos.get('close_deadline_epoch'), float('inf')),
+                    ack + LIMIT_SECONDS)
+        if pos != before:
+            self.ledger.save()
 
     def _settle_close_confirmation(self, symbol: str, result: Mapping[str, Any], *, now: float) -> None:
         """Book cumulative exact fills once; an ACK/cancel is not a fill."""
@@ -87,7 +116,7 @@ class CloseLongMixin:
         if (pos.get('close_phase') == QUEUE and pos.get('close_timer_pending')
                 and (response_oid or pos.get('close_order_id'))):
             # A queued network job may sit behind another request. Do not use
-            # local queue residence as its 60s exchange resting interval.
+            # local queue residence as its 5s exchange resting interval.
             pos.update(close_timer_pending=False, close_ack_epoch=now,
                        close_deadline_epoch=now if pos.get('close_urgent') else now + LIMIT_SECONDS)
         requested = self._finite(pos.get('close_quantity'))
@@ -139,7 +168,12 @@ class CloseLongMixin:
             phase = str(pos.get('close_phase') or MARKET)
             LOG.info('close terminal with residual symbol=%s phase=%s status=%s remaining=%.8g',
                      symbol, phase, status, self._finite(pos.get('quantity')))
-            self._clear_close_order(symbol, next_phase=MARKET)
+            pos['close_queue_rounds'] = self._queue_close_rounds(pos)
+            repeat_queue = (phase == QUEUE and LIMIT_ENABLED
+                            and not pos.get('close_urgent')
+                            and status != 'REJECTED'
+                            and pos['close_queue_rounds'] < LIMIT_ATTEMPTS)
+            self._clear_close_order(symbol, next_phase=QUEUE if repeat_queue else MARKET)
         else:
             self.ledger.save()
 
@@ -165,7 +199,7 @@ class CloseLongMixin:
                 return
             event_now = time.time() if self._network_io else now
             if error is not None:
-                self._close_warning(symbol, f'QUEUE cancel uncertain ({error}); no market until confirmed', now=event_now)
+                self._close_warning(symbol, f'QUEUE cancel uncertain ({error}); retain identity until confirmed', now=event_now)
                 self.ledger.save()
                 return
             self._close_stat('close_limit_cancel')
@@ -179,6 +213,7 @@ class CloseLongMixin:
         pos = self.positions.get(symbol)
         if not pos or not pos.get('close_client_order_id'):
             return
+        self._restore_queue_close_policy(symbol)
         query = getattr(self.client, 'query_exact_order', None)
         if callable(query):
             result, known = query(
@@ -217,6 +252,8 @@ class CloseLongMixin:
                     self.positions[symbol].get('quantity'), delay, exc)
 
     def _close_position(self, symbol: str, reason: str, *, now: float) -> None:
+        # Preserve an injected epoch while including blocking work in sync mode.
+        started_mono = _monotonic()
         pos = self.positions.get(symbol)
         if not pos:
             return
@@ -236,6 +273,11 @@ class CloseLongMixin:
             return
         phase = str(pos.get('close_next_phase') or
                     (QUEUE if LIMIT_ENABLED and reason in QUEUE_REASONS else MARKET))
+        if reason not in QUEUE_REASONS or pos.get('close_urgent'):
+            phase = MARKET
+        if phase == QUEUE and (not LIMIT_ENABLED
+                               or self._queue_close_rounds(pos) >= LIMIT_ATTEMPTS):
+            phase = MARKET
         attempt = int(self._finite(pos.get('close_attempt')))
         prefix = 'clq' if phase == QUEUE else 'close'
         kind = prefix if attempt == 0 else f'{prefix}{attempt}'
@@ -243,9 +285,11 @@ class CloseLongMixin:
         already_registered = self.ledger.owns_client(cid)
         pos.setdefault('close_started_epoch', now)
         if phase == QUEUE:
-            pos.setdefault('close_deadline_epoch', now + LIMIT_SECONDS)
-            if self._network_io:
-                pos.update(close_timer_pending=True, close_enqueued_epoch=now)
+            # Reserve the round together with its exact identity before sending.
+            # A delayed ACK starts a fresh resting interval, including sync I/O.
+            pos.update(close_queue_rounds=self._queue_close_rounds(pos) + 1,
+                       close_deadline_epoch=now + LIMIT_SECONDS,
+                       close_timer_pending=True, close_enqueued_epoch=now)
         pos.update(close_phase=phase, close_client_order_id=cid, close_order_id='',
                    close_quantity=self._finite(pos.get('quantity')), close_accounted_qty=0.0,
                    close_accounted_quote=0.0, close_requested_epoch=now, close_reason=reason,
@@ -261,7 +305,8 @@ class CloseLongMixin:
             pos = self.positions.get(symbol)
             if not pos or pos.get('close_client_order_id') != cid:
                 return
-            event_now = time.time() if self._network_io else now
+            event_now = (time.time() if self._network_io
+                         else now + max(0.0, _monotonic() - started_mono))
             try:
                 if error is not None:
                     raise error
@@ -278,16 +323,17 @@ class CloseLongMixin:
                 self._close_warning(symbol, f'{phase} submit uncertain ({exc}); exact identity retained', now=event_now)
                 return
             self._close_stat('close_limit' if phase == QUEUE else 'close_market')
-            if phase == MARKET and 'close_deadline_epoch' in pos:
+            if phase == MARKET and (pos.get('close_queue_rounds')
+                                    or 'close_deadline_epoch' in pos):
                 self._close_stat('close_fallback')
             pos['close_order_id'] = str(result.get('orderId') or '')
             pos['close_status'] = str(result.get('status') or 'UNKNOWN').upper()
             self.ledger.register(symbol=symbol, client_order_id=cid,
                                  order_id=pos['close_order_id'], kind='close', qty=pos['close_quantity'])
-            LOG.info('close submitted symbol=%s phase=%s qty=%.8g id=%s deadline=%s reason=%s',
-                     symbol, phase, pos['close_quantity'], cid,
-                     pos.get('close_deadline_epoch') if phase == QUEUE else '-', reason)
             self._settle_close_confirmation(symbol, result, now=event_now)
+            LOG.info('close submitted symbol=%s phase=%s qty=%.8g id=%s round=%s/%s deadline=%s reason=%s',
+                     symbol, phase, quantity, cid, pos.get('close_queue_rounds', 0),
+                     LIMIT_ATTEMPTS, pos.get('close_deadline_epoch') if phase == QUEUE else '-', reason)
         self._run_network(('close', symbol, cid),
             lambda: place(symbol=symbol, qty=quantity, client_order_id=cid), complete, priority=0)
 
@@ -297,6 +343,8 @@ class CloseLongMixin:
                     'order_id': p.get('close_order_id'),
                     'phase': p.get('close_phase', MARKET), 'status': p.get('close_status'),
                     'remaining_owned_qty': p.get('quantity'),
+                    'queue_round': p.get('close_queue_rounds', 0),
+                    'queue_max_rounds': LIMIT_ATTEMPTS,
                     'deadline_epoch': p.get('close_deadline_epoch'),
                     'cancel_requested': bool(p.get('close_cancel_requested_epoch'))}
                 for s, p in self.positions.items() if p.get('close_client_order_id')}

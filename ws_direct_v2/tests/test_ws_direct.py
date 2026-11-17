@@ -438,11 +438,11 @@ class TemplateAndMigrationTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         baseline = json.loads((root/'BASELINE.json').read_text())['source_normalized_sha256']
         # Forced-exit reconciliation now also accepts explicitly adopted seeds;
-        # its exact-fill behavior is covered by test_forced_close. Frozen model,
-        # selection and close-order policy sources below remain unchanged.
+        # its exact-fill behavior is covered by test_forced_close. The v2 close
+        # ladder intentionally uses 12 x 5s rounds (test_close_ladder_v2).
+        # Frozen signal model and entry selection sources remain unchanged.
         for name in ('v9711_live/signal_logic.py',
-                     'v9711_live/entry_policy.py','v9711_live/execution/logic.py',
-                     'v9711_live/execution/close_ladder.py'):
+                     'v9711_live/entry_policy.py','v9711_live/execution/logic.py'):
             self.assertEqual(hashlib.sha256((root/name).read_bytes().replace(b'\r\n',b'\n')).hexdigest(),baseline[name],name)
 
     def ledgers(self, source):
