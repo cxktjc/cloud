@@ -146,8 +146,9 @@ class ModelSizingTests(unittest.TestCase):
             book=SignalPortfolio(Path(d)/'signal.json')
             bar=180000*100
             symbols=['AAAUSDT','BBBUSDT','CCCUSDT','DDDUSDT']
-            bars={s:[SimpleNamespace(open_time_ms=bar-180000,open=1,high=1.01,low=.98,close=1,quote_volume=1),
-                     SimpleNamespace(open_time_ms=bar,open=1,high=1,low=.96,close=.99,quote_volume=1)] for s in symbols}
+            bars={s:[SimpleNamespace(open_time_ms=bar-i*cfg.BAR_MS,open=1,high=1.01,
+                                    low=1 if i else .96,close=1,quote_volume=1)
+                     for i in range(96, -1, -1)] for s in symbols}
             with patch('v9711_live.signal_portfolio.BarStore.qv20',return_value=1):
                 book.advance(bars,through_bar_open_ms=bar,symbols=symbols)
                 self.assertEqual([p['notional'] for p in book.positions.values()],[7.5,4.5,3])

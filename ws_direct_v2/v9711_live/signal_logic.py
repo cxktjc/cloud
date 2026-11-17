@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping
 
 from . import config as cfg
 from .contracts import Decision, DesiredOrder
+from .qv import QVHistory
 
 
 def _ms_to_iso(ms: int) -> str:
@@ -62,9 +63,10 @@ def long_gap(limit_price: float, observed_price: float) -> float:
 
 def build_candidates(bars_by_symbol: Mapping[str, Iterable[Any]], *,
                      reference_bar_open_ms: int, symbols: Iterable[str],
-                     qv_threshold: float = cfg.QV_THRESHOLD,
+                     qv_threshold: float | None = None,
                      notional: float = cfg.EQUITY0 / cfg.SIGNAL_SIZING_DIVISOR,
-                     qv20_fn=None) -> tuple[Candidate, ...]:
+                     qv20_fn=None, entry_offset: float = cfg.D,
+                     qv_snapshot=None) -> tuple[Candidate, ...]:
     """Plan orders for the upcoming 3m bar using only completed data.
 
     The next bar's open is not knowable in advance. The completed bar's CLOSE is
@@ -77,6 +79,18 @@ def build_candidates(bars_by_symbol: Mapping[str, Iterable[Any]], *,
         from .market_data import BarStore
         qv20_fn = BarStore.qv20
     order_bar_open_ms = int(reference_bar_open_ms) + cfg.BAR_MS
+    symbols = tuple(symbols)
+    if qv_threshold is None:
+        context = qv_snapshot or QVHistory(bars_by_symbol, symbols).snapshot(order_bar_open_ms)
+        if context.order_bar_open_ms != order_bar_open_ms:
+            raise ValueError('QV snapshot does not match candidate order bar')
+        if not context.ready:
+            return ()
+        qv_threshold = context.threshold
+    else:
+        context = None  # explicit legacy strategy only
+    if not math.isfinite(qv_threshold) or qv_threshold <= 0:
+        return ()
     # v9711 holds K bars from the entry bar.  The executor owns a monotonic
     # timer; this is the exact wall-clock due time fixed before the order is
     # submitted: entry_bar_open + K*3m + 3m (the exit bar's completed close).
@@ -97,7 +111,8 @@ def build_candidates(bars_by_symbol: Mapping[str, Iterable[Any]], *,
         if (bar is None or int(bar.open_time_ms) != reference_bar_open_ms
                 or not math.isfinite(float(bar.close)) or float(bar.close) <= 0.0):
             continue
-        qv = float(qv20_fn(series, order_bar_open_ms))
+        qv = float(context.qv20.get(symbol, float('nan')) if context is not None
+                   else qv20_fn(series, order_bar_open_ms))
         if not math.isfinite(qv) or qv <= 0.0 or qv > qv_threshold:
             continue
         out.append(Candidate(
@@ -106,7 +121,7 @@ def build_candidates(bars_by_symbol: Mapping[str, Iterable[Any]], *,
             order_bar_available_ms=order_bar_open_ms + cfg.BAR_MS,
             reference_bar_open_ms=int(bar.open_time_ms),
             reference_bar_available_ms=int(bar.open_time_ms) + cfg.BAR_MS,
-            limit_price=float(bar.close) * (1.0 - cfg.D),
+            limit_price=float(bar.close) * (1.0 - entry_offset),
             qv20=qv,
             notional=float(notional),
             reference_price=float(bar.close),
@@ -123,12 +138,12 @@ def select_orders(candidates: Iterable[Candidate], prices: Mapping[str, SignalIn
                   incumbent_symbols: Iterable[str] = (),
                   place_gap: float = cfg.SIGNAL_DISCOVERY_GAP,
                   cancel_gap: float | None = None) -> SignalPlan:
-    """Publish the complete <=2.2% discovery envelope for tiered trade admission.
+    """Publish the complete <=2.0% discovery envelope for tiered trade admission.
 
     Signal does not cap pending intents at six and does not price-cancel a
     valid incumbent. Trade owns the eight physical slots and applies count-based
     admission plus cancel-first rotation (including underfilled 5..7 books).
-    Signal never infers physical capacity from its unlimited model positions.
+    Signal never infers physical capacity from its independent model positions.
     Negative gaps remain eligible for the frozen LIMIT buy.
     The cancel_gap keyword is retained for compatibility and ignored.
     """

@@ -43,16 +43,20 @@ def env_int(name: str, default: int) -> int:
 VERSION = 'v9711_ws_direct_v2_503020'
 SLOT_WEIGHTS = (0.5, 0.3, 0.2)
 SIZING_POLICY = 'actual_position_count_503020_v2'
-D = 0.03
+D = 0.025
 K = 4
-SLOTS = 3  # execution-side actual-position cap only
+SLOTS = 3  # independent signal-model and ordinary trade position limits
 SIGNAL_SIZING_DIVISOR = 3  # notional sizing; never a signal-count cap
 BAR_MS = 180_000
 EQUITY0 = 15.0
-QV_THRESHOLD = 67522.82013208
+# Used only to finish/replay the explicitly recognized pre-upgrade strategy.
+LEGACY_QV_THRESHOLD = 67522.82013208
 TRADE_FEE_RATE = 0.0005
 QV_WINDOW = 20
 QV_MIN_PERIODS = 10
+QV_QUANTILE = 0.90
+QV_SMOOTH_BARS = 24
+QV_REQUIRED_BARS = QV_WINDOW + QV_SMOOTH_BARS - 1
 
 # Reuse parent deployment collectors by default; keep all new writers isolated.
 SHARED_ROOT = ROOT.parent
@@ -84,10 +88,9 @@ MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD', MYSQL_DEFAULT_PASSWORD)
 MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE', 'binance_futures')
 MYSQL_TABLE = 'klines_3m'
 
-# Keeping 40 completed 3m bars covers qv20 + shift(1) and leaves 19 bars for
-# reconciliation/out-of-order restarts. Bootstrap fetches only these bars once;
-# each new status signature normally adds one bar per symbol.
-HISTORY_BARS = env_int('V9711_LIVE_HISTORY_BARS', 40)
+# 43 completed bars reconstruct all 24 historical quantiles; 96 also covers
+# the bounded 40-bar catch-up. Old .env HISTORY_BARS=40 is upgraded in place.
+HISTORY_BARS = max(96, env_int('V9711_LIVE_HISTORY_BARS', 96))
 MYSQL_BATCH_SIZE = env_int('V9711_LIVE_MYSQL_BATCH_SIZE', 100)
 # High-frequency stat-only probes, NOT collector/network request intervals.
 STATUS_POLL_SECONDS = env_float('V9711_LIVE_STATUS_POLL_SECONDS', 0.02)
@@ -108,13 +111,14 @@ DB_SETTLE_SECONDS = env_float('V9711_LIVE_DB_SETTLE_SECONDS', 4.0)
 ORDER_BAR_LIFETIME_MS = 2 * BAR_MS
 
 # Current-bar pending order policy. Signed gap includes all below-limit prices.
-# Signal publishes eligible candidates up to +2.2%; trade admits the
-# first five at +2.2%, orders 6-8 at +2.0%, and full-book replacements at +1.8%.
+# Signal publishes eligible candidates up to +2.0%; trade admits the
+# first five at +2.0%, orders 6-8 at +1.8%, and full-book replacements at +1.6%.
 # During a held position's final pre-exit 3m bar, pending admission ignores position cap.
-PLACE_GAP = env_float('V9711_LIVE_PLACE_GAP', 0.018)
+# Fixed v2 policy: legacy gap overrides must not silently retain old tiers.
+PLACE_GAP = 0.016
 # Signal publishes the discovery envelope; trade applies count-based tiers.
-BOOTSTRAP_PLACE_GAP = env_float('V9711_LIVE_BOOTSTRAP_PLACE_GAP', 0.022)
-FILL_PLACE_GAP = env_float('V9711_LIVE_FILL_PLACE_GAP', 0.020)
+BOOTSTRAP_PLACE_GAP = 0.020
+FILL_PLACE_GAP = 0.018
 BOOTSTRAP_PENDING_ORDERS = 5
 SIGNAL_DISCOVERY_GAP = BOOTSTRAP_PLACE_GAP
 if not (0 <= PLACE_GAP <= FILL_PLACE_GAP <= BOOTSTRAP_PLACE_GAP < 1):
@@ -126,7 +130,7 @@ SWITCH_TOLERANCE = env_float('V9711_LIVE_SWITCH_TOLERANCE', 0.005)
 # Kept as numeric compatibility/diagnostic constants for older readers.
 # Current eight-slot policy does not use an upward price gap to auto-cancel.
 CANCEL_GAP = env_float('V9711_LIVE_CANCEL_GAP', 0.02)
-PENDING_ORDER_POLICY = 'tiered_5_8_rotation_first_v3'
+PENDING_ORDER_POLICY = 'tiered_5_8_rotation_first_v4'
 if not (0.0 <= PLACE_GAP < 1.0 and 0.0 <= SWITCH_TOLERANCE < 1.0):
     raise ValueError('Require finite place/switch gaps in [0, 1)')
 if not 1 <= MAX_PENDING_ORDERS <= 8:

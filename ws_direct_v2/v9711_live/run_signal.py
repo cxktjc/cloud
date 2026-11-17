@@ -26,6 +26,7 @@ from .local_poll import LocalChangePoller, probe_sleep
 from .publisher import DesiredPublisher
 from .signal_logic import SignalInput, build_candidates, long_gap, select_orders
 from .signal_portfolio import SignalPortfolio
+from .qv import QVHistory
 from .signal_diagnostics import CandidateDistance, nearest_candidates, nearest_candidates_line
 from .terminal_view import TerminalView, desired_map, latest_completed_positions
 
@@ -40,6 +41,12 @@ class LiveSignal:
         self.status_reader = StatusReader(cfg.STATUS_FILE)
         self.price_reader = PriceReader(cfg.PRICE_FILE)
         self.bar_store = BarStore()
+        # Quantiles use the configured market universe, never the near-limit
+        # candidate list or the collector's first partial completion batch.
+        self.symbols = tuple(sorted({s.strip().upper() for s in
+            cfg.SYMBOLS_FILE.read_text(encoding='utf-8-sig').splitlines()
+            if s.strip() and not s.lstrip().startswith('#')}))
+        self.qv_diagnostics = {}
         self.portfolio = SignalPortfolio(cfg.STATE_DIR / cfg.SIGNAL_BOOK_FILENAME)
         self.publisher = DesiredPublisher(cfg.DESIRED_FILE)
         self.view = TerminalView()
@@ -167,7 +174,8 @@ class LiveSignal:
         pending = [p for p in self.portfolio.positions.values()
                    if self.portfolio.last_bar is not None
                    and p['exit_bar_open_ms'] <= self.portfolio.last_bar]
-        key = (status.open_time_ms, status.symbols, self.bar_store.revision)
+        universe = self._universe(status)
+        key = (status.open_time_ms, universe, self.bar_store.revision)
         behind = self.portfolio.last_bar != status.open_time_ms
         if key == self._last_model_input_key and not behind and not pending:
             return False
@@ -177,13 +185,15 @@ class LiveSignal:
                  else self.portfolio.last_bar + cfg.BAR_MS)
         through = min(status.open_time_ms, first + (cfg.SIGNAL_CATCHUP_BARS - 1) * cfg.BAR_MS)
         required = min(first, through, self.portfolio.last_bar if self.portfolio.last_bar is not None
-                       else through) - cfg.QV_WINDOW * cfg.BAR_MS
+                       else through) - cfg.QV_REQUIRED_BARS * cfg.BAR_MS
         cached_start = min((b.open_time_ms for rows in self.bar_store.bars.values() for b in rows),
                            default=status.open_time_ms)
         data = self.bar_store.bars
-        if required < cached_start:
+        first_context_ready = (bool(self.portfolio.candidate_options(min(first, through)))
+                               or QVHistory(data, universe).snapshot(min(first, through)).ready)
+        if required < cached_start or not first_context_ready:
             data = self.bar_store.read_window(
-                set(status.symbols) | set(self.portfolio.positions), required, through)
+                set(universe) | set(self.portfolio.positions), required, through)
         if pending:
             # An old/delisted symbol's missing due close must not force a
             # repeated all-universe query spanning the entire stalled interval.
@@ -194,7 +204,7 @@ class LiveSignal:
                     recovered = self.bar_store.read_window([symbol], due, due)
                     data.setdefault(symbol, []).extend(recovered.get(symbol, ()))
         checked_from = through if self.portfolio.last_bar is None else self.portfolio.last_bar
-        events = self.portfolio.advance(data, through_bar_open_ms=through, symbols=status.symbols)
+        events = self.portfolio.advance(data, through_bar_open_ms=through, symbols=universe)
         outcomes_changed = self._resolve_ended_desired(
             processed_data=data, processed_from_ms=checked_from, model_events=events)
         for event in events:
@@ -211,10 +221,14 @@ class LiveSignal:
         self._model_retry_epoch = now + (0.0 if still_behind and progressed else max(0.25, cfg.DB_SETTLE_SECONDS))
         return progressed or outcomes_changed
 
+    def _universe(self, status):
+        return tuple(sorted(set(getattr(self, 'symbols', ())) | set(status.symbols)))
+
     def _refresh_bar(self, status, *, now: float | None = None) -> bool:
         if status is None:
             return False
         now = time.time() if now is None else float(now)
+        universe = self._universe(status)
         if self.stats.bar_open_ms != status.open_time_ms + cfg.BAR_MS:
             self._retire_desired(now=now, before_bar_ms=status.open_time_ms + cfg.BAR_MS)
             self.stats.reset(status.open_time_ms + cfg.BAR_MS)
@@ -223,17 +237,30 @@ class LiveSignal:
         needs_update = (
             (status.open_time_ms, status.symbols) != self._barstore_status_signature
             or status.updated_epoch > self._barstore_updated_epoch + 0.001)
-        missing = any(not self.bar_store.bars.get(s)
+        missing = not self.warmup_ready or any(not self.bar_store.bars.get(s)
                       or self.bar_store.bars[s][-1].open_time_ms < status.open_time_ms
                       for s in status.symbols)
         if needs_update or (missing and now >= self._barstore_retry_epoch):
-            self.bar_store.update(status, now_epoch=now)
+            self.bar_store.update(status, now_epoch=now, symbols=universe)
+            if not needs_update and not self.warmup_ready:
+                # A late historical hole must be retried: incremental cursors
+                # alone would never revisit a gap behind the latest candle.
+                recovered = self.bar_store.read_window(universe,
+                    status.open_time_ms - cfg.QV_REQUIRED_BARS * cfg.BAR_MS, status.open_time_ms)
+                self.bar_store.merge_window(recovered, through_ms=status.open_time_ms)
             self._barstore_retry_epoch = now + max(0.25, cfg.DB_SETTLE_SECONDS)
-            self.warmup_bars = len({b.open_time_ms for rows in self.bar_store.bars.values() for b in rows})
-            self.warmup_ready = self.warmup_bars >= cfg.QV_WINDOW + cfg.QV_MIN_PERIODS
+            context = QVHistory(self.bar_store.bars, universe).snapshot(status.open_time_ms + cfg.BAR_MS)
+            self.qv_diagnostics = context.describe()
+            legacy = self.portfolio.candidate_options(status.open_time_ms + cfg.BAR_MS)
+            if legacy:
+                self.qv_diagnostics.update(policy='legacy_static_before_upgrade_bar',
+                                           threshold=legacy['qv_threshold'])
+            self.qv_diagnostics['strategy_effective_bar_open_ms'] = self.portfolio.state['strategy_effective_bar_open_ms']
+            self.warmup_bars = context.history_bars
+            self.warmup_ready = context.ready
             self._barstore_status_signature = (status.open_time_ms, status.symbols)
             self._barstore_updated_epoch = status.updated_epoch
-        book_changed = self._advance_book(status, now=now) if self.warmup_ready else False
+        book_changed = self._advance_book(status, now=now)
         outcomes_changed = self._resolve_ended_desired()
         book_changed = book_changed or outcomes_changed
         self.model_ready = self.warmup_ready and self.portfolio.last_bar == status.open_time_ms
@@ -249,17 +276,19 @@ class LiveSignal:
             return book_changed
         self.candidates = build_candidates(
             self.bar_store.bars, reference_bar_open_ms=status.open_time_ms,
-            symbols=status.symbols, notional=self._order_equity() * cfg.SLOT_WEIGHTS[min(len(self.portfolio.positions), 2)],
-            qv20_fn=BarStore.qv20)
+            symbols=universe, notional=self._order_equity() * cfg.SLOT_WEIGHTS[min(len(self.portfolio.positions), 2)],
+            **self.portfolio.candidate_options(status.open_time_ms + cfg.BAR_MS))
         self._candidate_key = key
         self.stats.candidates = len(self.candidates)
         return True
 
     def _portfolio_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else float(now)
-        return self.portfolio.snapshot(
+        result = self.portfolio.snapshot(
             self.current_price.prices if self.current_price else {}, now=now,
             ready=self.model_ready and self.current_status is not None)
+        result['qv'] = getattr(self, 'qv_diagnostics', {})
+        return result
 
     def _publish_heartbeat(self, *, now: float, force: bool = False) -> None:
         self.publisher.publish(
@@ -327,7 +356,7 @@ class LiveSignal:
         left = (self.current_status.open_time_ms + cfg.ORDER_BAR_LIFETIME_MS) / 1000 - now
         model = 'ready' if self.model_ready else 'catching_up'
         price = f'{age:.1f}s' if math.isfinite(age) else '-'
-        return (f'3m bar={self.current_status.open_time_ms}; warmup={self.warmup_bars}/{cfg.HISTORY_BARS}; '
+        return (f'3m bar={self.current_status.open_time_ms}; warmup={self.warmup_bars}/{cfg.QV_REQUIRED_BARS}; cache={cfg.HISTORY_BARS}; '
                 f'signal_book={model}; price_age={price}; active_left={left:.1f}s'
                 + ('' if self.price_healthy else '; 价格不可用，暂不计划挂单'))
 

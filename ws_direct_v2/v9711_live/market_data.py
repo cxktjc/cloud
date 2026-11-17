@@ -205,8 +205,8 @@ class BarStore:
 
     def __init__(self, *, history_bars: int = cfg.HISTORY_BARS,
                  batch_size: int = cfg.MYSQL_BATCH_SIZE):
-        if history_bars < cfg.QV_WINDOW + cfg.QV_MIN_PERIODS:
-            raise ValueError('history_bars must cover qv20 plus reconciliation')
+        if history_bars < cfg.QV_REQUIRED_BARS:
+            raise ValueError('history_bars must cover qv20 and all 24 historical quantiles')
         self.history_bars = int(history_bars)
         self.batch_size = int(batch_size)
         self.bars: dict[str, list[Bar]] = defaultdict(list)
@@ -229,12 +229,13 @@ class BarStore:
             self._has_closed_column = cursor.fetchone() is not None
         return ' AND is_closed = 1' if self._has_closed_column else ''
 
-    def update(self, status: KlineStatus, *, now_epoch: float | None = None) -> int:
+    def update(self, status: KlineStatus, *, now_epoch: float | None = None,
+               symbols: Iterable[str] | None = None) -> int:
         """Read only completed bars up to status bar, returning rows merged."""
         target_ms = int(status.open_time_ms)
         if target_ms % cfg.BAR_MS:
             raise ValueError('3m status open_time_ms is not aligned')
-        symbols = status.symbols
+        symbols = tuple(status.symbols if symbols is None else symbols)
         if not symbols:
             return 0
         # The status writer publishes only after the closed batch has persisted.
@@ -328,6 +329,25 @@ class BarStore:
         finally:
             conn.close()
         return dict(result)
+
+    def merge_window(self, recovered, *, through_ms):
+        """Repair late historical rows without losing the 96-bar cache."""
+        changed = False
+        cutoff = through_ms - (self.history_bars - 1) * cfg.BAR_MS
+        for symbol, rows in recovered.items():
+            old = self.bars.get(symbol, [])
+            merged = {b.open_time_ms: b for b in old}
+            merged.update({b.open_time_ms: b for b in rows
+                           if cutoff <= b.open_time_ms <= through_ms
+                           and b.open_time_ms % cfg.BAR_MS == 0
+                           and math.isfinite(b.close) and b.close > 0})
+            new = [merged[t] for t in sorted(merged) if t >= cutoff]
+            if new != old:
+                self.bars[symbol] = new
+                changed = True
+        if changed:
+            self.revision += 1
+        return changed
 
     @staticmethod
     def qv20(series: Iterable[Bar], target_open_ms: int) -> float:

@@ -433,17 +433,18 @@ class TemplateAndMigrationTests(unittest.TestCase):
                 status_signature=None,price_sequence=-1,candidate_templates=[dict(symbol='FARUSDT')])
             self.assertEqual(json.loads(path.read_text())['candidate_templates'],[])
 
-    def test_original_model_and_selection_rules_are_source_identical(self):
-        import hashlib
+    def test_historical_baseline_is_retained_and_strategy_changes_are_explicit(self):
         root = Path(__file__).resolve().parents[1]
         baseline = json.loads((root/'BASELINE.json').read_text())['source_normalized_sha256']
-        # Forced-exit reconciliation now also accepts explicitly adopted seeds;
-        # its exact-fill behavior is covered by test_forced_close. The v2 close
-        # ladder intentionally uses 12 x 5s rounds (test_close_ladder_v2).
-        # Frozen signal model and entry selection sources remain unchanged.
+        # BASELINE records the original port, not the subsequently authorized
+        # d025 / dynamic QV / shifted tiers. Behavior is exercised by
+        # test_qv_v2, test_entry_tiers_v2 and the execution recovery tests.
         for name in ('v9711_live/signal_logic.py',
                      'v9711_live/entry_policy.py','v9711_live/execution/logic.py'):
-            self.assertEqual(hashlib.sha256((root/name).read_bytes().replace(b'\r\n',b'\n')).hexdigest(),baseline[name],name)
+            self.assertIn(name, baseline)
+        from v9711_live.signal_portfolio import SignalPortfolio
+        self.assertEqual(SignalPortfolio.parameters()['d'], .025)
+        self.assertEqual(SignalPortfolio.parameters()['qv_policy'], 'cs_q90_trailing24')
 
     def ledgers(self, source):
         source.mkdir()

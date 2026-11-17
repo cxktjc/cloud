@@ -147,6 +147,13 @@ class TerminalView:
             '先确认撤旧再挂新；不因价差扩大自动撤单；'
             'entry_confirmed=已发计划确认信号入仓；expire=到期未入仓；withdraw=数据/状态异常等撤回；pending_confirmation=等待完成bar。',
         ]
+        qv = book.get('qv') or {}
+        if qv:
+            threshold = qv.get('threshold')
+            shown = f'{threshold:.2f}' if threshold is not None else '等待历史数据'
+            lines.append(f'QV阈值: {shown} ({qv.get("policy", "")})  全币池QV20正值数={qv.get("positive_symbols", 0)}  '
+                         f'历史分位数={qv.get("quantile_count", 0)}/24  '
+                         f'连续完成bar={qv.get("history_bars", 0)}/{cfg.QV_REQUIRED_BARS}')
         if book['pending_exit_price_symbols']:
             lines.append('已到退出bar，等待对应已完成close，账本保留: ' + ', '.join(book['pending_exit_price_symbols']))
         if book['stale_mark_symbols']:

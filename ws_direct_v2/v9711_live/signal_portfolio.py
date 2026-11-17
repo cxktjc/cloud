@@ -1,8 +1,8 @@
 """Signal-owned v9711 target book, independent of exchange execution feedback.
 
 Completed 3m bars confirm touches of the SAME previous-close limit planned
-for that bar. All eligible signals are retained; only trade controls actual
-position capacity. Entries run before that bar's K-bar exits.
+for that bar. Signal maintains its own three-position model; trade controls
+actual position capacity independently. Entries run before that bar's K-bar exits.
 Unlike a finite backtest, unavailable FUTURE exit prices never reject entries.
 These are strategy targets/model PnL, not claims of actual exchange fills.
 """
@@ -12,6 +12,8 @@ import copy
 import hashlib
 import json
 import math
+import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -20,6 +22,7 @@ from . import config as cfg
 from .contracts import atomic_write_json, read_json, utc_now_iso
 from .market_data import BarStore
 from .signal_logic import build_candidates
+from .qv import QVHistory
 
 
 class SignalStateError(RuntimeError):
@@ -35,9 +38,10 @@ def finite(value: Any, default: float = 0.0) -> float:
 
 
 class SignalPortfolio:
-    MODEL = 'v9712_previous_close_limit_count_503020'
+    LEGACY_MODEL = 'v9712_previous_close_limit_count_503020'
+    MODEL = 'v9712_previous_close_d025_cs_q90_s24_503020'
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, now: float | None = None):
         self.path = Path(path)
         self._dirty = False
         self.state: dict[str, Any] = {
@@ -50,29 +54,84 @@ class SignalPortfolio:
             'positions': {}, 'recent_trades': [],
             'total_entries': 0, 'total_exits': 0, 'revision': 0,
             'last_bar_checkpoint': None, 'last_bar_input_key': None,
+            'strategy_effective_bar_open_ms': 0,
         }
         if self.path.exists():
             payload = read_json(self.path)
             self._validate(payload)
             self.state = payload
+            if payload['model'] == self.LEGACY_MODEL:
+                self._upgrade(now=time.time() if now is None else now)
 
     @staticmethod
     def parameters() -> dict[str, Any]:
         return {'d': cfg.D, 'k': cfg.K, 'sizing_divisor': cfg.SIGNAL_SIZING_DIVISOR,
                 'price_reference': 'previous_completed_close', 'signal_position_limit': cfg.SLOTS, 'sizing_weights': list(cfg.SLOT_WEIGHTS),
-                'qv_threshold': cfg.QV_THRESHOLD, 'fee_per_side': cfg.TRADE_FEE_RATE,
+                'qv_policy': 'cs_q90_trailing24', 'qv_window': cfg.QV_WINDOW,
+                'qv_min_periods': cfg.QV_MIN_PERIODS, 'qv_quantile': cfg.QV_QUANTILE,
+                'qv_smooth_bars': cfg.QV_SMOOTH_BARS, 'fee_per_side': cfg.TRADE_FEE_RATE,
                 'initial_equity': cfg.EQUITY0, 'bar_ms': cfg.BAR_MS}
 
+    @classmethod
+    def legacy_parameters(cls):
+        params = {k: v for k, v in cls.parameters().items() if not k.startswith('qv_')}
+        return dict(params, d=0.03, qv_threshold=cfg.LEGACY_QV_THRESHOLD)
+
+    def _upgrade(self, *, now):
+        """Back up before changing metadata. Never reprice an existing target.
+
+        The active order bar remains legacy, including after a restart. Old
+        catch-up bars use old rules; the next full wall-clock bar uses new ones.
+        Legacy checkpoints are frozen so upgrading cannot replay old entries.
+        """
+        backup = self.path.with_name(self.path.name + '.pre_d025_cs_qv.bak')
+        original = self.path.read_bytes()
+        if json.loads(original.decode('utf-8-sig')) != self.state:
+            raise SignalStateError('Signal book changed during upgrade; stop the other signal writer')
+        if backup.exists():
+            if backup.read_bytes() != original:
+                raise SignalStateError('Strategy upgrade backup differs; original book retained')
+        else:
+            with backup.open('xb') as stream:
+                stream.write(original)
+                stream.flush()
+                os.fsync(stream.fileno())
+        effective = (int(now * 1000) // cfg.BAR_MS + 1) * cfg.BAR_MS
+        if self.last_bar is not None:
+            effective = max(effective, self.last_bar + cfg.BAR_MS)
+        self.state.update(model=self.MODEL, parameters=self.parameters(),
+                          strategy_effective_bar_open_ms=effective,
+                          strategy_upgrade=dict(from_model=self.LEGACY_MODEL,
+                              backup=backup.name, effective_bar_open_ms=effective,
+                              frozen_through_bar_open_ms=self.last_bar,
+                              original_sha256=hashlib.sha256(original).hexdigest(),
+                              upgraded_at_utc=utc_now_iso()))
+        self.state['revision'] += 1
+        self._dirty = True
+        self._save()
+
+    def candidate_options(self, order_bar_open_ms):
+        if order_bar_open_ms < self.state['strategy_effective_bar_open_ms']:
+            return dict(qv_threshold=cfg.LEGACY_QV_THRESHOLD, entry_offset=0.03,
+                        qv20_fn=BarStore.qv20)
+        return {}
+
     def _validate(self, data: Any) -> None:
+        recognized = isinstance(data, dict) and (
+            (data.get('model') == self.MODEL and data.get('parameters') == self.parameters())
+            or (data.get('model') == self.LEGACY_MODEL and data.get('parameters') == self.legacy_parameters()))
         if (not isinstance(data, dict) or data.get('schema_version') != 1
                 or data.get('component') != 'signal_portfolio'
-                or data.get('model') != self.MODEL
-                or data.get('parameters') != self.parameters()
+                or not recognized
                 or not isinstance(data.get('positions'), dict)
                 or not isinstance(data.get('recent_trades'), list)
                 or not isinstance(data.get('session_id'), str)
                 or finite(data.get('realized_balance'), -1) <= 0):
             raise SignalStateError(f'Invalid/incompatible signal book; retained without reset: {self.path}')
+        if data['model'] == self.MODEL:
+            effective = data.get('strategy_effective_bar_open_ms')
+            if not isinstance(effective, int) or effective < 0 or effective % cfg.BAR_MS:
+                raise SignalStateError('Invalid strategy effective bar; refusing to reset')
         last = data.get('last_processed_bar_open_ms')
         if last is not None and (not isinstance(last, int) or last % cfg.BAR_MS):
             raise SignalStateError('Invalid signal bar checkpoint; refusing to reset')
@@ -161,20 +220,24 @@ class SignalPortfolio:
                           'realized_balance', 'positions', 'recent_trades',
                           'total_entries', 'total_exits')
 
-    def _input_key(self, bars, index, universe, bar_ms):
+    def _input_key(self, bars, index, universe, bar_ms, qv_history):
         rows = []
+        options = self.candidate_options(bar_ms)
+        context = None if options else qv_history.snapshot(bar_ms)
         checkpoint_positions = (self.state.get('last_bar_checkpoint') or {}).get('positions', {})
         for symbol in sorted(set(universe) | set(self.positions) | set(checkpoint_positions)):
             bar = index.get(symbol, {}).get(bar_ms)
             values = None if bar is None else [
                 finite(getattr(bar, k), None) for k in ('open', 'high', 'low', 'close', 'quote_volume')]
-            qv = finite(BarStore.qv20(bars.get(symbol, ()), bar_ms), None)
+            qv = finite(BarStore.qv20(bars.get(symbol, ()), bar_ms) if context is None
+                        else context.qv20.get(symbol), None)
             previous = index.get(symbol, {}).get(bar_ms - cfg.BAR_MS)
             previous_close = None if previous is None else finite(previous.close, None)
             rows.append((symbol, values, qv, previous_close))
         # Existing held symbols may need an older missing due-bar close. That
         # recovery is handled by _settle even when the current inputs match.
-        return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+        return hashlib.sha256(json.dumps([rows, context.describe() if context else options['qv_threshold']],
+                                         sort_keys=True).encode()).hexdigest()
 
     def advance(self, bars: Mapping[str, Iterable[Any]], *, through_bar_open_ms: int,
                 symbols: Iterable[str]) -> list[dict[str, Any]]:
@@ -195,12 +258,15 @@ class SignalPortfolio:
         bars = {symbol: [by_time[ms] for ms in sorted(by_time)]
                 for symbol, by_time in index.items()}
         universe = sorted({str(s).strip().upper() for s in symbols if str(s).strip()})
+        qv_history = QVHistory(bars, universe)
         events: list[dict[str, Any]] = []
         replay_from = None
-        if self.last_bar is not None and through >= self.last_bar:
+        frozen = (self.state.get('strategy_upgrade') or {}).get('frozen_through_bar_open_ms')
+        if (self.last_bar is not None and through >= self.last_bar
+                and (frozen is None or self.last_bar > frozen)):
             checkpoint = self.state.get('last_bar_checkpoint')
             if checkpoint and self.last_bar in {ms for rows in index.values() for ms in rows}:
-                input_key = self._input_key(bars, index, universe, self.last_bar)
+                input_key = self._input_key(bars, index, universe, self.last_bar, qv_history)
                 if input_key != self.state.get('last_bar_input_key'):
                     # The 90%-ready collector can append late symbols in the
                     # same 3m batch. Recompute only this last committed bar from
@@ -217,9 +283,16 @@ class SignalPortfolio:
             # Never skip a whole missing bar and silently forget its entries.
             if not any(bar_ms in rows for rows in index.values()):
                 break
+            options = self.candidate_options(bar_ms)
+            context = None if options else qv_history.snapshot(bar_ms)
+            if context is not None and not context.ready:
+                # Missing warmup blocks new model admission, but original due
+                # prices can still settle existing positions without a reset.
+                events.extend(dict(t, action='exit') for t in self._settle(index, through_ms=bar_ms))
+                break
             self.state['last_bar_checkpoint'] = {
                 field: copy.deepcopy(self.state[field]) for field in self._CHECKPOINT_FIELDS}
-            self.state['last_bar_input_key'] = self._input_key(bars, index, universe, bar_ms)
+            self.state['last_bar_input_key'] = self._input_key(bars, index, universe, bar_ms, qv_history)
             if self.state['start_bar_open_ms'] is None:
                 self.state['start_bar_open_ms'] = bar_ms
             balance_at_entry = self.balance
@@ -230,7 +303,7 @@ class SignalPortfolio:
             # substitute the entry bar's open for its previous-close limit.
             planned = build_candidates(
                 bars, reference_bar_open_ms=bar_ms - cfg.BAR_MS,
-                symbols=universe, notional=notional, qv20_fn=BarStore.qv20)
+                symbols=universe, notional=notional, qv_snapshot=context, **options)
             for candidate in planned:
                 if len(self.positions) >= cfg.SLOTS:
                     break
@@ -312,6 +385,8 @@ class SignalPortfolio:
                          if self.last_bar is not None and p['exit_bar_open_ms'] <= self.last_bar]
         return {
             'authority': 'signal', 'model': self.MODEL,
+            'parameters': self.parameters(),
+            'strategy_effective_bar_open_ms': self.state['strategy_effective_bar_open_ms'],
             'session_id': self.state['session_id'], 'revision': self.revision,
             'ready': bool(ready and self.last_bar is not None),
             'start_bar_open_ms': self.state['start_bar_open_ms'],

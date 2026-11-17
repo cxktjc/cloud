@@ -1,7 +1,8 @@
 """Tiered pending-entry admission; gaps are signed fractions of frozen limit.
 
-Only pending-order selection changes. Signal model positions remain unlimited;
-trade owns the 3 actual-position / 8 physical-entry-order limits; during the final pre-exit bar, pending admission ignores the position limit.
+Signal and trade keep independent three-position books. Trade owns eight
+ordinary pending orders plus the separately managed signal-follow entries;
+during the final pre-exit bar, ordinary admission ignores the position limit.
 """
 from __future__ import annotations
 
@@ -42,7 +43,7 @@ class GapPolicy:
 
     def beats(self, old_gap: float, new_gap: float) -> bool:
         # Strict >0.5 percentage point; equality must NOT rotate. The exception
-        # is strict on both ends too: new <1.8%, old >2.0%.
+        # is strict on both ends too: new <1.6%, old >1.8%.
         exception = (strictly_above(self.strict_gap, new_gap)
                      and strictly_above(old_gap, self.fill_gap))
         return exception or strictly_above(old_gap - new_gap, self.improvement)
@@ -51,7 +52,7 @@ class GapPolicy:
         return at_most(new_gap, ceiling) and self.beats(old_gap, new_gap)
 
     def describe(self) -> dict:
-        return dict(version=3, bootstrap_order_count=self.bootstrap_orders,
+        return dict(version=4, bootstrap_order_count=self.bootstrap_orders,
                     bootstrap_gap=self.bootstrap_gap, fill_gap=self.fill_gap,
                     full_rotation_gap=self.strict_gap,
                     improvement_strictly_greater_than=self.improvement,
