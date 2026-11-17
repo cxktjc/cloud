@@ -171,7 +171,7 @@ class CloseLadderV2Tests(unittest.TestCase):
     def test_fixed_v2_timing_and_attempt_contract(self):
         self.assertEqual(policy.LIMIT_SECONDS, 5.0)
         self.assertEqual(policy.LIMIT_ATTEMPTS, 12)
-        self.assertEqual(policy.TIMED_EXIT_LEAD_SECONDS, 3.0)
+        self.assertEqual(policy.TIMED_EXIT_LEAD_SECONDS, 1.0)
 
     def test_twelve_queue_rounds_then_exactly_one_market_with_unique_identities(self):
         self.close(100.)
@@ -380,15 +380,17 @@ class CloseLadderV2Tests(unittest.TestCase):
         self.assertEqual(self.exchange.queue_calls, [])
         self.assertEqual(self.exchange.market_calls, [])
 
-    def test_timed_exit_starts_three_seconds_early_without_mutating_due_fields(self):
+    def test_timed_exit_starts_one_second_early_without_mutating_due_fields(self):
         original = (self.pos['exit_due_epoch'], self.pos['exit_due_ms'])
-        self.trade._timed_exits(now=99.999)
-        self.assertEqual(self.exchange.queue_calls, [])
         self.trade._timed_exits(now=100.)
+        self.assertEqual(self.exchange.queue_calls, [])
+        self.trade._timed_exits(now=101.999)
+        self.assertEqual(self.exchange.queue_calls, [])
+        self.trade._timed_exits(now=102.)
         self.assertEqual(len(self.exchange.queue_calls), 1)
         self.assertEqual((self.pos['exit_due_epoch'], self.pos['exit_due_ms']), original)
-        self.assertEqual(self.pos['close_requested_epoch'], 100.)
-        self.assertEqual(self.pos['close_deadline_epoch'], 105.)
+        self.assertEqual(self.pos['close_requested_epoch'], 102.)
+        self.assertEqual(self.pos['close_deadline_epoch'], 107.)
 
     def test_disabled_queue_after_restart_cannot_use_persisted_between_round_phase(self):
         cid = self.seed_exact(rounds=7, deadline=105.)

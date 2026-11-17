@@ -13,7 +13,7 @@ Safety:
     - no aggregate positionRisk ownership inference;
     - only exact ``cfg.ORDER_CLIENT_PREFIX_*`` client/order identities are cancelled or closed;
     - at most eight physical pending orders; normally three owned LONG positions, with pending entry admissions allowed during a position's final pre-exit 3m bar;
-    - timed QUEUE close starts 3s before the signal-provided ``exit_due_epoch``;
+    - timed QUEUE close starts 1s before the signal-provided ``exit_due_epoch``;
       up to twelve 5s rounds, each cancelled and confirmed before replacement,
       then MARKET for the owned residual;
     - a symbol is blocked from reopening for 60s after a close;

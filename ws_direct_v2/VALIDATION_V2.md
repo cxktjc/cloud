@@ -36,7 +36,7 @@
 另完成 74 个 Python 文件语法编译检查，以及 signal/trade 的只读 `--check-inputs`。
 文件数量和参考代码 SHA256 见 `SOURCE_V2.json`；原 v1 的 88 个文件与
 `V1_BASELINE.json` 指纹一致，父仓库 v1 路径没有工作区改动。
-最新完整日志在本地忽略目录 `var/validation_v2/tests-close-5s-12-rounds.log`，不随部署包发布。
+最新完整日志在本地忽略目录 `var/validation_v2/tests-close-1s-lead.log`，不随部署包发布。
 
 ## 执行边界
 
@@ -55,7 +55,7 @@
 
 ## 2026-11-17 平仓更新
 
-trade 的定时退出在原 `exit_due_epoch - 3` 开始，不改信号到期时间、`exit_due_ms`
+trade 的定时退出在原 `exit_due_epoch - 1` 开始，不改信号到期时间、`exit_due_ms`
 和订单身份的到期基准。无行情时也由 DirectTrade 最长约 0.25 秒的维护周期检查。
 signal 保持完成 bar 的模型退出方式。
 
@@ -66,7 +66,7 @@ QUEUE 每轮确认挂出后等待 5 秒，超时撤原单；精确确认终态�
 
 `close_queue_rounds` 与订单身份代次 `close_attempt` 分开持久化，重启继续当前轮。
 每轮单独重设截止时间；已知原挂出时间的旧 QUEUE 单裁短至 5 秒，已有 MARKET 路径继续原单。
-v2 固定 5 秒、12 轮、提前 3 秒，旧 `V9711_LIVE_CLOSE_LIMIT_SECONDS` 环境变量不再生效。
+v2 固定 5 秒、12 轮、提前 1 秒，旧 `V9711_LIVE_CLOSE_LIMIT_SECONDS` 环境变量不再生效。
 保留显式 `V9711_LIVE_CLOSE_LIMIT_ENABLED=0` 的直接 MARKET 模式；默认启用 QUEUE。
 原基线文件保留历史指纹，close ladder 的旧文件一致性断言由新行为回归测试替代，
 signal 模型和入场选择仍校验原始指纹。改动仅限 `ws_direct_v2`。
@@ -74,4 +74,4 @@ signal 模型和入场选择仍校验原始指纹。改动仅限 `ws_direct_v2`�
 新增 22 项离线回归覆盖 12 次上限及唯一身份、第 12 轮部分成交/撤单竞态后的残量市价、
 累计成交差额记账、提前全成、UNKNOWN/负查询/缺失累计量、重启第 7/12 轮与旧 MARKET、
 旧 60 秒 deadline、两轮之间关闭限价开关、异步排队及同步慢 ACK 后完整 5 秒、
-紧急退出，以及提前 3 秒且原 due 字段不变。
+紧急退出，以及提前 1 秒且原 due 字段不变（包含原提前 3 秒时点不再启动的检查）。

@@ -25,7 +25,7 @@ LIMIT_ENABLED = os.environ.get('V9711_LIVE_CLOSE_LIMIT_ENABLED', '1').strip().lo
 # Fixed v2 policy: copied v1 .env files must not restore the old 60s wait.
 LIMIT_SECONDS = 5.0
 LIMIT_ATTEMPTS = 12
-TIMED_EXIT_LEAD_SECONDS = 3.0
+TIMED_EXIT_LEAD_SECONDS = 1.0
 CANCEL_RETRY_SECONDS = cfg.env_float('V9711_LIVE_CLOSE_CANCEL_RETRY_SECONDS', 5.0)
 if not (math.isfinite(CANCEL_RETRY_SECONDS) and 1.0 <= CANCEL_RETRY_SECONDS <= 60.0):
     raise ValueError('Invalid QUEUE close cancel retry seconds')
