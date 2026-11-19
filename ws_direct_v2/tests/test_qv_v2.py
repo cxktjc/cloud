@@ -198,11 +198,18 @@ class BookTests(unittest.TestCase):
         book = SignalPortfolio(self.path, now=(TARGET+STEP+5000)/1000)
         candidate = build_candidates(candles(), reference_bar_open_ms=TARGET,
             symbols=SYMBOLS, **book.candidate_options(TARGET+STEP))[0]
-        row = dict(asdict(candidate), observed_price=100, gap=(100-97)/97)
+        # Migration retains the old price/identity inside the new 2.1% boundary.
+        row = dict(asdict(candidate), observed_price=98.5, gap=(98.5-97)/97)
         old = dict(row, client_order_id='v9712l_original', order_id=12345)
         plan = select_physical_orders([row], {candidate.symbol: old})
         self.assertEqual(plan.keep, (candidate.symbol,))
         self.assertFalse(plan.cancel)
+        self.assertFalse(plan.place)
+        far = dict(row, observed_price=100, gap=(100-97)/97)
+        plan = select_physical_orders([far], {candidate.symbol: old})
+        self.assertEqual(plan.cancel, (candidate.symbol,))
+        self.assertEqual(old['client_order_id'], 'v9712l_original')
+        self.assertEqual(old['order_id'], 12345)
         self.assertFalse(plan.place)
 
     def test_newly_processed_legacy_bar_still_accepts_late_candles(self):

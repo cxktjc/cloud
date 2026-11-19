@@ -27,36 +27,42 @@ class GapPolicy:
     strict_gap: float = cfg.PLACE_GAP
     bootstrap_orders: int = cfg.BOOTSTRAP_PENDING_ORDERS
     improvement: float = cfg.SWITCH_TOLERANCE
+    crowded_improvement: float = cfg.CROWDED_SWITCH_TOLERANCE
+    cancel_gap: float = cfg.CANCEL_GAP
 
     def __post_init__(self):
         if not (all(math.isfinite(v) for v in (self.bootstrap_gap, self.fill_gap,
-                 self.strict_gap, self.improvement))
+                 self.strict_gap, self.improvement, self.crowded_improvement, self.cancel_gap))
                 and 0 <= self.strict_gap <= self.fill_gap <= self.bootstrap_gap < 1
-                and 0 <= self.improvement < 1 and self.bootstrap_orders >= 1):
+                and 0 <= self.crowded_improvement <= self.improvement < 1
+                and self.bootstrap_gap <= self.cancel_gap < 1 and self.bootstrap_orders >= 1):
             raise ValueError('Invalid tiered pending-order policy')
 
     def admission_gap(self, count: int) -> float:
         return self.bootstrap_gap if count < self.bootstrap_orders else self.fill_gap
 
     def rotation_gap(self, count: int, capacity: int) -> float:
-        return self.strict_gap if count >= capacity else self.fill_gap
+        # Replacement is independent of initial/fill admission tiers.
+        return self.cancel_gap
 
-    def beats(self, old_gap: float, new_gap: float) -> bool:
-        # Strict >0.5 percentage point; equality must NOT rotate. The exception
-        # is strict on both ends too: new <1.45%, old >1.65%.
-        exception = (strictly_above(self.strict_gap, new_gap)
-                     and strictly_above(old_gap, self.fill_gap))
-        return exception or strictly_above(old_gap - new_gap, self.improvement)
+    def minimum_improvement(self, count: int) -> float:
+        return self.crowded_improvement if count >= self.bootstrap_orders else self.improvement
 
-    def replacement_allowed(self, old_gap: float, new_gap: float, *, ceiling: float) -> bool:
-        return at_most(new_gap, ceiling) and self.beats(old_gap, new_gap)
+    def beats(self, old_gap: float, new_gap: float, *, count: int = 0) -> bool:
+        # Inclusive 0.30pp at every count; inclusive 0.22pp with >=5 orders.
+        return at_most(self.minimum_improvement(count), old_gap - new_gap)
+
+    def replacement_allowed(self, old_gap: float, new_gap: float, *, ceiling: float,
+                            count: int = 0) -> bool:
+        return at_most(new_gap, ceiling) and self.beats(old_gap, new_gap, count=count)
 
     def describe(self) -> dict:
-        return dict(version=6, bootstrap_order_count=self.bootstrap_orders,
+        return dict(version=7, bootstrap_order_count=self.bootstrap_orders,
                     bootstrap_gap=self.bootstrap_gap, fill_gap=self.fill_gap,
-                    full_rotation_gap=self.strict_gap,
-                    improvement_strictly_greater_than=self.improvement,
-                    exception_new_strictly_below=self.strict_gap,
-                    exception_old_strictly_above=self.fill_gap,
+                    full_rotation_gap=self.cancel_gap,
+                    improvement_at_least=self.improvement,
+                    crowded_improvement_at_least=self.crowded_improvement,
+                    cancel_gap=self.cancel_gap, cancel_gap_strict=True,
+                    rotation_ignores_admission_tiers=True,
                     underfilled_rotation_before_vacancy_fill=True,
                     cancel_terminal_before_replacement=True)

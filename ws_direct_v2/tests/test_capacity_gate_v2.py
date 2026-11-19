@@ -122,6 +122,64 @@ class CapacityGateTests(unittest.TestCase):
         self.assertFalse(self.submits)
         self.assertEqual(self.trade._submit_skip_reasons['N0USDT'], 'position_or_pending_capacity_full')
 
+    def test_price_event_cancels_far_ordinary_entry_but_preserves_signal_follow(self):
+        self.ordinary_plan()
+        self.targets = [self.target('AUSDT')]
+        self.publish()
+        self.event('N0USDT')
+        self.assertEqual(len(self.trade.tracked), 9)
+        self.assertTrue(self.trade.tracked['AUSDT']['signal_follow'])
+        self.trade.market.update('N0USDT', '1.021001', int(self.now*1000))
+        self.trade.market.decide(self.trade.market.events.get_nowait(), self.trade.on_tick)
+        self.assertNotIn('N0USDT', self.trade.tracked)
+        self.assertIn('AUSDT', self.trade.tracked)
+        self.assertEqual([r['symbol'] for r in self.cancels], ['N0USDT'])
+        self.assertEqual(len(self.submits), 9)
+
+    def test_full_ordinary_book_replaces_above_discovery_gate_with_follow_excluded(self):
+        self.ordinary_plan()
+        self.templates.append(dict(self.templates[0], symbol='N8USDT'))
+        self.targets = [self.target('AUSDT')]
+        self.publish()
+        self.event('N0USDT')
+        self.assertEqual(self.trade._ordinary_pending_count(), 8)
+        self.assertEqual(len(self.trade.tracked), 9)
+        def quote(symbol, price):
+            self.trade.market.update(symbol, str(price), int(self.now*1000))
+            self.trade.market.decide(self.trade.market.events.get_nowait(), self.trade.on_tick)
+        quote('N8USDT', 1.0188)
+        self.assertFalse(self.cancels)
+        quote('N7USDT', 1.021)
+        self.assertEqual([r['symbol'] for r in self.cancels], ['N7USDT'])
+        self.assertEqual(self.trade.ledger.state['pending_rotation']['original_order_count'], 8)
+        self.assertNotIn('N8USDT', self.trade.tracked)
+        quote('N8USDT', 1.0188)
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.assertAlmostEqual(self.trade.tracked['N8USDT']['gap'], .0188)
+        self.assertIn('AUSDT', self.trade.tracked)
+        self.assertIsNone(self.trade.ledger.state['pending_rotation'])
+        self.assertEqual(self.trade._ordinary_pending_count(), 8)
+
+    def test_four_ordinary_plus_two_follow_orders_still_use_sparse_margin(self):
+        self.ordinary_plan()
+        self.templates = self.templates[:4]
+        self.targets = [self.target(s) for s in ('AUSDT', 'BUSDT')]
+        self.publish()
+        self.event('N0USDT')
+        self.assertEqual(len(self.trade.tracked), 6)
+        self.trade.market.update('N3USDT', '1.020', int(self.now*1000))
+        self.trade.market.decide(self.trade.market.events.get_nowait(), self.trade.on_tick)
+        self.templates.append(dict(self.templates[0], symbol='N8USDT'))
+        self.publish()
+        self.trade.market.update('N8USDT', '1.0178', int(self.now*1000))
+        self.trade.market.decide(self.trade.market.events.get_nowait(), self.trade.on_tick)
+        # 0.22pp is insufficient at FOUR ordinary orders: fill the free fifth
+        # slot instead. Counting two follow orders would incorrectly rotate.
+        self.assertFalse(self.cancels)
+        self.assertIn('N3USDT', self.trade.tracked)
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.assertEqual(self.trade._ordinary_pending_count(), 5)
+
     def test_worker_final_window_permission_expires_without_another_owner_update(self):
         self.held(3)
         self.ordinary_plan()

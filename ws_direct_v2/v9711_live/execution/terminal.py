@@ -225,7 +225,9 @@ class TradeTerminalView:
         if policy:
             lines.insert(-1, f'当前准入价差上限={100*f.get("current_admission_gap", policy["fill_gap"]):g}%（挂单计数，非持仓数）')
             lines.insert(-1, f'挂单分档: 不足5≤{100*policy["bootstrap_gap"]:g}% / 第6～8≤{100*policy["fill_gap"]:g}% / '
-                         f'满8替换≤{100*policy["full_rotation_gap"]:g}%；5～7单先换旧；优势>0.5个百分点或新<{100*policy["exception_new_strictly_below"]:g}%换旧>{100*policy["exception_old_strictly_above"]:g}%。')
+                         f'替换优先: 更近≥{100*policy["improvement_at_least"]:g}个百分点；'
+                         f'≥5单时更近≥{100*policy["crowded_improvement_at_least"]:g}个百分点；'
+                         f'替换不受分档限制；距离>{100*policy["cancel_gap"]:g}%自动撤单。')
         sizing = (f.get('entry_diagnostics') or {}).get('sizing') or {}
         if sizing:
             lines.insert(-1, f"Sizing 50/30/20: positions={sizing['positions']} weight={sizing['weight']:.0%} trade_balance={sizing['balance']:.6f} target={sizing['raw_notional']:.6f}U; exchange minimum may raise size; concurrent fills may exceed target")

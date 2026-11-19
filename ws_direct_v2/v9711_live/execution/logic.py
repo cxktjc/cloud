@@ -1,9 +1,9 @@
 """Pure tiered execution selection; exact-cancel-first rotation reservations.
 
 The first five physical pending entries admit <=1.85%, orders 6-8 admit <=1.65%.
-At 5..7 orders a qualifying improvement rotates BEFORE filling a free slot.
-At eight, replacement must pass <=1.45%; >0.5pp advantage is normally required,
-except a new <1.45% candidate may replace an incumbent >1.65% without that margin.
+At any count a >=0.30pp improvement rotates BEFORE filling a free slot;
+with >=5 orders the inclusive advantage is >=0.22pp. Replacements bypass the
+admission tiers. Fresh quotes strictly beyond +2.1% retire ordinary entries.
 """
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def select_physical_orders(
     signal_ready: bool = True,
     now: float | None = None,
     place_gap: float = cfg.PLACE_GAP,
-    cancel_gap: float | None = None,
+    cancel_gap: float = cfg.CANCEL_GAP,
     switch_tolerance: float = cfg.SWITCH_TOLERANCE,
     bootstrap_gap: float = cfg.BOOTSTRAP_PLACE_GAP,
     fill_gap: float = cfg.FILL_PLACE_GAP,
@@ -108,11 +108,13 @@ def select_physical_orders(
     """Select admissions or ONE cancel-first rotation, never a blind replacement.
 
     An unresolved rotation reserves the intended replacement, including when
-    the book has spare physical slots. Its original admission/advantage gates
-    survive the victim's retirement: a former six-order rotation cannot quietly
-    degrade into a looser five-order fill. Legacy cancel_gap is ignored.
+    the book has spare physical slots. Its original order count survives the
+    victim's retirement: a five-order rotation still uses the 0.22pp margin
+    after cancellation leaves four orders. Fresh quotes also retire ordinary
+    entries strictly beyond cancel_gap, independently of signal readiness.
     """
-    policy = GapPolicy(bootstrap_gap, fill_gap, place_gap, bootstrap_orders, switch_tolerance)
+    policy = GapPolicy(bootstrap_gap, fill_gap, place_gap, bootstrap_orders,
+                       switch_tolerance, cancel_gap=cancel_gap)
     if max_orders < 0:
         raise ValueError('Invalid pending order capacity')
     held_set = {str(s).upper().strip() for s in held if str(s).strip()}
@@ -133,6 +135,9 @@ def select_physical_orders(
     for symbol in sorted(tracked):
         old = tracked[symbol]
         row = rows.get(symbol)
+        quote_row = row
+        if quote_row is None and old.get('_quote_fresh'):
+            quote_row = Row.from_dict(dict(old, symbol=symbol))
         old_bar = int(_finite(old.get('order_bar_open_ms')))
         end_ms = _finite(old.get('order_bar_available_ms'), old_bar + cfg.BAR_MS)
         reason = None
@@ -144,6 +149,8 @@ def select_physical_orders(
             reason = 'order_bar_expired'
         elif signal_ready and row is not None and _order_changed(old, row):
             reason = 'order_plan_changed'
+        elif quote_row is not None and not at_most(quote_row.gap, cancel_gap):
+            reason = 'entry_gap_too_far'
         if reason:
             cancel.append(symbol)
             actions.append(Action('cancel', symbol, reason, order_id=old.get('order_id')))
@@ -153,8 +160,7 @@ def select_physical_orders(
             in_flight = True
             actions.append(Action('keep', symbol, 'await_cancel_terminal', order_id=old.get('order_id')))
             continue
-        if row is None and old.get('_quote_fresh'):
-            row = Row.from_dict(dict(old, symbol=symbol))
+        row = quote_row
         if row is not None:
             ranked[symbol] = row
         actions.append(Action('keep', symbol, 'retained_for_order_bar',
@@ -204,13 +210,16 @@ def select_physical_orders(
             return result()
         if not signal_ready or len(tracked) >= max_orders:
             return result()
-        ceiling = min(_finite(pending_rotation.get('admission_gap'), -1),
-                      policy.rotation_gap(int(_finite(pending_rotation.get('original_order_count'))), max_orders))
+        original_count = int(_finite(pending_rotation.get('original_order_count')))
+        # Apply v7 even to an in-progress v6 reservation after restart. Do not
+        # resurrect its obsolete 1.45/1.65% gate. Keep the original count so a
+        # 5 -> 4 cancellation still completes with the agreed 0.22pp margin.
+        ceiling = policy.rotation_gap(original_count, max_orders)
         old_gap = _finite(pending_rotation.get('victim_gap'), float('nan'))
         bar = int(_finite(pending_rotation.get('order_bar_open_ms')))
         challengers = sorted((r for r in rows.values()
             if r.symbol not in tracked and r.symbol != victim and r.order_bar_open_ms == bar
-            and policy.replacement_allowed(old_gap, r.gap, ceiling=ceiling)),
+            and policy.replacement_allowed(old_gap, r.gap, ceiling=ceiling, count=original_count)),
             key=lambda r: (r.gap, r.symbol))
         if challengers:
             best = challengers[0]
@@ -224,19 +233,19 @@ def select_physical_orders(
     challengers = sorted((r for s, r in rows.items() if s not in tracked),
                          key=lambda r: (r.gap, r.symbol))
     count = len(tracked)
-    # Preserve cancel-first rotation before adding another entry once the
-    # bootstrap tier (first five orders) is filled.
-    if (count >= min(policy.bootstrap_orders, max_orders) and kept and not cancel and not in_flight
+    # Relative improvement takes priority at every nonempty order count.
+    if (kept and not cancel and not in_flight
             and len(ranked) == len(kept)):
         worst = max(kept, key=lambda s: (ranked[s].gap, s))
         ceiling = policy.rotation_gap(count, max_orders)
         best = next((r for r in challengers if policy.replacement_allowed(
-            ranked[worst].gap, r.gap, ceiling=ceiling)), None)
+            ranked[worst].gap, r.gap, ceiling=ceiling, count=count)), None)
         if best is not None:
             old = tracked[worst]
             rotation = dict(victim=worst, victim_client_order_id=str(old.get('client_order_id') or ''),
                 victim_order_id=old.get('order_id'), victim_gap=ranked[worst].gap,
                 challenger=best.symbol, original_order_count=count, admission_gap=ceiling,
+                minimum_improvement=policy.minimum_improvement(count), policy_version=7,
                 order_bar_open_ms=best.order_bar_open_ms,
                 expires_at_ms=best.order_bar_open_ms + cfg.BAR_MS,
                 victim_terminal=False, victim_filled=False)
@@ -257,15 +266,14 @@ def select_physical_orders(
         current_count = count + len(placed)
         if current_count >= max_orders:
             break
-        if placed and current_count >= policy.bootstrap_orders and not cancel and not in_flight:
+        if placed and not cancel and not in_flight:
             hypothetical = dict(ranked, **{row.symbol: row for row in placed})
             if hypothetical and len(hypothetical) == len(kept) + len(placed):
                 worst_gap = max(row.gap for row in hypothetical.values())
                 if policy.replacement_allowed(worst_gap, r.gap,
-                        ceiling=policy.rotation_gap(current_count, max_orders)):
-                    # Crossed 2 -> 3 while preparing this batch. Send that
-                    # bootstrap subset first; the next owner step can rotate
-                    # an exact tracked identity instead of adding a fourth.
+                        ceiling=policy.rotation_gap(current_count, max_orders), count=current_count):
+                    # Send this subset first, then rotate an exact tracked
+                    # identity on the next owner step rather than add a slot.
                     break
         if at_most(r.gap, policy.admission_gap(current_count)):
             placed.append(r)

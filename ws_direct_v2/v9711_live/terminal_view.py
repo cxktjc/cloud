@@ -142,9 +142,9 @@ class TerminalView:
             f'withdraw={f.get("total_withdraw", 0)} bars={f["total_bars"]} '
             f'price_updates={f["total_price_updates"]} evaluations={f["total_evaluations"]}',
             f'挂单策略: signal发布≤{100 * cfg.SIGNAL_DISCOVERY_GAP:g}%候选；trade不足5单准入≤{100 * cfg.BOOTSTRAP_PLACE_GAP:g}%，'
-            f'第6～8单准入≤{100 * cfg.FILL_PLACE_GAP:g}%；5～7单优先换旧、不增单；满8替换准入≤{100 * cfg.PLACE_GAP:g}%；'
-            f'通常优势>{100 * cfg.SWITCH_TOLERANCE:g}个百分点，或新<{100 * cfg.PLACE_GAP:g}%直接换旧>{100 * cfg.FILL_PLACE_GAP:g}%；'
-            '先确认撤旧再挂新；不因价差扩大自动撤单；'
+            f'第6～8单准入≤{100 * cfg.FILL_PLACE_GAP:g}%；trade任意单数更近≥{100 * cfg.SWITCH_TOLERANCE:g}个百分点优先换旧；'
+            f'≥5单更近≥{100 * cfg.CROWDED_SWITCH_TOLERANCE:g}个百分点；替换不受分档限制；'
+            f'先确认撤旧再挂新；trade普通单距离>{100 * cfg.CANCEL_GAP:g}%自动撤单；'
             'entry_confirmed=已发计划确认信号入仓；expire=到期未入仓；withdraw=数据/状态异常等撤回；pending_confirmation=等待完成bar。',
         ]
         qv = book.get('qv') or {}

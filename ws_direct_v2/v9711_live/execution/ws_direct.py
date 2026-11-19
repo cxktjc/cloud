@@ -126,7 +126,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         limit = self._finite((row or {}).get('limit_price'))
         gap = (price-limit)/limit if limit > 0 else float('inf')
         self._eligible.pop(symbol, None)
-        if row and gap <= cfg.BOOTSTRAP_PLACE_GAP:
+        if row and gap <= cfg.CANCEL_GAP:
             item = (gap, symbol, version)
             self._eligible[symbol] = item
             heapq.heappush(self._rank_heap, item)

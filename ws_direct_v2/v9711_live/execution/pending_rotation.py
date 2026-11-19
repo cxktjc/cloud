@@ -14,10 +14,10 @@ class PendingRotationMixin:
     def _current_admission_gap(self) -> float:
         policy = GapPolicy()
         count = self._ordinary_pending_count()
-        ceiling = policy.strict_gap if count >= cfg.MAX_PENDING_ORDERS else policy.admission_gap(count)
+        ceiling = policy.rotation_gap(count, cfg.MAX_PENDING_ORDERS) if count >= cfg.MAX_PENDING_ORDERS else policy.admission_gap(count)
         pending = self.ledger.state.get('pending_rotation')
         if pending:
-            ceiling = min(ceiling, self._finite(pending.get('admission_gap'), ceiling))
+            ceiling = policy.rotation_gap(int(self._finite(pending.get('original_order_count'))), cfg.MAX_PENDING_ORDERS)
         return ceiling
 
     def _prepare_rotation(self, plan) -> None:

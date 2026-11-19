@@ -867,7 +867,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     and row_bar == bar_ms):
                 item['observed_price'] = price
                 item['gap'] = (price - limit) / limit
-                if symbol not in self.tracked and (symbol in self.positions or item['gap'] > cfg.BOOTSTRAP_PLACE_GAP):
+                if symbol not in self.tracked and (symbol in self.positions or item['gap'] > cfg.CANCEL_GAP):
                     continue
                 if symbol not in self.tracked and self._entry_submission_blocked(item):
                     filtered_entries[symbol] = 'submission_blocked_for_current_plan'
@@ -985,10 +985,11 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                  cfg.EXECUTION_FEEDBACK_FILE.resolve(), cfg.TRADE_LOG_FILE.resolve())
         LOG.info('network I/O nonblocking=%s workers=%s; main loop owns state and signal polling',
                  self._network_io is not None, self._network_io.worker_count if self._network_io else 0)
-        LOG.info('entry gap policy bootstrap<3=%.2f%% fill<6=%.2f%% full-rotation=%.2f%%; '
-                 'rotation-first at3..5; >%.2fpp improvement or new<strict/old>fill exception',
+        LOG.info('entry gaps: first5<=%.2f%% fill6..8<=%.2f%%; '
+                 'rotate at any count >=%.2fpp closer, at >=5 orders >=%.2fpp closer; '
+                 'replacement bypasses admission tiers; cancel gap>%.2f%%',
                  cfg.BOOTSTRAP_PLACE_GAP*100, cfg.FILL_PLACE_GAP*100,
-                 cfg.PLACE_GAP*100, cfg.SWITCH_TOLERANCE*100)
+                 cfg.SWITCH_TOLERANCE*100, cfg.CROWDED_SWITCH_TOLERANCE*100, cfg.CANCEL_GAP*100)
         LOG.info('entry plans: singleton=WS multi=REST batchOrders chunks<=5; independent plans do not await previous ACK')
         LOG.info('entry cancels: nearest absolute relative gap first; one at a time; '
                  '1.5s after previous response; exit/QUEUE cancels and other I/O bypass this lane')

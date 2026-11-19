@@ -30,23 +30,63 @@ class EntryTierTests(unittest.TestCase):
             self.assertEqual([r.symbol for r in select(count, .01, .0165).place], ['NEW'])
             self.assertFalse(select(count, .01, .016501).place)
 
-    def test_full_book_1p45_ceiling_and_cancel_before_place(self):
-        plan = select(8, .03, .0145)
-        self.assertEqual(len(plan.cancel), 1)
-        self.assertFalse(plan.place)
-        self.assertEqual(plan.rotation['admission_gap'], .0145)
-        self.assertFalse(select(8, .03, .014501).cancel)
+    def test_every_nonempty_count_rotates_at_inclusive_0p30pp(self):
+        for count in range(1, 9):
+            with self.subTest(count=count):
+                plan = select(count, .020, .017)
+                self.assertEqual(plan.cancel, (f'OLD{count-1}',))
+                self.assertFalse(plan.place)
 
-    def test_exception_new_below_1p45_old_above_1p65_is_strict(self):
-        policy = GapPolicy()
-        self.assertTrue(policy.beats(.01651, .01449))
-        self.assertFalse(policy.beats(.0165, .01449))
-        self.assertFalse(policy.beats(.01651, .0145))
+    def test_crowded_rotation_bypasses_all_old_admission_ceilings(self):
+        for count in range(5, 9):
+            with self.subTest(count=count):
+                plan = select(count, .021, .0188)
+                self.assertEqual(len(plan.cancel), 1)
+                self.assertFalse(plan.place)
+                self.assertEqual(plan.rotation['admission_gap'], .021)
+                self.assertAlmostEqual(plan.rotation['minimum_improvement'], .0022)
+                self.assertFalse(select(count, .021, .018801).cancel)
 
-    def test_half_percentage_point_equality_still_does_not_rotate(self):
+    def test_sparse_margin_is_0p30pp_not_0p22pp(self):
+        for count in range(1, 5):
+            with self.subTest(count=count):
+                self.assertFalse(select(count, .020, .017001).cancel)
+                self.assertFalse(select(count, .020, .0178).cancel)
+
+    def test_old_exception_no_longer_overrides_minimum_improvement(self):
         policy = GapPolicy()
-        self.assertFalse(policy.beats(.0195, .0145))
-        self.assertTrue(policy.beats(.019501, .0145))
+        self.assertFalse(policy.beats(.01651, .01449, count=8))
+        self.assertFalse(select(8, .01651, .01449).cancel)
+
+    def test_rotation_waits_for_exact_cancel_terminal_and_keeps_original_count(self):
+        tracked = {f'OLD{i}': row(f'OLD{i}', .01) for i in range(5)}
+        tracked['OLD4'] = row('OLD4', .020)
+        new = row('NEW', .0178)
+        first = select_physical_orders([*tracked.values(), new], tracked)
+        pending = dict(first.rotation)
+        self.assertEqual(first.cancel, ('OLD4',))
+        self.assertFalse(first.place)
+        self.assertFalse(select_physical_orders([new], tracked, pending_rotation=pending).place)
+        tracked.pop('OLD4')
+        unknown = select_physical_orders([*tracked.values(), new], tracked, pending_rotation=pending)
+        self.assertFalse(unknown.place)
+        self.assertIn('rotation_victim_fate_unknown', [a.reason for a in unknown.actions])
+        pending['victim_terminal'] = True
+        complete = select_physical_orders([*tracked.values(), new], tracked, pending_rotation=pending)
+        self.assertEqual([r.symbol for r in complete.place], ['NEW'])
+        self.assertEqual(complete.rotation_action, 'consume')
+        # A worse fresh quote must not inherit the qualification at cancellation.
+        self.assertFalse(select_physical_orders([*tracked.values(), row('NEW', .017801)],
+            tracked, pending_rotation=pending).place)
+        # Existing v6 reservations use the newly confirmed v7 rules on restart.
+        pending['admission_gap'] = .0145
+        pending.pop('policy_version', None)
+        self.assertEqual([r.symbol for r in select_physical_orders([*tracked.values(), new],
+            tracked, pending_rotation=pending).place], ['NEW'])
+        pending['victim_filled'] = True
+        filled = select_physical_orders([*tracked.values(), new], tracked, pending_rotation=pending)
+        self.assertFalse(filled.place)
+        self.assertEqual(filled.rotation_action, 'clear')
 
     def test_underfilled_rotation_precedes_vacancy_fill(self):
         plan = select(5, .0185, .0135)
@@ -54,18 +94,30 @@ class EntryTierTests(unittest.TestCase):
         self.assertFalse(plan.place)
         self.assertEqual(plan.rotation['original_order_count'], 5)
 
-    def test_tighter_policy_does_not_cancel_valid_incumbent_for_gap_alone(self):
-        old = row('OLD', .05)
-        plan = select_physical_orders([old], {'OLD': old})
-        self.assertEqual(plan.keep, ('OLD',))
-        self.assertFalse(plan.cancel)
+    def test_ordinary_gap_cancel_is_strictly_beyond_2p1_percent(self):
+        for gap, expected in ((.021, ()), (.021001, ('OLD',))):
+            with self.subTest(gap=gap):
+                old = row('OLD', gap)
+                plan = select_physical_orders([old], {'OLD': old})
+                self.assertEqual(plan.cancel, expected)
+                if expected:
+                    self.assertIn('entry_gap_too_far', [a.reason for a in plan.actions])
+
+    def test_gap_cancel_uses_fresh_tracked_quote_without_signal(self):
+        old = dict(row('OLD', .022), _quote_fresh=True)
+        plan = select_physical_orders([], {'OLD': old}, signal_ready=False)
+        self.assertEqual(plan.cancel, ('OLD',))
+        old['_quote_fresh'] = False
+        self.assertFalse(select_physical_orders([], {'OLD': old}, signal_ready=False).cancel)
 
     def test_legacy_environment_cannot_restore_old_gaps_or_short_history(self):
         env = dict(os.environ, V9711_LIVE_HISTORY_BARS='40',
                    V9711_LIVE_PLACE_GAP='.018', V9711_LIVE_FILL_PLACE_GAP='.020',
-                   V9711_LIVE_BOOTSTRAP_PLACE_GAP='.022')
+                   V9711_LIVE_BOOTSTRAP_PLACE_GAP='.022', V9711_LIVE_SWITCH_TOLERANCE='.005',
+                   V9711_LIVE_CANCEL_GAP='.05')
         script = ('import json; from v9711_live import config as c; '
-                  'print(json.dumps([c.HISTORY_BARS,c.BOOTSTRAP_PLACE_GAP,c.FILL_PLACE_GAP,c.PLACE_GAP]))')
+                  'print(json.dumps([c.HISTORY_BARS,c.BOOTSTRAP_PLACE_GAP,c.FILL_PLACE_GAP,c.PLACE_GAP,'
+                  'c.SWITCH_TOLERANCE,c.CROWDED_SWITCH_TOLERANCE,c.CANCEL_GAP]))')
         result = subprocess.run([sys.executable, '-B', '-c', script], env=env,
                                 check=True, capture_output=True, text=True)
-        self.assertEqual(json.loads(result.stdout), [96, .0185, .0165, .0145])
+        self.assertEqual(json.loads(result.stdout), [96, .0185, .0165, .0145, .003, .0022, .021])

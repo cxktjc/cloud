@@ -112,10 +112,11 @@ ORDER_BAR_LIFETIME_MS = 2 * BAR_MS
 
 # Current-bar pending order policy. Signed gap includes all below-limit prices.
 # Signal publishes eligible candidates up to +1.85%; trade admits the
-# first five at +1.85%, orders 6-8 at +1.65%, and full-book replacements at +1.45%.
+# first five at +1.85% and orders 6-8 at +1.65%. Replacements use relative
+# improvement only, within the +2.1% ordinary-order cancellation boundary.
 # During a held position's final pre-exit 3m bar, pending admission ignores position cap.
 # Fixed v2 policy: legacy gap overrides must not silently retain old tiers.
-PLACE_GAP = 0.0145
+PLACE_GAP = 0.0145  # Legacy compatibility; no longer a replacement ceiling.
 # Signal publishes the discovery envelope; trade applies count-based tiers.
 BOOTSTRAP_PLACE_GAP = 0.0185
 FILL_PLACE_GAP = 0.0165
@@ -126,11 +127,12 @@ if not (0 <= PLACE_GAP <= FILL_PLACE_GAP <= BOOTSTRAP_PLACE_GAP < 1):
 MAX_PENDING_ORDERS = env_int('V9711_LIVE_MAX_PENDING_ORDERS', 8)
 SIGNAL_FOLLOW_MAX_PENDING_ORDERS = 2
 SIGNAL_FOLLOW_POSITION_STOP = 6
-SWITCH_TOLERANCE = env_float('V9711_LIVE_SWITCH_TOLERANCE', 0.005)
-# Kept as numeric compatibility/diagnostic constants for older readers.
-# Current eight-slot policy does not use an upward price gap to auto-cancel.
-CANCEL_GAP = env_float('V9711_LIVE_CANCEL_GAP', 0.02)
-PENDING_ORDER_POLICY = 'tiered_5_8_rotation_first_v6'
+SWITCH_TOLERANCE = 0.003
+CROWDED_SWITCH_TOLERANCE = 0.0022
+# Ordinary pending entries outside +2.1% are retired through the paced queue.
+# Fixed v2 rule: a legacy environment override must not change this boundary.
+CANCEL_GAP = 0.021
+PENDING_ORDER_POLICY = 'tiered_5_8_rotation_first_v7'
 if not (0.0 <= PLACE_GAP < 1.0 and 0.0 <= SWITCH_TOLERANCE < 1.0):
     raise ValueError('Require finite place/switch gaps in [0, 1)')
 if not 1 <= MAX_PENDING_ORDERS <= 8:
