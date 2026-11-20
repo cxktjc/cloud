@@ -41,6 +41,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._rank_heap = []
         self._quote_versions = {}
         self._active_price_symbols = None
+        self._cycle_price_maps = None
         self._skipped_far_events = 0
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -80,6 +81,17 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return super().step(now=now)
 
     def _execute_entries(self, snapshot, status, **kwargs):
+        # Reuse one read within this decision only. No owner state or quote
+        # view is cached across events, and worker send guards stay live.
+        symbols = self._active_price_symbols if self._fast_tick else None
+        previous = self._cycle_price_maps
+        self._cycle_price_maps = self.market.price_maps(symbols)
+        try:
+            return self._execute_entries_with_prices(snapshot, status, **kwargs)
+        finally:
+            self._cycle_price_maps = previous
+
+    def _execute_entries_with_prices(self, snapshot, status, **kwargs):
         snapshot = dict(snapshot)
         snapshot['_signal_snapshot_valid'] = status == 'valid'
         if status == 'valid':
@@ -137,9 +149,13 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return payload, status
 
     def refresh_prices(self, *, now=None):
+        if self._cycle_price_maps is not None:
+            return self._cycle_price_maps[0]
         return self.market.prices(self._active_price_symbols if self._fast_tick else None)
 
     def refresh_entry_prices(self, *, now=None):
+        if self._cycle_price_maps is not None:
+            return self._cycle_price_maps[2]
         return self.market.entry_prices(self._active_price_symbols if self._fast_tick else None)
 
     def _publish_entry_gate(self):
@@ -207,7 +223,6 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         previous_revision = self._template_revision
         snapshot, status = self.desired_snapshot(now=now)
         self._io_signal = snapshot, status
-        self._publish_entry_gate()
         completed = self._drain_network()
         previous_ids = {row.get('client_order_id') for row in self.tracked.values()}
         targets = self._target_positions(snapshot)
@@ -225,6 +240,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
                 self._skipped_far_events += 1
                 return False
+        # A far quote changed no signal/order/position state. Rebuilding the
+        # immutable worker gate for it cannot change admission; workers still
+        # check live market health, quote distance, TTL and capacity at send.
+        # Maintenance and every state-changing path continue publishing it.
+        self._publish_entry_gate()
         working = self._fast_snapshot(snapshot, tick, now)
         # All mutations, rankings and capacity reservations have one owner.
         self._fast_tick = True

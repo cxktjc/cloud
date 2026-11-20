@@ -280,7 +280,7 @@ class DirectMarket:
     def write_mirror(self):
         atomic_write_json(self.output, self.snapshot())
 
-    def metrics(self):
+    def metrics(self, *, fresh_prices=None):
         with self._lock:
             now = time.monotonic()
             previous, received, decided = self._rate_sample
@@ -293,7 +293,7 @@ class DirectMarket:
             return dict(self.counts, queue=self.events.qsize(), queue_peak=self.queue_peak,
                         receive_per_second=self._rates[0], decide_per_second=self._rates[1], healthy=self.healthy(),
                         subscribed=len(self.symbols), received_symbols=len(self.processed),
-                        fresh_symbols=len(self.prices()),
+                        fresh_symbols=len(self.prices() if fresh_prices is None else fresh_prices),
                         receive_to_decision_us_p50=percentile(.5),
                         receive_to_decision_us_p95=percentile(.95),
                         receive_to_decision_us_p99=percentile(.99),
@@ -386,33 +386,60 @@ class DualMarket(DirectMarket):
             self._book_ids[symbol] = key
         return accepted
 
-    def _quote(self, feed, symbol, tick=None):
+    @staticmethod
+    def _quote_clock():
+        return time.monotonic(), time.time(), time.monotonic_ns()
+
+    def _quote(self, feed, symbol, tick=None, *, clock=None):
+        mono, epoch, nano = self._quote_clock() if clock is None else clock
         with feed._lock:
             tick = feed.processed.get(symbol) if tick is None else tick
             tick = feed.quote_tick(symbol, tick)
             if (self._closing.is_set() or feed.overloaded or -1 in self.errors or not tick or not tick.valid
                     or tick.group in feed.errors or tick.group not in feed.receipts
                     or tick.generation != feed.generation[tick.group]
-                    or time.monotonic()-feed.receipts[tick.group][0] > ticker_ws.MAX_SILENCE_SECONDS
-                    or not -5 <= time.time()-tick.exchange_ms/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS
-                    or (time.monotonic_ns()-tick.received_ns)/1e9 > cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS):
+                    or mono-feed.receipts[tick.group][0] > ticker_ws.MAX_SILENCE_SECONDS
+                    or not -5 <= epoch-tick.exchange_ms/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS
+                    or (nano-tick.received_ns)/1e9 > cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS):
                 return None
             return float(tick.price)
 
     def healthy(self):
-        return any(self._quote(feed, symbol) is not None
+        clock = self._quote_clock()
+        return any(self._quote(feed, symbol, clock=clock) is not None
                    for symbol in self.symbols for feed in (self, self.book))
 
     def order_allowed(self, symbol):
-        return self._quote(self, symbol) is not None or self._quote(self.book, symbol) is not None
+        clock = self._quote_clock()
+        return (self._quote(self, symbol, clock=clock) is not None
+                or self._quote(self.book, symbol, clock=clock) is not None)
 
     def prices(self, symbols=None):
         # Deliberately keep tick-only valuation and the signal price mirror.
+        clock = self._quote_clock()
         return {symbol: price for symbol in (self.symbols if symbols is None else symbols)
-                if (price := self._quote(self, symbol)) is not None}
+                if (price := self._quote(self, symbol, clock=clock)) is not None}
+
+    def price_maps(self, symbols=None):
+        """One owner-cycle view; send guards always re-read live feed health."""
+        clock = self._quote_clock()
+        ticks, bids, entries = {}, {}, {}
+        for symbol in self.symbols if symbols is None else symbols:
+            tick = self._quote(self, symbol, clock=clock)
+            bid = self._quote(self.book, symbol, clock=clock)
+            if tick is not None:
+                ticks[symbol] = tick
+            if bid is not None:
+                bids[symbol] = bid
+            selected = bid if tick is None else tick if bid is None else min(tick, bid)
+            if selected is not None:
+                entries[symbol] = selected
+        return ticks, bids, entries
 
     def entry_quote(self, symbol):
-        tick, bid = self._quote(self, symbol), self._quote(self.book, symbol)
+        clock = self._quote_clock()
+        tick = self._quote(self, symbol, clock=clock)
+        bid = self._quote(self.book, symbol, clock=clock)
         candidates = [(price, source) for price, source in ((tick, 'tick'), (bid, 'bid0')) if price is not None]
         selected, source = min(candidates, default=(None, None))
         with self.book._lock:
@@ -422,8 +449,7 @@ class DualMarket(DirectMarket):
                     bid_quantity=quantity)
 
     def entry_prices(self, symbols=None):
-        return {symbol: price for symbol in (self.symbols if symbols is None else symbols)
-                if (price := self.entry_quote(symbol)['selected']) is not None}
+        return self.price_maps(symbols)[2]
 
     def quote_state(self, symbol):
         if self.order_allowed(symbol):
@@ -434,9 +460,11 @@ class DualMarket(DirectMarket):
 
     def snapshot(self):
         result = super().snapshot()
+        clock = self._quote_clock()
         with self._lock:
             result['prices'] = {s: dict(price=tick.price, exchange_time_ms=tick.exchange_ms)
-                                for s, tick in self.committed.items() if self._quote(self, s, tick) is not None}
+                                for s, tick in self.committed.items()
+                                if self._quote(self, s, tick, clock=clock) is not None}
             tick_ready = (not self.overloaded and not self.errors and len(self.receipts) == len(self.groups)
                           and all(time.monotonic()-r[0] <= ticker_ws.MAX_SILENCE_SECONDS for r in self.receipts.values()))
             result['status'] = 'ok' if tick_ready and result['status'] == 'ok' else 'error'
@@ -448,20 +476,20 @@ class DualMarket(DirectMarket):
         return super().decide(tick, callback)
 
     def metrics(self):
-        result = super().metrics()
+        ticks, bids, entries = self.price_maps()
+        result = super().metrics(fresh_prices=ticks)
         values = sorted(self.latencies_us + self.book.latencies_us)
         for suffix, fraction in (('p50', .5), ('p95', .95), ('p99', .99)):
             result['receive_to_decision_us_'+suffix] = values[int((len(values)-1)*fraction)] if values else None
         result['receive_to_decision_us_max'] = max(values, default=None)
-        book_metrics = self.book.metrics()
+        book_metrics = self.book.metrics(fresh_prices=bids)
         for key in ('received', 'decided', 'rejected_old', 'rejected_backlog', 'overflow',
                     'enqueued', 'unchanged', 'overload_discarded'):
             result[key] += self.book.counts[key]
         result['queue_peak'] = max(self.queue_peak, self.book.queue_peak)
         result['receive_per_second'] += book_metrics['receive_per_second']
         result['decide_per_second'] += book_metrics['decide_per_second']
-        result.update(bid0_symbols=sum(self._quote(self.book, s) is not None for s in self.symbols),
-                      entry_symbols=len(self.entry_prices()),
+        result.update(bid0_symbols=len(bids), entry_symbols=len(entries),
                       book_received=self.book.counts['received'], book_decided=self.book.counts['decided'],
                       book_rejected_backlog=self.book.counts['rejected_backlog'],
                       book_overflow=self.book.counts['overflow'])

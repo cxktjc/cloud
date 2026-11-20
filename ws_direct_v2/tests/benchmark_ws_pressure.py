@@ -14,7 +14,7 @@ from tests import test_book_ticker_v2 as fixtures
 from v9711_live import config as cfg
 
 
-def run(rate=5000, seconds=3, symbols=800):
+def run(rate=5000, seconds=3, symbols=800, pattern='mixed'):
     case = fixtures.DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     stop, errors = threading.Event(), []
@@ -52,7 +52,13 @@ def run(rate=5000, seconds=3, symbols=800):
                     if index % 32 == 0:
                         stop.wait(max(0, started+index/rate-time.perf_counter()))
                     symbol = case.symbols[index % symbols]
-                    price = 1.01 if index % symbols < 8 else 1.03+(index % 2)*.001
+                    if pattern == 'changing':
+                        # All sources change price on every revisit, including
+                        # incumbent orders; no quantity-only dedupe benefit.
+                        base = 1.01 if index % symbols < 8 else 1.03
+                        price = base+(index//symbols % 2)*.0001
+                    else:
+                        price = 1.01 if index % symbols < 8 else 1.03+(index % 2)*.001
                     try:
                         if index % 5 == 0:
                             market.update(symbol, str(price), int(case.now*1000))
@@ -75,25 +81,34 @@ def run(rate=5000, seconds=3, symbols=800):
             threads.append(thread)
             thread.start()
         maintenance, cycles = time.perf_counter()+.25, 0
+        maintenance_ms, decision_ms = [], []
         while not stop.is_set() or not market.events.empty():
             if time.perf_counter() >= maintenance:
+                cycle_started = time.perf_counter()
                 case.trade.step(now=case.now)
+                maintenance_ms.append((time.perf_counter()-cycle_started)*1000)
                 maintenance = time.perf_counter()+.25
                 cycles += 1
             try:
                 event = market.events.get(timeout=.01)
             except queue.Empty:
                 continue
-            market.decide(event, case.trade.on_tick)
+            if market.decide(event, case.trade.on_tick):
+                decision_ms.append((time.monotonic_ns()-event.received_ns)/1e6)
             market.events.task_done()
         for thread in threads:
             thread.join()
         result = market.metrics()
         counters = {key: result.get(key, 0)-initial.get(key, 0)-initial_book.get(key, 0)
                     for key in ('received', 'decided', 'enqueued', 'unchanged', 'overflow', 'rejected_backlog', 'overload_discarded')}
-        return dict(symbols=symbols, target_frames=frames, target_rate=rate,
+        maintenance_ms.sort()
+        decision_ms.sort()
+        percentile = lambda p: round(decision_ms[int((len(decision_ms)-1)*p)], 3) if decision_ms else None
+        return dict(symbols=symbols, pattern=pattern, target_frames=frames, target_rate=rate,
             elapsed_seconds=round(time.perf_counter()-started, 3), counters=counters,
-            queue_peak=result.get('queue_peak'), p95_receive_to_decision_ms=round((result['receive_to_decision_us_p95'] or 0)/1000, 3),
+            queue_peak=result.get('queue_peak'), p95_receive_to_decision_ms=percentile(.95),
+            p99_receive_to_decision_ms=percentile(.99), latency_scope='all decided events in this run; includes mirror commit',
+            maintenance_p95_ms=round(maintenance_ms[int((len(maintenance_ms)-1)*.95)], 3) if maintenance_ms else None,
             pending=len(case.trade.tracked), simulated_submissions=len(case.submits),
             maintenance_cycles=cycles, skipped_far_events=getattr(case.trade, '_skipped_far_events', 0),
             errors=errors, scope='in-memory ingress with real owner/temporary durable files; mocked exchange')
@@ -108,11 +123,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rate', type=int, default=5000)
     parser.add_argument('--seconds', type=float, default=3)
+    parser.add_argument('--pattern', choices=('mixed', 'changing'), default='mixed')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     if args.rate <= 0 or args.seconds <= 0:
         parser.error('rate and seconds must be positive')
-    result = run(args.rate, args.seconds)
+    result = run(args.rate, args.seconds, pattern=args.pattern)
     text = json.dumps(result, indent=2)
     print(text)
     if args.output:
