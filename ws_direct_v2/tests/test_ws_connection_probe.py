@@ -1,11 +1,13 @@
 """Read-only diagnostics preserve socket failure evidence without trade state."""
 import asyncio
 import json
+import logging
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Frame, Opcode
 
 from collectors import ws_connection_probe as diagnostic
 
@@ -100,8 +102,75 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][0][1], ['BTCUSDT'])
         self.assertEqual(calls[3][1], {'subscribe': True})
 
+    async def test_heartbeat_comparison_pins_same_peer_and_changes_only_ping_interval(self):
+        calls = []
+        async def probe(*args, **kwargs):
+            calls.append((args, kwargs))
+            return dict(case=args[0], matching_events=1, status='observation_finished')
+        with patch.object(diagnostic, 'probe', side_effect=probe), patch.object(diagnostic, 'emit'):
+            await diagnostic.run(['XUSDT'], 20, heartbeat_compare=True, peer_ip='192.0.2.1')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0][1:], calls[1][0][1:])
+        self.assertEqual(calls[0][0][1], ['BTCUSDT'])
+        self.assertEqual([kw['ping_interval'] for _, kw in calls], [30, 2])
+        self.assertTrue(all(kw['peer_ip'] == '192.0.2.1' for _, kw in calls))
+
+    async def test_pinned_peer_preserves_original_tls_hostname_and_validation(self):
+        connection, _ = self.connection([self.quote()])
+        with patch.object(diagnostic.websockets, 'connect', return_value=connection) as connect, \
+                patch.object(diagnostic, 'emit'):
+            result = await diagnostic.probe('depth', ['XUSDT'], diagnostic.BOOK_WS_BASE,
+                'bookTicker', 20, ping_interval=2, peer_ip='192.0.2.1')
+        options = connect.call_args.kwargs
+        self.assertEqual(options['host'], '192.0.2.1')
+        self.assertEqual(options['server_hostname'], 'fstream.binance.com')
+        self.assertNotIn('ssl', options)
+        self.assertEqual(result['ping_interval'], 2)
+        self.assertFalse(result['observation_end_requested'])
+
+    async def test_real_library_automatically_pongs_and_records_control_frames(self):
+        from websockets.asyncio.server import serve
+        confirmed = []
+        async def handler(socket):
+            pong = await socket.ping(b'probe-server-ping')
+            await asyncio.wait_for(pong, 1)
+            confirmed.append(True)
+            await socket.close()
+        async with serve(handler, '127.0.0.1', 0, ping_interval=None) as server:
+            port = server.sockets[0].getsockname()[1]
+            with patch.object(diagnostic, 'emit'):
+                result = await diagnostic.probe('local', ['XUSDT'], f'ws://127.0.0.1:{port}/',
+                                                'bookTicker', 2)
+        self.assertEqual(confirmed, [True])
+        self.assertEqual(result['ws_control_counts']['in_PING'], 1)
+        self.assertEqual(result['ws_control_counts']['out_PONG'], 1)
+        events = result['ws_control_events']
+        ping = next(e for e in events if e['frame'] == 'PING')
+        pong = next(e for e in events if e['frame'] == 'PONG')
+        self.assertEqual(ping['payload_hex'], pong['payload_hex'])
+        self.assertLessEqual(ping['elapsed_ms'], pong['elapsed_ms'])
+
 
 class ExceptionChainTests(unittest.TestCase):
+    def test_control_trace_works_through_logger_adapter_and_ignores_data_frames(self):
+        trace = diagnostic.ControlTrace('unit')
+        adapter = logging.LoggerAdapter(trace, {})
+        with patch.object(Frame, '__str__', side_effect=AssertionError('frame formatting is forbidden')):
+            for _ in range(1000):
+                adapter.debug('< %s', Frame(Opcode.TEXT, b'market-data'))
+            adapter.debug('< %s', Frame(Opcode.PING, b'payload'))
+            adapter.debug('> %s', Frame(Opcode.PONG, b'payload'))
+            adapter.debug('< EOF')
+        self.assertEqual(dict(trace.counts), {'in_PING': 1, 'out_PONG': 1})
+        self.assertEqual(len(trace.events), 3)
+
+    def test_control_trace_bounds_retention_but_keeps_total_counts(self):
+        trace = diagnostic.ControlTrace('bounded')
+        for _ in range(100):
+            trace.debug('< %s', Frame(Opcode.PING, b'x'))
+        self.assertEqual(trace.counts['in_PING'], 100)
+        self.assertEqual(len(trace.events), 32)
+
     def test_transport_exception_supports_old_and_current_library_attributes(self):
         error = ConnectionResetError(104, 'Connection reset by peer')
         for socket in (SimpleNamespace(recv_exc=error), SimpleNamespace(connection_exc=error),

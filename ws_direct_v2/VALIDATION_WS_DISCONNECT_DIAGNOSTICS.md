@@ -73,3 +73,36 @@ curl 不是完整的 WS 客户端，不自动响应 WS ping，不能当长期可
 当作“最近升级导致”的证据。原始诊断工具读取旧私有字段，因此该版本下 `transport_error=[]`
 不能证明底层没有异常；外层 exceptions 与 protocol_error 的 EOF 证据不受影响。
 工具现兼容两个字段，新增一项对应测试；诊断相关共 32 项通过。交易/重连代码没有变化。
+
+## 固定 IP 的 TLS 关闭通知与控制帧对照
+
+后续 curl 对同一 IP 的详细日志显示：证书为有效的 `*.binance.com`，校验通过，协商 TLS 1.3；
+`HTTP 101` 后收到 877,800 字节，9.250451 秒时出现入站 `TLS alert, close notify`。
+这次是远端 TLS 终止端发出关闭通知，并非 curl 的 20 秒观察超时。TLS 终止端可能是服务入口/负载均衡，
+仅凭通知无法确定它的内部关闭理由，不能直接推断成封 IP、连接限额或普通丢包。
+参考：[TLS 1.3 closure alerts](https://www.rfc-editor.org/rfc/rfc8446.html#section-6.1)。
+
+curl 的手工 Upgrade 测试不会自动回 WebSocket pong，所以不能把它当作完备的 WS 心跳测试。
+新增同一 BTCUSDT、同一官方 public 入口的两路 Python 对照，两路均由库自动回复 pong。
+默认用正常系统 DNS，各自输出实际入口 IP：
+
+```bash
+/opt/v9711-live/cloud/.venv/bin/python -B -u -m collectors.ws_connection_probe \
+  --heartbeat-compare --seconds 20
+```
+
+也可固定到同一入口 IP，便于控制 DNS 返回地址的差异（仍不保证连接落到同一个后端实例）：
+
+```bash
+/opt/v9711-live/cloud/.venv/bin/python -B -u -m collectors.ws_connection_probe \
+  --heartbeat-compare --peer-ip 16.76.74.58 --seconds 20
+```
+
+一条连接保留 30 秒客户端 ping，另一条每 2 秒主动 ping。每条记录入站/出站的 PING/PONG/CLOSE
+及 EOF 顺序；出站记录表示库生成了帧，不证明服务器已经收到。记录保留最近 32 个控制事件，
+总计数独立累加；不格式化或输出行情数据帧。`observation_end_requested=true` 表示主动结束观察，
+不要把随后本地生成的正常 CLOSE 当作远端先关。固定 IP 仍保留 fstream.binance.com 的 SNI 和证书校验。
+
+这可以继续检查漏回服务器 ping、主动保活差异及对端关闭顺序；2 秒心跳稳定一次只能作为后续验证线索。
+未将诊断用的 2 秒参数应用到 trade。新增控制日志与两路配置、SNI 的回归和本地真实服务主动 ping/
+确认 pong 的集成测试；诊断相关共 37 项通过。
