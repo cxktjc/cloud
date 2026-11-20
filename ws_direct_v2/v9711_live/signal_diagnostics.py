@@ -26,7 +26,7 @@ class CandidateDistance:
 def nearest_candidates(candidates: Iterable[Candidate], prices: Mapping[str, SignalInput], *,
                        held_symbols: Iterable[str] = (), desired_symbols: Iterable[str] = (),
                        limit: int = 3, place_gap: float = cfg.SIGNAL_DISCOVERY_GAP) -> tuple[CandidateDistance, ...]:
-    """Nearest fresh, non-held candidates by abs(gap), with signed distance.
+    """Fresh, non-held candidates by ascending signed gap, below-limit first.
 
     Below-limit prices are eligible for a buy intent, never proof of a fill.
     Using the exact selection inputs prevents stale quotes from appearing
@@ -51,13 +51,13 @@ def nearest_candidates(candidates: Iterable[Candidate], prices: Mapping[str, Sig
             status = 'outside_place_gap' if quote.gap > place_gap else 'eligible_not_published'
         rows.append(CandidateDistance(candidate.symbol, quote.observed_price,
                                       candidate.limit_price, quote.gap, status))
-    return tuple(nsmallest(limit, rows, key=lambda r: (abs(r.gap), r.symbol)))
+    return tuple(nsmallest(limit, rows, key=lambda r: (r.gap, r.symbol)))
 
 
 def nearest_candidates_line(rows: Iterable[CandidateDistance], *, candidate_count: int,
                             price_healthy: bool, place_gap: float = cfg.SIGNAL_DISCOVERY_GAP) -> str:
     """Stable display/log block: header, then one candidate per line."""
-    prefix = f'最近3候选(按绝对价差；信号候选高出≤{100 * place_gap:.4f}%（含低于限价）):\n  '
+    prefix = f'最近3候选(按价差从小到大，低于限价优先；信号候选高出≤{100 * place_gap:.4f}%（含低于限价）):\n  '
     if not candidate_count:
         return prefix + '无有效候选'
     if not price_healthy:
