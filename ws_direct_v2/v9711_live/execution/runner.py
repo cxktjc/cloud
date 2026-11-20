@@ -48,6 +48,7 @@ from .cancel_pacing import exact_entry_cancel_key
 from .session_entries import SessionEntryStats
 from .nonblocking_io import NetworkTradeMixin
 from .submit_errors import require_submit_ack, submit_error_is_ambiguous
+from .order_identity import matches_order_identity
 from .stream import StreamUnavailable
 from .terminal import TradeTerminalView
 from .forced_close import ForcedCloseMixin
@@ -192,6 +193,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 self._note_entry_absence(symbol, row, now=now)
                 self._retire_order(symbol, row, 'confirmed_absent')
                 continue
+            if not matches_order_identity(order, symbol=symbol,
+                    client_order_id=row.get('client_order_id'), order_id=row.get('order_id')):
+                LOG.warning('ignore mismatched entry evidence; identity retained symbol=%s', symbol)
+                continue
             # Recover the acknowledgement of an ambiguous placement before a
             # cancel. Subsequent cancellation can use its exact exchange ID and
             # must not run an extra UID lookup every executor cycle.
@@ -319,6 +324,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 LOG.warning('cancel uncertain symbol=%s reason=%s err=%s', symbol, reason, error)
                 return
             result = result if isinstance(result, Mapping) else {}
+            if not matches_order_identity(result, symbol=symbol, client_order_id=cid, order_id=oid):
+                LOG.warning('ignore mismatched cancel evidence; identity retained symbol=%s', symbol)
+                return
             if current.get('signal_follow') and not self._follow_fill_evidence(current, result):
                 return
             filled_qty = self._finite(result.get('executedQty'))
@@ -424,6 +432,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         count = int(self._finite((records.get(cid) or {}).get('confirmed_absences'))) + 1
         records[cid] = dict(symbol=symbol, order_bar_open_ms=bar_ms,
                             confirmed_absences=count, last_absence_epoch=now)
+        count = self._entry_recovery_count(row)
         if count > cfg.ENTRY_RECOVERY_MAX_RETRIES:
             LOG.warning('entry recovery limit reached symbol=%s id=%s retries=%d; '
                         'no more sends for this order bar', symbol, cid, cfg.ENTRY_RECOVERY_MAX_RETRIES)
@@ -432,24 +441,40 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                      'and capacity allow symbol=%s id=%s retry=%d/%d',
                      symbol, cid, count, cfg.ENTRY_RECOVERY_MAX_RETRIES)
 
+    def _entry_recovery_count(self, row: Mapping[str, Any]) -> int:
+        symbol = str(row.get('symbol') or '').upper()
+        bar = int(self._finite(row.get('order_bar_open_ms')))
+        return sum(int(self._finite(record.get('confirmed_absences')))
+                   for record in self.ledger.state['entry_recovery'].values()
+                   if record.get('symbol') == symbol
+                   and int(self._finite(record.get('order_bar_open_ms'))) == bar)
+
     def _entry_submission_blocked(self, row: Mapping[str, Any]) -> bool:
         symbol = str(row.get('symbol') or '').upper()
         if self._forced_entry_blocked(symbol, now=time.time()):
             return True
-        cid = self._entry_client_id(row)
-        rotated = self.ledger.state.get('rotated_out_plans', {}).get(cid)
-        if isinstance(rotated, Mapping) and rotated.get('plan_signature') == self._entry_plan_signature(row):
-            return True  # do not re-add the exact old plan into a spare slot after rotating it out
-        recovery = self.ledger.state['entry_recovery'].get(cid) or {}
-        if self._finite(recovery.get('confirmed_absences')) > cfg.ENTRY_RECOVERY_MAX_RETRIES:
+        signature = self._entry_plan_signature(row)
+        if row.get('signal_follow'):
+            # Follow entries already advance their own durable generation and
+            # retry confirmed rejects after a cooldown while signal is active.
+            cid = self._entry_client_id(row)
+            previous = self.ledger.state['entry_submit_rejections'].get(cid) or {}
+            recovery = self.ledger.state['entry_recovery'].get(cid) or {}
+            return (previous.get('plan_signature') == signature
+                    or self._finite(recovery.get('confirmed_absences')) > cfg.ENTRY_RECOVERY_MAX_RETRIES)
+        # Guard the signal plan, not a physical send ID. New IDs must not reset
+        # rotation suppression, definitive rejection, or bounded absence retry.
+        for name in ('rotated_out_plans', 'entry_submit_rejections'):
+            if any(record.get('symbol') == symbol and record.get('plan_signature') == signature
+                   for record in self.ledger.state.get(name, {}).values()):
+                return True
+        if self._entry_recovery_count(row) > cfg.ENTRY_RECOVERY_MAX_RETRIES:
             return True
-        previous = self.ledger.state['entry_submit_rejections'].get(cid)
-        return (isinstance(previous, Mapping)
-                and previous.get('plan_signature') == self._entry_plan_signature(row))
+        return False
 
     def _prune_entry_rejections(self, bar_ms: int) -> None:
-        # At most one current-bar rejection per deterministic symbol/bar ID.
-        # Keep it across restart but not an unbounded history or retry hot loop.
+        # Keep current-bar physical-ID evidence across restart, while bounding
+        # history and preserving plan-level suppression across new send IDs.
         if bar_ms > 0:
             for name in ('entry_submit_rejections', 'entry_recovery', 'rotated_out_plans'):
                 records = self.ledger.state[name]
@@ -510,8 +535,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         elif ((len(self.positions) >= cfg.SLOTS and not final_exit_bar)
                 or self._ordinary_pending_count() >= cfg.MAX_PENDING_ORDERS):
             return skipped('position_or_pending_capacity_full')
-        client_id = self._entry_client_id(row)
-        if self.ledger.owns_client(client_id) or self._entry_submission_blocked(row):
+        plan_id = self._entry_client_id(row)
+        if self.ledger.owns_client(plan_id) or self._entry_submission_blocked(row):
             return skipped('exact_client_identity_already_used_or_plan_rejected')
         price = self._finite(row.get('limit_price'))
         notional = self._finite(row.get('notional'))
@@ -540,6 +565,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 prepared.get('actual_notional'), qty * self._finite(prepared.get('price'), price)),
             'sizing_target_notional': self._finite(prepared.get('target_notional'), notional),
         }
+        client_id = plan_id if following else self.ledger.reserve_entry_client_id(symbol, bar_ms)
         # Persist BOTH exact identity and its occupied physical slot before I/O.
         # A process interruption between send and ACK must not lose this slot.
         self.tracked[symbol] = {
@@ -557,6 +583,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'observed_price': self._finite(row.get('observed_price'), price),
             'gap': self._finite(row.get('gap'), 0.0),
             'placed_at_epoch': submit_now, 'last_status': 'SUBMITTING',
+            'entry_identity_version': 2,
             'fate_unknown': True,
         }
         origin = row.get('_rotation_origin')
@@ -568,7 +595,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self.ledger.register(symbol=symbol, client_order_id=client_id,
                              kind='entry', limit_price=price, qty=qty,
                              exit_due_epoch=self._finite(row.get('exit_due_epoch')))
-        if self.ledger.state['entry_recovery'].get(client_id):
+        if self._entry_recovery_count(row):
             self.stats['entry_retries'] += 1
         source_row = dict(row)
         def send():
@@ -588,6 +615,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     raise error
                 place_result = require_submit_ack(
                     place_result, symbol=symbol, client_order_id=client_id)
+                if not matches_order_identity(place_result, symbol=symbol,
+                        client_order_id=client_id, order_id=current.get('order_id')):
+                    raise RuntimeError('entry ACK conflicts with exact known order identity')
             except Exception as exc:
                 # A stream ACK/fill may beat the background result. Never erase
                 # known exchange ownership because an older call failed.

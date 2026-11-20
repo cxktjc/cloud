@@ -361,16 +361,32 @@ class SignalFollowTests(unittest.TestCase):
         self.assertEqual(self.trade.positions['AUSDT']['quantity'], 2.)
         self.assertEqual(len(self.submits), 1)
 
-    def test_follow_order_resizes_on_position_tier_change_after_exact_cancel(self):
+    def test_follow_order_freezes_price_and_quantity_across_tier_changes_and_restart(self):
         self.event()
-        cid = self.trade.tracked['AUSDT']['client_order_id']
-        self.held(1)
+        original = deepcopy(self.trade.tracked['AUSDT'])
+        for count in (1, 2, 0, 3, 5):
+            self.trade.positions.clear()
+            self.held(count)
+            self.trade.ledger.state['realized_balance'] = 100 + count
+            self.event()
+            row = self.trade.tracked['AUSDT']
+            for field in ('client_order_id', 'order_id', 'limit_price', 'qty', 'notional', 'sizing_weight'):
+                self.assertEqual(row[field], original[field])
+            self.assertEqual(self.trade._ordinary_pending_count(), 0)
+            # Direct sizing calls and the actual worker gate must agree too.
+            raw = dict(self.target('AUSDT'), signal_follow=True,
+                       signal_follow_position_id=self.targets[0]['position_id'])
+            self.assertEqual(self.trade._entry_sizing_row(raw)['notional'], original['notional'])
+            self.trade._publish_entry_gate()
+            io = object.__new__(NetworkIO)
+            io._entry_gate, io._closed = self.trade.client.entry_gate, False
+            self.assertTrue(io.check_entry('AUSDT', row['client_order_id'], row['order_bar_open_ms']))
+        self.make_trade()
         self.event()
-        self.assertNotIn('AUSDT', self.trade.tracked)
-        self.event()
-        self.assertNotEqual(self.trade.tracked['AUSDT']['client_order_id'], cid)
-        self.assertEqual(self.trade.tracked['AUSDT']['sizing_weight'], .3)
-        self.assertEqual(len(self.cancels), 1)
+        self.assertEqual(self.trade.tracked['AUSDT']['client_order_id'], original['client_order_id'])
+        self.assertEqual(self.trade.tracked['AUSDT']['qty'], original['qty'])
+        self.assertFalse(self.cancels)
+        self.assertEqual(len(self.submits), 1)
 
 
 if __name__ == '__main__':

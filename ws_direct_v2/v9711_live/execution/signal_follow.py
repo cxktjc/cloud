@@ -129,8 +129,6 @@ class SignalFollowMixin:
             if (len(allowed) < FOLLOW_ORDER_CAP and row.get('signal_follow') and target
                     and symbol not in self.positions and not row.get('cancel_requested')
                     and row.get('signal_follow_position_id') == target['position_id']
-                    and (row.get('sizing_weight') is None
-                         or row.get('sizing_weight') == cfg.SLOT_WEIGHTS[min(len(self.positions), 2)])
                     and not self._forced_entry_blocked(symbol, now=now)):
                 allowed[str(row.get('client_order_id'))] = (symbol, int(row['order_bar_open_ms']))
         return allowed

@@ -120,7 +120,7 @@ class TradeTerminalView:
             f'signal应挂单={capacity["signal_desired_count"]} '
             f'有价可评估={capacity["priced_desired_count"]} '
             f'近阈值={capacity["near_place_count"]}',
-            f'补挂规则: signal原入场限价，最多额外{cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS}单；'
+            f'补挂规则: signal原入场限价，挂出后固定数量，不随仓数变化撤改；最多额外{cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS}单；'
             f'trade持仓≥{cfg.SIGNAL_FOLLOW_POSITION_STOP}时撤补挂单；普通挂单数不含补挂单。',
             f'容量排除/缺口: 超出3仓目标={capacity["signal_targets_over_position_cap"]} '
             f'未实际持有signal目标={capacity["signal_targets_not_held"]} '

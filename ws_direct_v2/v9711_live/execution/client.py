@@ -27,6 +27,7 @@ from .submit_errors import ConfirmedSubmitRejection, is_transport_error
 from .nonblocking_io import NetworkPending
 from .batch_entry import BatchEntryMixin
 from .signal_follow import follow_send_allowed
+from .order_identity import matches_order_identity
 
 LOG = logging.getLogger('v9711_live_trade.client')
 
@@ -100,6 +101,16 @@ class OwnershipLedger:
         digest = hashlib.sha1(raw.encode()).hexdigest()[:12]
         # Binance client order id has a 36-character limit.
         return f'{cfg.ORDER_CLIENT_PREFIX}_{kind}_{digest}'
+
+    def reserve_entry_client_id(self, symbol: str, bar_open_ms: int) -> str:
+        # Separate namespace from legacy deterministic symbol/bar IDs. Persist
+        # before registration/send; a skipped number after interruption is safe.
+        sequence = int(self.state.get('entry_submission_sequence', 0)) + 1
+        self.state['entry_submission_sequence'] = sequence
+        raw = f'{cfg.ORDER_CLIENT_PREFIX}:physical-entry-v2:{symbol.upper()}:{int(bar_open_ms)}:{sequence}'
+        cid = f'{cfg.ORDER_CLIENT_PREFIX}_entry_{hashlib.sha1(raw.encode()).hexdigest()[:20]}'
+        self.save()
+        return cid
 
     def register(self, *, symbol: str, client_order_id: str, order_id: Any = None,
                  kind: str, limit_price: float = 0.0, qty: float = 0.0,
@@ -602,6 +613,24 @@ class ExchangeClient(BatchEntryMixin):
             self.stream.health()
         except StreamUnavailable:
             pass
+        intent = ledger.intents.get(f'c:{client_order_id}') or {}
+        tracked = ledger.state['tracked_orders'].get(symbol.upper()) or {}
+        def valid_evidence(result):
+            if not matches_order_identity(result, symbol=symbol,
+                                          client_order_id=client_order_id, order_id=order_id):
+                return False
+            # A pre-upgrade reused CID may still be awaiting its new ACK.
+            # Its older terminal stream/cache must not retire this attempt.
+            if (intent.get('kind') == 'entry' and order_id in (None, '', 0, '0')
+                    and tracked.get('client_order_id') == client_order_id
+                    and not tracked.get('entry_identity_version') and not tracked.get('signal_follow')):
+                updated = _finite(result.get('updateTime'))
+                placed = _finite(tracked.get('placed_at_epoch')) * 1000
+                if 0 < updated < placed:
+                    return False
+            return True
+        if payload and not valid_evidence(payload):
+            payload = None
         terminal = {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED'}
         def complete_terminal(row):
             status = str(row.get('status') or '').upper()
@@ -609,6 +638,10 @@ class ExchangeClient(BatchEntryMixin):
             return (status in terminal and (qty <= 0 or avg > 0)
                     and (status != 'FILLED' or qty > 0))
         state = self._order_queries.get(key)
+        if state:
+            for field in ('confirmed_terminal', 'confirmed_snapshot'):
+                if state.get(field) and not valid_evidence(state[field]):
+                    state.pop(field, None)
         if payload and complete_terminal(payload):
             self._order_queries.pop(key, None)
             ledger.clear_unknown(key)
@@ -671,6 +704,8 @@ class ExchangeClient(BatchEntryMixin):
                     or (response_oid and order_id not in (None, '', 0, '0')
                         and response_oid != str(order_id))):
                 raise RuntimeError('exact order query identity mismatch; ownership retained')
+            if not valid_evidence(result):
+                raise RuntimeError('exact order query returned stale/mismatched evidence; ownership retained')
             # Cache broker evidence across a missing terminal stream event.
             # Do not query again each cycle when the local row stays old NEW.
             state['failures'] = state['not_found'] = 0
@@ -709,7 +744,7 @@ class ExchangeClient(BatchEntryMixin):
                         symbol=symbol, order_id=order_id, client_order_id=client_order_id)
                 except StreamUnavailable:
                     latest = None
-                if latest:
+                if latest and valid_evidence(latest):
                     state['not_found'] = 0
                     state.pop('last_negative_epoch', None)
                     return latest, True

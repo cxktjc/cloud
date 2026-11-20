@@ -20,6 +20,12 @@ class CountSizingMixin:
         count = len(self.positions)  # partial fills / pending closes still count
         weight = weight_for_count(count)
         old = self.tracked.get(str(item.get('symbol', '')).upper()) or {}
+        if (old.get('signal_follow') and item.get('signal_follow')
+                and old.get('signal_follow_position_id') == item.get('signal_follow_position_id')):
+            for k in ('notional', 'sizing_weight', 'sizing_position_count', 'sizing_balance', 'sizing_raw_notional'):
+                if k in old:
+                    item[k] = old[k]
+            return item  # existing follow entries retain their original size
         same_plan = old and all(old.get(k) == item.get(k) for k in
             ('order_bar_open_ms', 'reference_bar_open_ms', 'limit_price'))
         if same_plan and old.get('sizing_weight') == weight:
@@ -36,7 +42,7 @@ class CountSizingMixin:
     def _execute_entries(self, snapshot, status, **kwargs):
         weight = weight_for_count(len(self.positions))
         for symbol, row in list(self.tracked.items()):
-            if (symbol not in self.positions and row.get('sizing_weight') != weight
+            if (not row.get('signal_follow') and symbol not in self.positions and row.get('sizing_weight') != weight
                     and not row.get('cancel_requested')):
                 # Persist the reason before async cancellation. UNKNOWN retains
                 # its identity; no replacement until exact terminal evidence.
