@@ -6,6 +6,7 @@ Only changed content redraws the terminal. All values are computed by
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -13,6 +14,12 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from .. import config as cfg
+
+
+class MarketConsoleFilter(logging.Filter):
+    """Collector chatter stays in trade.log; sticky errors live in the panel."""
+    def filter(self, record):
+        return not (record.name == 'v9711.ticker_ws' or record.name.startswith('v9711.ticker_ws.'))
 
 
 def iso(ms: Any) -> str:
@@ -180,6 +187,16 @@ class TradeTerminalView:
             for source in ('tick', 'depth'):
                 for group, error in list((ws.get(source+'_errors') or {}).items())[:3]:
                     lines.insert(-1, f'  {source} group={group} error={error}')
+            recent = ws.get('recent_errors') or []
+            if recent:
+                block = ['WS 最近报错（UTC，恢复后保留；相同错误合并计数）:']
+                for row in recent[:5]:
+                    status = '已恢复' if row.get('recovered') else '未恢复'
+                    block.append(f'  {iso(row["last_epoch"]*1000)} {row["source"]} group={row["group"]} '
+                                 f'次数={row["count"]} [{status}] {row["error"]}')
+                block.append(f'完整日志: {cfg.TRADE_LOG_FILE}')
+                block.append('-' * 116)
+                lines[4:4] = block
         for symbol, quote in list(diagnostics.get('entry_quotes', {}).items())[:3]:
             def shown(key):
                 value = quote.get(key+'_gap')
@@ -238,16 +255,6 @@ class TradeTerminalView:
             block.append('  口径: 只计启动后完成3m确认的signal入场；部分成交算已开仓；'
                          '延迟成交回报会修正未成交数，实际平仓不会重新算漏开。')
             lines[-1:-1] = block
-        policy = f.get('entry_gap_policy') or {}
-        if policy:
-            lines.insert(-1, f'当前准入价差上限={100*f.get("current_admission_gap", policy["fill_gap"]):g}%（挂单计数，非持仓数）')
-            lines.insert(-1, f'挂单分档: 不足5≤{100*policy["bootstrap_gap"]:g}% / 第6～8≤{100*policy["fill_gap"]:g}% / '
-                         f'替换优先: 更近≥{100*policy["improvement_at_least"]:g}个百分点；'
-                         f'≥5单时更近≥{100*policy["crowded_improvement_at_least"]:g}个百分点；'
-                         f'替换不受分档限制；距离>{100*policy["cancel_gap"]:g}%自动撤单。')
-        sizing = (f.get('entry_diagnostics') or {}).get('sizing') or {}
-        if sizing:
-            lines.insert(-1, f"Sizing 50/30/20: positions={sizing['positions']} weight={sizing['weight']:.0%} trade_balance={sizing['balance']:.6f} target={sizing['raw_notional']:.6f}U; exchange minimum may raise size; concurrent fills may exceed target")
         for symbol, row in list((f.get('open_orders') or {}).items())[:self.max_rows]:
             if row.get('sizing_weight') is not None:
                 lines.insert(-1, f'  {symbol} 挂单资金档={row["sizing_weight"]:.0%} '

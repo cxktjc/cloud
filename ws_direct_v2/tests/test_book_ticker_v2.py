@@ -18,7 +18,7 @@ from v9711_live.execution.logic import select_physical_orders
 from v9711_live.execution.submit_errors import EntryQuoteUnavailable
 from v9711_live.execution.ws_market import DualMarket
 from v9711_live.execution.entry_quotes import qualify_quote
-from v9711_live.execution.terminal import compact_positions
+from v9711_live.execution.terminal import compact_positions, TradeTerminalView
 
 
 class DualMarketTests(unittest.TestCase):
@@ -94,6 +94,32 @@ class DualMarketTests(unittest.TestCase):
             self.assertEqual(self.market.entry_prices()['XUSDT'], 1.01)
             self.assertEqual(float(self.market.snapshot()['prices']['XUSDT']['price']), 1.03)
         self.drain(decision)
+
+    def test_recent_error_survives_reconnect_and_marks_only_valid_data_recovered(self):
+        self.market.book.group_failed(1, 'ConnectionClosedError: no close frame received or sent')
+        error = self.market.metrics()['recent_errors'][0]
+        self.assertEqual((error['source'], error['group'], error['count']), ('depth', 1, 1))
+        self.assertFalse(error['recovered'])
+        self.market.book.group_connected(1)
+        self.assertFalse(self.market.metrics()['recent_errors'][0]['recovered'])
+        self.quote(tick=None)
+        error = self.market.metrics()['recent_errors'][0]
+        self.assertTrue(error['recovered'])
+        self.assertIn('ConnectionClosedError', error['error'])
+        self.assertFalse(self.market.metrics()['depth_errors'])
+
+    def test_error_history_merges_repeats_and_remains_bounded(self):
+        for index in range(10):
+            self.market.book.group_failed(1, f'error {index}')
+        self.market.book.group_failed(1, 'error 9')
+        self.market.book.group_failed(1, 'error 9')
+        self.assertEqual(len(self.market.book.error_history), 5)
+        self.assertEqual(self.market.book.error_history[-1]['count'], 3)
+        self.assertEqual(self.market.book.error_history[-1]['error'], 'error 9')
+        self.market.book.group_failed(1, 'scheduled reconnect')
+        self.market.book.group_failed(1, 'collector stopped')
+        self.assertEqual(len(self.market.book.error_history), 5)
+        self.assertNotIn('collector stopped', str(self.market.book.error_history))
 
 
 class DualAdmissionTests(unittest.TestCase):
@@ -212,6 +238,25 @@ class DualAdmissionTests(unittest.TestCase):
         self.assertIn('登记满足=signal_follow', compact_positions(self.trade.tracked, 12))
         legacy = dict(symbol='OLDUSDT', client_order_id='old', quantity=1)
         self.assertIn('登记满足=unknown', compact_positions([legacy], 12))
+
+    def test_panel_keeps_recovered_ws_error_above_positions_on_later_refresh(self):
+        self.trade.market.book.group_failed(1, 'ConnectionClosedError: no close frame received or sent')
+        self.trade.market.book.group_connected(1)
+        while not self.trade.market.events.empty():
+            self.trade.market.events.get_nowait()
+        self.bid(1.01)
+        self.trade.step(now=self.now)
+        comparison = self.trade._render_trade.call_args.kwargs['comparison']
+        fields = dict(comparison=comparison, clock_utc='test', entry_diagnostics=self.trade._entry_diagnostics,
+                      entry_gap_policy={'fill_gap': .0165}, current_admission_gap=.0185)
+        view = TradeTerminalView()
+        first = view._format(fields)
+        self.assertIn('[已恢复] ConnectionClosedError', first)
+        self.assertLess(first.index('WS 最近报错'), first.index('当前实际持仓'))
+        self.now += 1
+        self.trade.step(now=self.now)
+        fields['entry_diagnostics'] = self.trade._entry_diagnostics
+        self.assertIn('[已恢复] ConnectionClosedError', view._format(fields))
 
     def test_distance_cancel_needs_all_valid_quotes_to_be_outside(self):
         self.plans()

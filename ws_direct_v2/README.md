@@ -34,6 +34,11 @@ trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bo
   连接和断线日志区分 `stream=aggTrade/bookTicker`，记录端点和 `proxy=disabled/direct`；
   无有效报价超时时附收包数、有效数及时间戳过期、品种类型不符等过滤计数。
   面板保留两路有效币数、各自分组错误、depth 端点及直连状态，可区分没收包和收包后被过滤。
+- WS 错误在面板顶部保留最近 5 条，显示 UTC 时间、来源/分组、相同错误累计次数及是否恢复。
+  连接恢复不会清掉错误历史，重复错误合并；每路最多保存 5 条，历史随 trade 进程重启重置。
+  trade 控制台不再穿插行情连接/重连日志，所有原始日志继续完整写入 `var/state/trade.log`，
+  也可用 `tail -f var/state/trade.log` 单独观察。普通订单等其他日志仍正常输出。
+  已移除面板的“当前准入价差上限”“挂单分档”和总览 `Sizing 50/30/20` 三段文案。
 
 仍从本目录使用原 `v9711_live.execution.runner` 启动 trade；进程内部启动两路订阅，不需要额外行情进程。
 接口依据：[Binance USDⓈ-M bookTicker 文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#individual-symbol-book-ticker-streams)。

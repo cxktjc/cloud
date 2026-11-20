@@ -47,6 +47,7 @@ class DirectMarket:
         self.generation = {index:0 for index in range(1, len(self.groups)+1)}
         self.receipts = {}
         self.errors = {}
+        self.error_history = []
         self.latest_ingress = {}
         self.processed = {}  # owner thread only
         self.committed = {}
@@ -78,7 +79,25 @@ class DirectMarket:
         with self._lock:
             self.receipts.pop(index, None)
             self.errors[index] = str(message)
+            if message not in ('scheduled reconnect', 'collector stopped'):
+                detail = str(message)[:700]
+                previous = next((row for row in self.error_history
+                                 if row['group'] == index and row['error'] == detail), None)
+                if previous is not None:
+                    self.error_history.remove(previous)
+                else:
+                    previous = dict(group=index, error=detail, count=0, first_epoch=time.time())
+                previous.update(count=previous['count']+1, last_epoch=time.time())
+                self.error_history.append(previous)
+                del self.error_history[:-5]
         self._wake()
+
+    def recent_errors(self):
+        with self._lock:
+            return [dict(row, source='depth' if self.source == 'bid0' else 'tick',
+                         recovered=(row['group'] in self.receipts and row['group'] not in self.errors
+                                    and time.monotonic()-self.receipts[row['group']][0] <= ticker_ws.MAX_SILENCE_SECONDS))
+                    for row in self.error_history]
 
     def group_received(self, index):
         pass  # update() validates/marks receipt before making its event visible
@@ -380,6 +399,8 @@ class DualMarket(DirectMarket):
             result['depth_errors'] = dict(self.book.errors)
         result['proxy'] = 'disabled/direct'
         result['depth_endpoint'] = ticker_ws.BOOK_WS_BASE
+        result['recent_errors'] = sorted(self.recent_errors()+self.book.recent_errors(),
+                                         key=lambda row: row['last_epoch'], reverse=True)[:5]
         return result
 
     async def _receive(self):

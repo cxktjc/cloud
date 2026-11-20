@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import io
+import logging
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -10,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from collectors import kline_aggregator_15m as agg
 from v9711_live import config as cfg
 from v9711_live.terminal_view import TerminalView
-from v9711_live.execution.terminal import TradeTerminalView
+from v9711_live.execution.terminal import TradeTerminalView, MarketConsoleFilter
 
 
 class BackfillTests(unittest.TestCase):
@@ -77,6 +79,19 @@ class BackfillTests(unittest.TestCase):
 
 
 class DisplayTests(unittest.TestCase):
+    def test_ws_chatter_is_kept_in_full_log_but_does_not_overwrite_panel(self):
+        console, full_log = io.StringIO(), io.StringIO()
+        console_handler, file_handler = logging.StreamHandler(console), logging.StreamHandler(full_log)
+        console_handler.addFilter(MarketConsoleFilter())
+        record = logging.LogRecord('v9711.ticker_ws', logging.WARNING, '', 1, 'connection failed', (), None)
+        console_handler.handle(record)
+        file_handler.handle(record)
+        self.assertEqual(console.getvalue(), '')
+        self.assertIn('connection failed', full_log.getvalue())
+        record = logging.LogRecord('v9711_live_trade', logging.WARNING, '', 1, 'order uncertain', (), None)
+        console_handler.handle(record)
+        self.assertIn('order uncertain', console.getvalue())
+
     def test_signal_default_does_not_change_trade_display(self):
         self.assertEqual(TerminalView().view.min_refresh_seconds, cfg.SignalViewConfig().min_refresh_seconds)
         self.assertIsNot(TerminalView().view.__class__, cfg.ViewConfig)

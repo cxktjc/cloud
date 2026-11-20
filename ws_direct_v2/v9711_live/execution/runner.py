@@ -51,7 +51,7 @@ from .submit_errors import require_submit_ack, submit_error_is_ambiguous, EntryQ
 from .order_identity import matches_order_identity
 from .entry_quotes import QUOTE_FIELDS
 from .stream import StreamUnavailable
-from .terminal import TradeTerminalView
+from .terminal import TradeTerminalView, MarketConsoleFilter
 from .forced_close import ForcedCloseMixin
 from .manual_close import ManualCloseMixin
 
@@ -820,8 +820,6 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             open_orders={symbol: dict(row) for symbol, row in orders.items()},
             close_orders=self._close_order_view(),
             network_io=self._network_io.health() if self._network_io else {'enabled': False},
-            entry_gap_policy=GapPolicy().describe(),
-            current_admission_gap=self._current_admission_gap(),
             pending_rotation=self.ledger.state.get('pending_rotation'),
             capital_mode=self.ledger.state.get('capital_mode', 'execution_ledger'),
             manual_signal_sync=dict(self.ledger.state.get('manual_signal_sync') or {}),
@@ -1110,10 +1108,12 @@ def main() -> int:
     if args.enable_live and args.no_dry_run and cfg.PAPER_MODE:
         parser.error('v2 live must not use --paper')
     cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    console_log = logging.StreamHandler()
+    console_log.addFilter(MarketConsoleFilter())
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-        handlers=[logging.StreamHandler(),
+        handlers=[console_log,
                   logging.FileHandler(cfg.TRADE_LOG_FILE, encoding='utf-8')])
     enabled = bool(args.enable_live)
     dry_run = not bool(args.no_dry_run)
