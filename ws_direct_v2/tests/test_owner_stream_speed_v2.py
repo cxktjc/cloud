@@ -125,6 +125,46 @@ class HotOwnedQuotesTests(unittest.TestCase):
     refresh_quotes = fixtures.FlashOwnerTests.refresh_quotes
     publish, held = fixtures.FlashOwnerTests.publish, fixtures.FlashOwnerTests.held
 
+    def test_missing_owned_quote_does_not_replan_every_other_quote(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        market = self.trade.market
+        market.processed.pop('N0USDT')
+        market.latest_ingress.pop('N0USDT')
+        self.assertIsNone(market.entry_quote('N0USDT')['selected'])
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('missing quote repeats full plan')):
+            for price in (1.0101, 1.0099, 1.0101):
+                self.event('N8USDT', price)
+        self.assertFalse(self.cancels)
+        self.assertEqual(len(self.trade.tracked), 8)
+        # Recovery must immediately restore ordinary distance/replacement checks.
+        self.event('N0USDT', 1.022)
+        self.assertNotIn('N0USDT', self.trade.tracked)
+
+    def test_missing_owned_quote_still_allows_fresh_candidate_in_vacancy(self):
+        self.plans(9)
+        for index in range(3, 9):
+            self.trade.market.update(f'N{index}USDT', '1.02', int(self.now*1000))
+            self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        self.event('N0USDT', 1.01)
+        self.assertEqual(len(self.trade.tracked), 3)
+        self.trade.market.processed.pop('N0USDT')
+        self.trade.market.latest_ingress.pop('N0USDT')
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('no vacancy candidate qualifies')):
+            self.event('N8USDT', 1.0201)
+        self.event('N8USDT', 1.0185)
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.assertIn('N0USDT', self.trade.tracked)
+
+    def test_missing_quote_does_not_suppress_other_owned_distance_cancel(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        self.trade.market.processed.pop('N0USDT')
+        self.trade.market.latest_ingress.pop('N0USDT')
+        self.event('N1USDT', 1.022)
+        self.assertNotIn('N1USDT', self.trade.tracked)
+        self.assertIn('N0USDT', self.trade.tracked)
+
     def test_owned_price_changes_without_action_do_not_repeat_full_plan(self):
         self.plans(9)
         self.event('N0USDT', 1.01)

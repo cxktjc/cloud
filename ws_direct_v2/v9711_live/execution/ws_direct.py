@@ -54,7 +54,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._owner_work = OwnerWork()
         self._feedback_writer = None
         self._maintenance_mark = None
-        self._runtime_source = dict(build='20261120-entry-first-v4', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261120-quote-outage-v5', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -356,7 +356,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         prices = self.market.entry_prices(ordinary)
         gaps = [(prices[s]-float(r['limit_price']))/float(r['limit_price'])
                 for s, r in ordinary.items() if s in prices and float(r.get('limit_price') or 0) > 0]
-        if len(gaps) != len(ordinary) or (gaps and not at_most(max(gaps), cfg.CANCEL_GAP)):
+        if (gaps and not at_most(max(gaps), cfg.CANCEL_GAP)):
             return False
         excluded = set(self.tracked) | set(self.positions) | set(targets)
         if pending:
@@ -375,7 +375,12 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             return not at_most(best, policy.admission_gap(count))
         if count < cfg.MAX_PENDING_ORDERS and at_most(best, policy.admission_gap(count)):
             return False
-        return not (gaps and policy.replacement_allowed(max(gaps), best,
+        # Missing incumbent quotes retain their physical slots, but cannot
+        # authorize distance cancellation or rotation. The full planner also
+        # requires ALL active incumbents to be ranked before replacing one.
+        # Replanning every healthy quote during an unrelated outage creates
+        # a backlog; still evaluate genuine vacancies and recovery crossings.
+        return not (len(gaps) == len(ordinary) and gaps and policy.replacement_allowed(max(gaps), best,
                     ceiling=cfg.CANCEL_GAP, count=count))
 
     def on_tick(self, tick):

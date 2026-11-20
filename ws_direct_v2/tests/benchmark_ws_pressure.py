@@ -103,6 +103,18 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
             store.db.commit()
             store.export()
             case.trade.client.query_exact_order = ExchangeClient.query_exact_order.__get__(case.trade.client)
+        unavailable = set()
+        if scenario == 'quote_outage':
+            # A resting order loses both quote sources while other groups
+            # continue sending; no new event may silently recover this group.
+            unavailable = set(market.groups[0])
+            for feed in (market, market.book):
+                feed.group_failed(1, 'offline benchmark quote outage')
+        producer_symbols = [symbol for symbol in case.symbols if symbol not in unavailable]
+        if hot_symbols:
+            producer_symbols = producer_symbols[:hot_symbols]
+        if not producer_symbols:
+            raise ValueError('quote_outage requires symbols in another connection group')
         initial = dict(market.counts)
         initial_book = dict(market.book.counts)
         frames = int(rate*seconds)
@@ -112,12 +124,12 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
                 for index in range(frames):
                     if index % 32 == 0:
                         stop.wait(max(0, started+index/rate-time.perf_counter()))
-                    symbol = case.symbols[index % (hot_symbols or symbols)]
+                    symbol = producer_symbols[index % len(producer_symbols)]
                     if pattern in ('changing', 'changing_effective'):
                         # All sources change price on every revisit, including
                         # incumbent orders; no quantity-only dedupe benefit.
                         base = bases[symbol]
-                        revisit = index//(hot_symbols or symbols) % 2
+                        revisit = index//len(producer_symbols) % 2
                         price = base+(revisit*.0002-.0001 if pattern == 'changing_effective' else revisit*.0001)
                     else:
                         price = bases[symbol]
@@ -207,7 +219,7 @@ if __name__ == '__main__':
     parser.add_argument('--hot-symbols', type=int, help='Concentrate measured events on the first N symbols')
     parser.add_argument('--account-history', type=int, default=0,
                         help='Use real account SQLite queries with N unrelated historical orders/fills')
-    parser.add_argument('--scenario', choices=('steady', 'full_positions', 'partial_book', 'owned_spread'),
+    parser.add_argument('--scenario', choices=('steady', 'full_positions', 'partial_book', 'owned_spread', 'quote_outage'),
                         default='steady')
     args = parser.parse_args()
     if (args.rate <= 0 or args.seconds <= 0 or not 0 <= args.near_symbols <= 800 or not 0 <= args.near_gap <= .021

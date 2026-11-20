@@ -90,6 +90,9 @@ trade 两路均按每连接最多 100 个币对分组，继续订阅完整币池
   序号与注册合并保存，发送前仍确认关键账本，防止重启重复下单。普通撤单仍保留回包后 1.5s 间隔。
   反馈 JSON/日志写盘移到后台；行情已排队时先给有限处理机会，再执行周期维护。
   439 项回归、明确的先后顺序及重启/写盘阻塞验证见 `VALIDATION_ENTRY_FIRST.md`。
+- 局部行情缺失时，已有普通挂单保留名额，缺报价本身不让每条其他行情反复执行完整规划。
+  有空位且新报价合格时仍可新挂；报价恢复、有效旧单超距、信号变化及订单回包继续检查。
+  461 项回归与断组压力复现见 `VALIDATION_WS_QUOTE_OUTAGE.md`；此修正不代表网络断线根因已确定。
 - depth 异常断线提供独立只读对照：`python -B -u -m collectors.ws_connection_probe --group 2 --seconds 20`。
   同时比较单币/整组 bookTicker、同组 aggTrade 与公开 SUBSCRIBE，输出底层异常链、连接 IP 和循环延迟。
   现场证据、判读限制和服务器命令见 `VALIDATION_WS_DISCONNECT_DIAGNOSTICS.md`；此工具不改变 trade 行为。
