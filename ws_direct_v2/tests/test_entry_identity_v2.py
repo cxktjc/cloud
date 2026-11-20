@@ -48,10 +48,10 @@ class EntryIdentityTests(unittest.TestCase):
             executed_quantity=0., average_price=0., original_quantity=float(terminal['origQty']),
             updated_at_ms=stamp, order_side='BUY', position_side='LONG')
         with closing(sqlite3.connect(directory/'events.sqlite3')) as db:
-            db.execute('CREATE TABLE orders(version_ms INTEGER, payload TEXT)')
-            db.execute('CREATE TABLE fills(transaction_ms INTEGER, payload TEXT)')
+            db.execute('CREATE TABLE orders(key TEXT PRIMARY KEY, version_ms INTEGER, payload TEXT)')
+            db.execute('CREATE TABLE fills(key TEXT PRIMARY KEY, transaction_ms INTEGER, payload TEXT)')
             db.execute('CREATE TABLE events(seq INTEGER PRIMARY KEY, event_type TEXT, payload TEXT)')
-            db.execute('INSERT INTO orders VALUES (?,?)', (stamp, json.dumps(payload)))
+            db.execute('INSERT INTO orders VALUES (?,?,?)', ('N0USDT:'+str(terminal['orderId']), stamp, json.dumps(payload)))
             db.commit()
 
     def test_gap_cancel_reentry_uses_new_durable_identity_even_after_restart(self):

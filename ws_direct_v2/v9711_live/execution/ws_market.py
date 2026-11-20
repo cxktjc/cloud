@@ -62,8 +62,9 @@ class DirectMarket:
         self.overloaded = False
         self.counts = dict(received=0, decided=0, rejected_old=0, rejected_backlog=0, overflow=0,
                            enqueued=0, unchanged=0, overload_discarded=0)
-        self._rate_sample = (time.monotonic(), 0, 0)
-        self._rates = (0., 0.)
+        self._rate_keys = ('received', 'enqueued', 'decided', 'unchanged', 'rejected_backlog', 'rejected_old', 'overload_discarded')
+        self._rate_sample = (time.monotonic(), {key: 0 for key in self._rate_keys})
+        self._rates = {key: 0. for key in self._rate_keys}
         self.queue_peak = 0
         self.latencies_us = []
         self.admission_latencies_us = []
@@ -287,15 +288,17 @@ class DirectMarket:
     def metrics(self, *, fresh_prices=None):
         with self._lock:
             now = time.monotonic()
-            previous, received, decided = self._rate_sample
+            previous, counts = self._rate_sample
             if now-previous >= 1:
-                self._rates = ((self.counts['received']-received)/(now-previous),
-                               (self.counts['decided']-decided)/(now-previous))
-                self._rate_sample = (now, self.counts['received'], self.counts['decided'])
+                self._rates = {key: (self.counts[key]-counts[key])/(now-previous) for key in self._rate_keys}
+                self._rate_sample = (now, {key: self.counts[key] for key in self._rate_keys})
             values = sorted(self.latencies_us)
             percentile = lambda p: values[min(len(values)-1, int((len(values)-1)*p))] if values else None
             return dict(self.counts, queue=self.events.qsize(), queue_peak=self.queue_peak,
-                        receive_per_second=self._rates[0], decide_per_second=self._rates[1], healthy=self.healthy(),
+                        receive_per_second=self._rates['received'], decide_per_second=self._rates['decided'],
+                        enqueue_per_second=self._rates['enqueued'], unchanged_per_second=self._rates['unchanged'],
+                        expired_per_second=self._rates['rejected_backlog'], old_per_second=self._rates['rejected_old'],
+                        discarded_per_second=self._rates['overload_discarded'], healthy=self.healthy(),
                         subscribed=len(self.symbols), received_symbols=len(self.processed),
                         fresh_symbols=len(self.prices() if fresh_prices is None else fresh_prices),
                         receive_to_decision_us_p50=percentile(.5),
@@ -522,8 +525,9 @@ class DualMarket(DirectMarket):
                     'enqueued', 'unchanged', 'overload_discarded'):
             result[key] += self.book.counts[key]
         result['queue_peak'] = max(self.queue_peak, self.book.queue_peak)
-        result['receive_per_second'] += book_metrics['receive_per_second']
-        result['decide_per_second'] += book_metrics['decide_per_second']
+        for key in ('receive_per_second', 'decide_per_second', 'enqueue_per_second', 'unchanged_per_second',
+                    'expired_per_second', 'old_per_second', 'discarded_per_second'):
+            result[key] += book_metrics[key]
         result.update(bid0_symbols=len(bids), entry_symbols=len(entries),
                       book_received=self.book.counts['received'], book_decided=self.book.counts['decided'],
                       book_rejected_backlog=self.book.counts['rejected_backlog'],

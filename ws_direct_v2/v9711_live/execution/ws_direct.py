@@ -1,6 +1,7 @@
 """Event-driven trade entrypoint. Signal publishes full-bar templates, not ticks."""
 from __future__ import annotations
 import heapq
+import hashlib
 import logging
 import queue
 import time
@@ -13,6 +14,7 @@ from .position_identity import CAPITAL_MODE
 from .sizing import CountSizingMixin
 from .signal_follow import SignalFollowMixin
 from .entry_quotes import qualify_quote
+from .owner_work import OwnerWork
 from ..entry_policy import GapPolicy, at_most
 from collectors.ticker_ws import load_symbols
 
@@ -48,6 +50,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._cycle_price_maps = None
         self._skipped_far_events = 0
         self._skipped_noncompetitive_events = 0
+        self._owner_work = OwnerWork()
+        self._maintenance_mark = None
+        self._runtime_source = dict(build='20261120-owner-stream-v3', source=str(Path(__file__).resolve()),
+                                    source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.market_guard = self._market_send_allowed
@@ -75,14 +81,35 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                              following=cid in gate.get('follow_entries', {}))
 
     def step(self, *, now=None):
-        stamp = time.time() if now is None else now
-        health = self._stream_health()
-        if health.get('fresh'):
-            self._account_deadline = stamp + cfg.ACCOUNT_STREAM_MAX_AGE_SECONDS - float(health.get('age_seconds', 0))
-        else:
-            self._account_deadline = 0
-        self._refresh_precision_readiness()
-        return super().step(now=now)
+        started = self._maintenance_mark = time.perf_counter_ns()
+        self._maintenance_segments = {}
+        try:
+            stamp = time.time() if now is None else now
+            health = self._stream_health()
+            if health.get('fresh'):
+                self._account_deadline = stamp + cfg.ACCOUNT_STREAM_MAX_AGE_SECONDS - float(health.get('age_seconds', 0))
+            else:
+                self._account_deadline = 0
+            self._maintenance_checkpoint('account_health')
+            self._refresh_precision_readiness()
+            self._maintenance_checkpoint('metadata')
+            return super().step(now=now)
+        finally:
+            self._maintenance_checkpoint('remaining')
+            self._owner_work.finish('maintenance', started, self._maintenance_segments)
+            self._maintenance_mark = None
+
+    def _maintenance_checkpoint(self, stage):
+        if self._maintenance_mark is not None:
+            now = time.perf_counter_ns()
+            self._maintenance_segments[stage] = (now-self._maintenance_mark)/1e6
+            self._maintenance_mark = now
+
+    def _render_trade(self, **kwargs):
+        try:
+            return super()._render_trade(**kwargs)
+        finally:
+            self._maintenance_checkpoint('render')
 
     def _execute_entries(self, snapshot, status, **kwargs):
         # Reuse one read within this decision only. No owner state or quote
@@ -263,11 +290,22 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def _no_entry_action(self, tick, targets, now):
         """Conservative no-action check for every ordinary order count.
 
-        State/file changes, completions and owned/target quote changes bypass
-        this method. Time-based reconciliation still runs in maintenance.
+        File changes and completions bypass this method. Owned/target quotes
+        must still pass cancel/follow/capacity checks before skipping work.
+        Time-based reconciliation still runs in maintenance.
         """
         ordinary = {s: r for s, r in self.tracked.items()
                     if not r.get('signal_follow') and not r.get('cancel_requested')}
+        if tick.symbol in targets and tick.symbol not in self.positions:
+            follow = self.tracked.get(tick.symbol) or {}
+            if (not follow.get('signal_follow') or follow.get('cancel_requested')
+                    or follow.get('signal_follow_position_id') != targets[tick.symbol].get('position_id')):
+                return False  # a newly available signal target must be evaluated
+        if any(r.get('signal_follow') and not r.get('cancel_requested')
+               and (s in self.positions or len(self.positions) >= cfg.SIGNAL_FOLLOW_POSITION_STOP
+                    or self._forced_entry_blocked(s, now=now) or s not in targets)
+               for s, r in self.tracked.items()):
+            return False
         pending = self.ledger.state.get('pending_rotation')
         if pending:
             victim = str(pending.get('victim') or '')
@@ -318,11 +356,27 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                     ceiling=cfg.CANCEL_GAP, count=count))
 
     def on_tick(self, tick):
+        started = self._quote_mark = time.perf_counter_ns()
+        self._quote_segments, self._quote_route, self._quote_tail = {}, 'full', 'screening'
+        try:
+            return self._on_tick(tick)
+        finally:
+            self._quote_checkpoint(self._quote_tail)
+            self._owner_work.finish('quote', started, self._quote_segments, route=self._quote_route)
+
+    def _quote_checkpoint(self, stage):
+        now = time.perf_counter_ns()
+        self._quote_segments[stage] = (now-self._quote_mark)/1e6
+        self._quote_mark = now
+
+    def _on_tick(self, tick):
         now = time.time()
         previous_revision = self._template_file_revision
         snapshot, status = self.desired_snapshot(now=now)
+        self._quote_checkpoint('signal')
         self._io_signal = snapshot, status
         completed = self._drain_network()
+        self._quote_checkpoint('callbacks')
         previous_ids = {row.get('client_order_id') for row in self.tracked.values()}
         targets = self._target_positions(snapshot)
         # A new far quote cannot enter the shortlist, change any incumbent's
@@ -338,20 +392,25 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             if not template or (quote is not None and limit > 0 and (quote-limit)/limit > cfg.CANCEL_GAP):
                 self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
                 self._skipped_far_events += 1
+                self._quote_route = 'far'
                 return False
         # Check genuine unowned challengers at partial/full order counts and
         # while position capacity is closed, not just uniform empty/full books.
         if (status == 'valid' and previous_revision == self._template_file_revision and not completed
-                and tick.symbol not in self.tracked and tick.symbol not in self.positions and tick.symbol not in targets
                 and self._no_entry_action(tick, targets, now)):
             self._skipped_noncompetitive_events += 1
+            self._quote_route = 'no_action'
             return False
         # A far quote changed no signal/order/position state. Rebuilding the
         # immutable worker gate for it cannot change admission; workers still
         # check live market health, quote distance, TTL and capacity at send.
         # Maintenance and every state-changing path continue publishing it.
+        self._quote_checkpoint('screening')
         self._publish_entry_gate()
+        self._quote_checkpoint('gate')
         working = self._fast_snapshot(snapshot, tick, now)
+        self._quote_checkpoint('ranking')
+        self._quote_tail = 'plan_dispatch'
         # All mutations, rankings and capacity reservations have one owner.
         self._fast_tick = True
         try:
@@ -364,15 +423,21 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return bool({row.get('client_order_id') for row in self.tracked.values()} - previous_ids)
 
     def write_feedback(self, **kwargs):
+        self._maintenance_checkpoint('pre_feedback')
         # Exposed in the persistent diagnostics snapshot, not printed per tick.
         self._entry_diagnostics = dict(getattr(self, '_entry_diagnostics', {}),
                                        ws_direct=self.market.metrics())
         self._entry_diagnostics['ws_direct']['skipped_far_events'] = self._skipped_far_events
         self._entry_diagnostics['ws_direct']['skipped_noncompetitive_events'] = self._skipped_noncompetitive_events
-        super().write_feedback(**kwargs)
+        self._entry_diagnostics['ws_direct']['owner_work'] = self._owner_work.snapshot()
+        self._entry_diagnostics['ws_direct']['runtime'] = self._runtime_source
+        try:
+            super().write_feedback(**kwargs)
+        finally:
+            self._maintenance_checkpoint('feedback')
 
     def _run_loop(self):
-        LOG.info('WS DIRECT mode=%s inputs=%s', cfg.WS_DIRECT_MODE, check_inputs())
+        LOG.info('WS DIRECT runtime=%s mode=%s inputs=%s', self._runtime_source, cfg.WS_DIRECT_MODE, check_inputs())
         if self.client.enabled and not self.client.dry_run:
             from ..contracts import read_json
             marker = read_json(cfg.STATE_DIR / 'WS_MIGRATION.json') or {}

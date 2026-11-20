@@ -6,6 +6,7 @@ This exercises in-memory ingress; it does not measure remote WS/TLS bandwidth.
 import argparse
 import json
 import queue
+from contextlib import closing
 import threading
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from v9711_live import config as cfg
 
 
 def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, near_symbols=8, near_gap=.01,
-        scenario='steady'):
+        scenario='steady', hot_symbols=None, account_history=0):
     case = fixtures.DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     # Keep the fixture's stable bar clock without Mock call recording on each
@@ -78,6 +79,30 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
             else:
                 market.decide(event, case.trade.on_tick)
             market.events.task_done()
+        if account_history:
+            from collectors.binance_account_stream import AccountStore
+            from v9711_live.execution.client import ExchangeClient
+            store = case.stack.enter_context(closing(AccountStore(cfg.ACCOUNT_STREAM_DIR)))
+            store.status(mode='live', ready=True, connected=True)
+            stamp = int(case.now*1000)
+            orders, fills = [], []
+            for index in range(account_history):
+                payload = json.dumps(dict(symbol=f'FOREIGN{index}USDT', order_id=index+1,
+                    client_order_id=f'foreign-{index}', status='FILLED', order_side='BUY',
+                    executed_quantity=1, original_quantity=1, average_price=1,
+                    last_price=1, last_quantity=1, trade_id=1, updated_at_ms=stamp))
+                orders.append((f'FOREIGN{index}USDT:{index+1}', stamp, payload))
+                fills.append((f'FOREIGN{index}USDT:{index+1}:1', stamp, payload))
+            for symbol, row in case.trade.tracked.items():
+                payload = dict(symbol=symbol, order_id=row['order_id'], client_order_id=row['client_order_id'],
+                    status='NEW', order_side='BUY', original_quantity=row['qty'], executed_quantity=0,
+                    average_price=0, updated_at_ms=stamp, price=row['limit_price'])
+                orders.append((symbol+':'+str(row['order_id']), stamp, json.dumps(payload)))
+            store.db.executemany('INSERT OR REPLACE INTO orders VALUES (?,?,?)', orders)
+            store.db.executemany('INSERT OR REPLACE INTO fills VALUES (?,?,?)', fills)
+            store.db.commit()
+            store.export()
+            case.trade.client.query_exact_order = ExchangeClient.query_exact_order.__get__(case.trade.client)
         initial = dict(market.counts)
         initial_book = dict(market.book.counts)
         frames = int(rate*seconds)
@@ -87,12 +112,12 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
                 for index in range(frames):
                     if index % 32 == 0:
                         stop.wait(max(0, started+index/rate-time.perf_counter()))
-                    symbol = case.symbols[index % symbols]
+                    symbol = case.symbols[index % (hot_symbols or symbols)]
                     if pattern in ('changing', 'changing_effective'):
                         # All sources change price on every revisit, including
                         # incumbent orders; no quantity-only dedupe benefit.
                         base = bases[symbol]
-                        revisit = index//symbols % 2
+                        revisit = index//(hot_symbols or symbols) % 2
                         price = base+(revisit*.0002-.0001 if pattern == 'changing_effective' else revisit*.0001)
                     else:
                         price = bases[symbol]
@@ -147,7 +172,9 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
         maintenance_ms.sort()
         decision_ms.sort()
         percentile = lambda p: round(decision_ms[int((len(decision_ms)-1)*p)], 3) if decision_ms else None
-        return dict(symbols=symbols, near_symbols=near_symbols, near_gap=near_gap, scenario=scenario,
+        return dict(symbols=symbols, hot_symbols=hot_symbols, account_history=account_history,
+            owner_work=case.trade._owner_work.snapshot() if hasattr(case.trade, '_owner_work') else None,
+            near_symbols=near_symbols, near_gap=near_gap, scenario=scenario,
             positions=len(case.trade.positions), pattern=pattern, nonblocking_io=nonblocking,
             target_frames=frames, target_rate=rate,
             elapsed_seconds=round(time.perf_counter()-started, 3), counters=counters,
@@ -177,13 +204,18 @@ if __name__ == '__main__':
     parser.add_argument('--near-gap', type=float, default=.01,
                         help='Near price gap; .02 exercises an empty book outside the admission tier')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--hot-symbols', type=int, help='Concentrate measured events on the first N symbols')
+    parser.add_argument('--account-history', type=int, default=0,
+                        help='Use real account SQLite queries with N unrelated historical orders/fills')
     parser.add_argument('--scenario', choices=('steady', 'full_positions', 'partial_book', 'owned_spread'),
                         default='steady')
     args = parser.parse_args()
-    if args.rate <= 0 or args.seconds <= 0 or not 0 <= args.near_symbols <= 800 or not 0 <= args.near_gap <= .021:
+    if (args.rate <= 0 or args.seconds <= 0 or not 0 <= args.near_symbols <= 800 or not 0 <= args.near_gap <= .021
+            or args.account_history < 0 or (args.hot_symbols is not None and not 1 <= args.hot_symbols <= 800)):
         parser.error('positive rate/seconds, near-symbols in 0..800 and near-gap in 0..0.021 required')
     result = run(args.rate, args.seconds, pattern=args.pattern, nonblocking=args.nonblocking,
-                 near_symbols=args.near_symbols, near_gap=args.near_gap, scenario=args.scenario)
+                 near_symbols=args.near_symbols, near_gap=args.near_gap, scenario=args.scenario,
+                 hot_symbols=args.hot_symbols, account_history=args.account_history)
     text = json.dumps(result, indent=2)
     print(text)
     if args.output:

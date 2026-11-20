@@ -210,10 +210,23 @@ class TradeTerminalView:
             lines.insert(-1, f'tick/bid0 OR准入: tick有效={ws.get("fresh_symbols", 0)} '
                          f'bid0有效={ws.get("bid0_symbols", 0)} 任一路有效={ws.get("entry_symbols", 0)}；估值仍用tick。')
             lines.insert(-1, f'行情负载: 接收={ws.get("receive_per_second", 0):.0f}/s '
+                         f'入队={ws.get("enqueue_per_second", 0):.0f}/s '
                          f'决策={ws.get("decide_per_second", 0):.0f}/s 积压={ws.get("queue", 0)} '
                          f'峰值={ws.get("queue_peak", 0)} 买一未变={ws.get("unchanged", 0)} '
                          f'远价快速处理={ws.get("skipped_far_events", 0)} '
                          f'过载丢弃={ws.get("overload_discarded", 0)}')
+            work = ws.get('owner_work') or {}
+            if work:
+                quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
+                lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '
+                             f'维护={maintenance.get("p95_ms", 0):.3f}/{maintenance.get("max_ms", 0):.3f} '
+                             f'未变买一={ws.get("unchanged_per_second", 0):.0f}/s '
+                             f'过期拒绝={ws.get("expired_per_second", 0):.0f}/s')
+                slow = (work.get('recent_slow') or [])[-1:]
+                for item in slow:
+                    lines.insert(-1, f'最近慢处理: {iso_ms(item.get("epoch", 0)*1000)} '
+                                 f'{item.get("kind")} {item.get("elapsed_ms")}ms '
+                                 f'主要阶段={item.get("stage")} {item.get("stage_ms")}ms')
             lines.insert(-1, f'depth WS: endpoint={ws.get("depth_endpoint", "-")} proxy={ws.get("proxy", "-")}')
             for source in ('tick', 'depth'):
                 for group, error in list((ws.get(source+'_errors') or {}).items())[:3]:

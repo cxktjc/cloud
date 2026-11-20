@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .. import config as cfg
+from ..local_poll import CachedJsonFile
 
 
 class StreamUnavailable(RuntimeError):
@@ -49,6 +50,7 @@ class AccountStreamView:
         self.account_id = _text(account_id) or 'default'
         self.max_age_seconds = max(1.0, float(max_age_seconds))
         self.snapshot_path = self.directory / 'account_snapshot.json'
+        self._health_reader = CachedJsonFile(self.snapshot_path)
         self.database_path = self.directory / 'events.sqlite3'
         self._lite_event_seq = 0
         self._lite_fills: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = {}
@@ -62,10 +64,9 @@ class AccountStreamView:
             return False
 
     def health(self) -> Health:
-        try:
-            payload = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
-        except (OSError, ValueError, TypeError) as exc:
-            raise StreamUnavailable('account snapshot missing or invalid') from exc
+        payload = self._health_reader.read()
+        if not isinstance(payload, Mapping):
+            raise StreamUnavailable('account snapshot missing or invalid')
         status = payload.get('status') if isinstance(payload, Mapping) else None
         if not isinstance(status, Mapping):
             raise StreamUnavailable('account snapshot status missing')
@@ -272,8 +273,15 @@ class AccountStreamView:
         try:
             best: dict[str, Any] | None = None
             best_version = -1
-            for version, raw in db.execute(
-                    'SELECT version_ms,payload FROM orders ORDER BY version_ms DESC').fetchall():
+            if order_id_text:
+                orders = db.execute('SELECT version_ms,payload FROM orders WHERE key=?',
+                                    (symbol+':'+order_id_text,))
+            else:
+                # Collector keys are SYMBOL:orderId. CID-only recovery reads
+                # just this symbol's indexed range, retaining exact CID checks.
+                orders = db.execute('SELECT version_ms,payload FROM orders WHERE key>=? AND key<?',
+                                    (symbol+':', symbol+';'))
+            for version, raw in orders:
                 try:
                     row = json.loads(raw)
                 except (TypeError, ValueError):
@@ -386,8 +394,12 @@ class AccountStreamView:
                     and (not client_order_id or cid == client_order_id)):
                 for trade_id, row in records.items():
                     combined[f'{fill_oid}:{trade_id}'] = dict(row)
+        prefix = symbol.upper()+':'+_text(order_id) if order_id not in (None, '', 0, '0') else symbol.upper()
+        # Fill keys are SYMBOL:orderId:tradeId (or the collector fallback
+        # suffix). ':'..';' bounds exclude similarly prefixed order IDs.
         for transaction_ms, raw in db.execute(
-                'SELECT transaction_ms,payload FROM fills ORDER BY transaction_ms ASC').fetchall():
+                'SELECT transaction_ms,payload FROM fills WHERE key>=? AND key<? ORDER BY transaction_ms ASC',
+                (prefix+':', prefix+';')):
             try:
                 row = json.loads(raw)
             except (TypeError, ValueError):

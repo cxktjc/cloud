@@ -863,6 +863,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             self._step(now=now)
 
     def _step(self, *, now: float | None = None) -> None:
+        checkpoint = getattr(self, '_maintenance_checkpoint', lambda stage: None)
         self.cycles += 1
         self._submit_skip_reasons = {}
         now = time.time() if now is None else float(now)
@@ -872,9 +873,11 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         # Capture exact booked fills before close reconciliation removes positions.
         self.session_entries.observe_owned_state(self.positions, self.tracked)
         self._drain_network()
+        checkpoint('signal_callbacks')
         self.reconcile_orders(now=now)
         self._reconcile_forced_exits(now=now)
         self._cleanup_forced_close_orders(now=now)
+        checkpoint('orders_forced')
         self._publish_entry_gate()
         for symbol in list(self.positions):
             self._reconcile_position_close(symbol, now=now)
@@ -882,18 +885,22 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self._reconcile_manual_flats(now=now)
         self._apply_signal_targets(snapshot)
         self.session_entries.observe_signal(snapshot, status=status, now=now)
+        checkpoint('positions_manual')
         targets = self._target_positions(snapshot)
         self._over_capacity_reduction(now=now, target_positions=targets)
         self._timed_exits(now=now)
         final_exit_bar = self._in_final_pre_exit_bar(now=now)
         self._cancel_all_for_full_capacity(now=now)
+        checkpoint('close_capacity')
         desired_rows, live_desired, price_map, plan = self._execute_entries(
             snapshot, status, now=now, targets=targets, final_exit_bar=final_exit_bar)
+        checkpoint('entry_plan')
         for row in self.tracked.values():
             timing = self.session_entries.timings.order(str(row.get('client_order_id') or ''))
             if timing:
                 row['entry_timing'] = timing
         self.ledger.save()
+        checkpoint('ledger')
         stream_health = self._stream_health()
         comparison = self._comparison(
             snapshot=snapshot, price_map=price_map,
@@ -903,6 +910,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                                  and self._finite(item.get('gap'), float('nan')) <= self._current_admission_gap()
                                  for item in live_desired),
             positions=self.positions, open_orders=self.tracked)
+        checkpoint('comparison')
         self.write_feedback(now=now, price_map=price_map,
                             comparison=comparison, stream_health=stream_health)
         self._render_trade(comparison=comparison, orders=self.tracked,
