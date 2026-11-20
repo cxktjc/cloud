@@ -497,17 +497,23 @@ class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dual_receiver_uses_identical_groups_for_both_streams(self):
         with tempfile.TemporaryDirectory() as directory:
-            market = DualMarket(['AUSDT', 'BUSDT', 'CUSDT'], Path(directory)/'prices.json', group_size=2)
+            symbols = [f'TEST{i:04d}USDT' for i in range(647)]
+            market = DualMarket(symbols, Path(directory)/'prices.json')
+            self.assertEqual([len(group) for group in market.groups], [100]*6+[47])
+            self.assertEqual(market.groups, market.book.groups)
             calls = []
             async def consume(group, state, **kw):
                 calls.append((kw['stream_kind'], tuple(group), kw['base']))
-                if len(calls) == 4:
+                if len(calls) == 14:
                     kw['stop'].set()
                 await kw['stop'].wait()
             with patch.object(ticker_ws, 'consume_group', side_effect=consume):
                 await market._receive()
             self.assertEqual([g for s,g,b in calls if s == 'aggTrade'],
                              [g for s,g,b in calls if s == 'bookTicker'])
+            for stream in ('aggTrade', 'bookTicker'):
+                self.assertEqual([symbol for kind, group, base in calls if kind == stream
+                                  for symbol in group], symbols)
             self.assertTrue(all('/public/' in b for s,g,b in calls if s == 'bookTicker'))
 
     async def test_real_parser_subscribes_same_symbols_and_reads_best_bid(self):

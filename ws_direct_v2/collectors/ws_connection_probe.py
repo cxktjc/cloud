@@ -193,7 +193,7 @@ async def run(symbols, seconds, *, heartbeat_compare=False, peer_ip=None, tls12=
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=float, default=20.)
-    parser.add_argument('--group', type=int, default=2, help='same 200-symbol grouping as trade')
+    parser.add_argument('--group', type=int, default=2, help='original 200-symbol grouping retained for diagnostic comparisons')
     parser.add_argument('--limit-symbols', type=int, default=200,
                         help='use first N symbols within original group (1..200); do not shift group boundaries')
     parser.add_argument('--heartbeat-compare', action='store_true',

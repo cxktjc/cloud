@@ -8,6 +8,8 @@
 trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bookTicker`。
 后者从 `/public/stream` 读取 `b`（买一价）、`B`（买一量），只使用最优一档，不维护多档深度簿。
 两路独立分组、连接和重连代次，任意有效事件都进入同一状态线程触发判断。
+trade 两路均按每连接最多 100 个币对分组，继续订阅完整币池；647 币时每路 7 组，最后一组 47 币。
+本次仅调整 trade 分组大小，更新后重启 trade 生效，signal 无需重启。
 
 - 普通单判断价取有效 tick/bid0 的较小值：`gap=(判断价-原入场限价)/原入场限价`。
   前 5 单 ≤1.85%、第 6～8 单 ≤1.65%；替换仍按任意单数 ≥0.30pp、≥5 单 ≥0.22pp 优势。
@@ -90,7 +92,8 @@ trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bo
   现场证据、判读限制和服务器命令见 `VALIDATION_WS_DISCONNECT_DIAGNOSTICS.md`；此工具不改变 trade 行为。
   `--heartbeat-compare` 默认按正常 DNS 对照 30s/2s 心跳；`--peer-ip IP` 可固定同一入口 IP，后端仍可能不同。
   两种方式都记录控制帧且保留自动 pong 与 TLS 验证。
-  `--group 2 --limit-symbols 100` 用原第 2 组前 100 币对照，分组边界、DNS 和默认 TLS 均保持原口径。
+  `--group 2 --limit-symbols 100` 用原 200 币分组的第 2 组前 100 币对照；诊断工具保留历史分组边界，
+  不对应当前 trade 的 100 币组号，DNS 和默认 TLS 均保持原口径。
 - 本地队列溢出时立即撤销受影响来源分组的旧代次、禁用其旧报价，并显式计数。
   保持 WS 读取以排空网络缓冲；队列降至低水位后，仅由新报价经 owner 确认恢复。
   溢出恢复期间丢弃的事件计入 `overload_discarded`，不拿遗漏期间的报价补做交易。

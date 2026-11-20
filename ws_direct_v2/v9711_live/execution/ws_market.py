@@ -37,7 +37,7 @@ class Tick:
 
 
 class DirectMarket:
-    def __init__(self, symbols, output: Path, *, group_size=200, queue_size=None, source='tick', dedupe_unchanged=False):
+    def __init__(self, symbols, output: Path, *, group_size=100, queue_size=None, source='tick', dedupe_unchanged=False):
         self.source = source
         self.dedupe_unchanged = dedupe_unchanged
         self.symbols = tuple(symbols)
