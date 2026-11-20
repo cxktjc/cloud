@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Mapping
 
 from .. import config as cfg
@@ -261,7 +262,9 @@ class TradeTerminalView:
                          '延迟成交回报会修正未成交数，实际平仓不会重新算漏开。')
             lines[-1:-1] = block
         for symbol, row in list((f.get('open_orders') or {}).items())[:self.max_rows]:
-            if row.get('sizing_weight') is not None:
+            if (row.get('sizing_weight') is not None
+                    and abs(Decimal(str(row.get('submitted_notional', 0)))
+                            - Decimal(str(row.get('sizing_raw_notional', 0)))) > Decimal('0.5')):
                 lines.insert(-1, f'  {symbol} 挂单资金档={row["sizing_weight"]:.0%} '
                              f'理论={row.get("sizing_raw_notional", 0):.6f}U '
                              f'实际委托={row.get("submitted_notional", 0):.6f}U')
