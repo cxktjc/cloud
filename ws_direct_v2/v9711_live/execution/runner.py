@@ -114,7 +114,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         return self.ledger.state['tracked_orders']
 
     def _ordinary_pending_count(self) -> int:
-        return sum(not row.get('signal_follow') for row in self.tracked.values())
+        return sum(not row.get('signal_follow') and not row.get('cancel_requested')
+                   for row in self.tracked.values())
 
     def _entry_client_id(self, row: Mapping[str, Any]) -> str:
         return self.ledger.client_id(str(row.get('symbol') or '').upper(),
@@ -292,6 +293,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
 
     def _retire_order(self, symbol: str, row: Mapping[str, Any], reason: str) -> None:
         self._note_rotation_terminal(symbol, row, reason)
+        getattr(self, '_cancel_attempts', {}).pop((symbol, str(row.get('client_order_id') or '')), None)
         self.tracked.pop(symbol, None)
         self.ledger.forget(symbol=symbol,
                            client_order_id=str(row.get('client_order_id') or ''),
@@ -314,13 +316,21 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             row['cancel_reason'] = reason
             self._publish_entry_gate()
             return False
-        if row.get('cancel_requested') and time.time() - self._finite(row.get('cancel_requested_epoch')) < 10.0:
+        attempts = getattr(self, '_cancel_attempts', None)
+        if attempts is None:
+            attempts = self._cancel_attempts = {}
+        attempt_key = (symbol, cid)
+        # Retry pacing is process-local: a persisted cancel flag after restart
+        # is not evidence that this process has already enqueued its request.
+        if (row.get('cancel_requested') and attempt_key in attempts
+                and time.time() - attempts[attempt_key] < 10.0):
             return False
         # Reserve cancellation on the owner thread before scheduling I/O.
         row['cancel_requested'] = True
         row['cancel_requested_epoch'] = time.time()
         row['cancel_reason'] = reason
         self.ledger.save()
+        attempts[attempt_key] = time.time()
         def complete(result, error):
             current = self.tracked.get(symbol)
             if (not current or current.get('client_order_id') != cid
@@ -762,6 +772,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 'qty': row.get('qty'),
                 'status': row.get('last_status', 'NEW'),
                 'signal_follow': bool(row.get('signal_follow')),
+                'cancel_requested': bool(row.get('cancel_requested')),
+                'cancel_reason': row.get('cancel_reason'),
                 'signal_follow_position_id': row.get('signal_follow_position_id'),
                 **{k: row[k] for k in (*QUOTE_FIELDS, 'entry_send_quote') if k in row},
             }

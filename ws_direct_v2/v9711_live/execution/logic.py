@@ -1,6 +1,6 @@
-"""Tiered admission with independent paced cancels and exact slot ownership.
+"""Tiered admission with independent paced cancels and exact order ownership.
 
-The first five physical pending entries admit <=1.85%, orders 6-8 admit <=1.65%.
+The first five active ordinary entries admit <=1.85%, orders 6-8 admit <=1.65%.
 At any count a >=0.30pp improvement rotates BEFORE filling a free slot;
 with >=5 orders the inclusive advantage is >=0.22pp. Replacements bypass the
 admission tiers. Fresh quotes strictly beyond +2.1% retire ordinary entries.
@@ -106,11 +106,11 @@ def select_physical_orders(
     pending_rotation: Mapping[str, Any] | None = None,
     ignore_position_capacity: bool = False,
 ) -> Plan:
-    """Use free slots immediately; wait only when reusing an occupied slot.
+    """Eight active ordinary entries; cancel backlog keeps exact ownership.
 
-    An unresolved victim keeps its physical slot until exact terminal evidence.
-    Other vacancies remain available. Its original order count survives the
-    victim's retirement: a five-order rotation still uses the 0.22pp margin
+    A cancellation releases admission capacity before its exchange terminal,
+    but retains its physical identity for retries and fills. The original count
+    survives retirement: a five-order rotation still uses the 0.22pp margin
     after cancellation leaves four orders. Fresh quotes also retire ordinary
     entries strictly beyond cancel_gap, independently of signal readiness.
     """
@@ -152,6 +152,10 @@ def select_physical_orders(
             reason = 'order_plan_changed'
         elif quote_row is not None and not at_most(quote_row.gap, cancel_gap):
             reason = 'entry_gap_too_far'
+        elif old.get('cancel_requested'):
+            # Revisit uncertain cancels after the owner's existing retry
+            # interval, even after a replacement has already consumed its gate.
+            reason = str(old.get('cancel_reason') or 'retry_pending_cancel')
         if reason:
             cancel.append(symbol)
             actions.append(Action('cancel', symbol, reason, order_id=old.get('order_id')))
@@ -167,8 +171,9 @@ def select_physical_orders(
         actions.append(Action('keep', symbol, 'retained_for_order_bar',
                               gap=row.gap if row else None, order_id=old.get('order_id')))
 
-    if len(tracked) > max_orders:
-        excess = len(tracked) - max_orders - len(cancel)
+    active = {s for s in kept if not tracked[s].get('cancel_requested')}
+    if len(active) > max_orders:
+        excess = len(active) - max_orders
         for symbol in sorted(kept, key=lambda s: (-ranked[s].gap if s in ranked else float('-inf'), s))[:max(0, excess)]:
             cancel.append(symbol)
             kept.remove(symbol)
@@ -183,13 +188,18 @@ def select_physical_orders(
         return Plan(tuple(sorted(kept)), tuple(placed), tuple(cancel), tuple(actions),
                     rotation, rotation_action if state is None else state, replacement)
 
+    def active_count():
+        queued = set(cancel)
+        return sum(not old.get('cancel_requested') and symbol not in queued
+                   for symbol, old in tracked.items())
+
     def fill_independent_vacancies(excluded=(), reserved=0):
-        # A cancel keeps its OWN physical slot, never a global admission lock.
-        # A locally missing but unconfirmed victim reserves one virtual slot.
+        # Queued cancels no longer consume ordinary admission capacity. A
+        # locally missing/unrecoverable victim still reserves an unknown slot.
         placed = []
         for candidate in sorted((r for s, r in rows.items()
                 if s not in tracked and s not in excluded), key=lambda r: (r.gap, r.symbol)):
-            count = len(tracked)+reserved+len(placed)
+            count = active_count()+reserved+len(placed)
             if count >= max_orders:
                 break
             if at_most(candidate.gap, policy.admission_gap(count)):
@@ -208,8 +218,8 @@ def select_physical_orders(
 
     if slots == 0:
         return result(state='clear' if pending_rotation else rotation_action)
-    # Keep exact victim accounting, but let independent physical vacancies send
-    # immediately. The victim's occupied slot cannot be reused before terminal.
+    # Legacy reservations can complete before the victim's cancel ACK. Keep
+    # that victim's exact row until terminal; never erase it to create capacity.
     if pending_rotation:
         victim = str(pending_rotation.get('victim') or '')
         current = tracked.get(victim)
@@ -227,9 +237,9 @@ def select_physical_orders(
             actions.append(Action('defer', str(pending_rotation.get('challenger') or ''),
                                   'await_reserved_rotation_terminal'))
             candidates = replacement_candidates(pending_rotation) if signal_ready else []
-            if len(tracked) < max_orders and candidates:
+            if active_count() < max_orders and candidates:
                 best = candidates[0]
-                actions.append(Action('place', best.symbol, 'replacement_uses_existing_free_slot',
+                actions.append(Action('place', best.symbol, 'replacement_before_cancel_ack',
                     best.limit_price, best.notional, best.gap, best.observed_price))
                 return result((best,), state='consume', replacement=best.symbol)
             placed = fill_independent_vacancies((victim, pending_rotation.get('challenger'))) if signal_ready else ()
@@ -240,7 +250,7 @@ def select_physical_orders(
                                   'rotation_victim_fate_unknown'))
             placed = fill_independent_vacancies((victim, pending_rotation.get('challenger')), reserved=1) if signal_ready else ()
             return result(placed)
-        if not signal_ready or len(tracked) >= max_orders:
+        if not signal_ready or active_count() >= max_orders:
             return result()
         original_count = int(_finite(pending_rotation.get('original_order_count')))
         # Apply v7 even to an in-progress v6 reservation after restart. Do not
@@ -266,7 +276,7 @@ def select_physical_orders(
         return result()
     challengers = sorted((r for s, r in rows.items() if s not in tracked),
                          key=lambda r: (r.gap, r.symbol))
-    count = len(tracked)
+    count = active_count()
     # Relative improvement takes priority at every nonempty order count.
     active_kept = {s for s in kept if not tracked[s].get('cancel_requested')}
     if active_kept and len(ranked) == len(active_kept):
@@ -289,16 +299,11 @@ def select_physical_orders(
             r = ranked[worst]
             actions.append(Action('cancel', worst, 'replaced_by_closer', r.limit_price,
                                   r.notional, r.gap, r.observed_price, old.get('order_id')))
-            if count < max_orders:
-                actions.append(Action('place', best.symbol, 'replacement_uses_existing_free_slot',
-                    best.limit_price, best.notional, best.gap, best.observed_price))
-                return result((best,), rotation=rotation, state='reserve', replacement=best.symbol)
-            actions.append(Action('defer', best.symbol, 'await_cancel_terminal_before_replace',
-                                  best.limit_price, best.notional, best.gap, best.observed_price))
-            return result(rotation=rotation, state='reserve')
+            actions.append(Action('place', best.symbol, 'replacement_before_cancel_ack',
+                best.limit_price, best.notional, best.gap, best.observed_price))
+            return result((best,), rotation=rotation, state='reserve', replacement=best.symbol)
 
-    # Normal (non-rotation) cancellation reserves only its own slot; preserve
-    # independent admissions while unrelated I/O is pending.
+    # Old canceled identities remain tracked, outside the active admission cap.
     placed = []
     for r in challengers:
         current_count = count + len(placed)

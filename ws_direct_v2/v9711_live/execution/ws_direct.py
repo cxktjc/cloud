@@ -252,7 +252,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         # Empty books cannot admit a quote outside the first tier; full books
         # cannot rotate without the required improvement. A conservative heap
         # bound avoids a full plan but never drops a crossing or incumbent event.
-        ordinary = {s: r for s, r in self.tracked.items() if not r.get('signal_follow')}
+        ordinary = {s: r for s, r in self.tracked.items()
+                    if not r.get('signal_follow') and not r.get('cancel_requested')}
         if (status == 'valid' and previous_revision == self._template_file_revision and not completed
                 and len(ordinary) in (0, cfg.MAX_PENDING_ORDERS)
                 and tick.symbol not in self.tracked and tick.symbol not in self.positions and tick.symbol not in targets

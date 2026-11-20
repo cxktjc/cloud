@@ -66,6 +66,8 @@ class GapPolicy:
                     rotation_ignores_admission_tiers=True,
                     underfilled_rotation_before_vacancy_fill=True,
                     cancel_terminal_before_replacement=False,
-                    cancel_terminal_before_slot_reuse=True,
+                    cancel_terminal_before_slot_reuse=False,
+                    cancel_terminal_before_retire=True,
+                    cancel_backlog_may_exceed_pending_cap=True,
                     underfilled_replacement_uses_free_slot=True,
                     cancel_queue_blocks_independent_entries=False)

@@ -16,6 +16,7 @@ from v9711_live.execution import client as client_module
 from v9711_live.execution.client import ExchangeClient, OwnershipLedger
 from v9711_live.execution.logic import select_physical_orders
 from v9711_live.execution.nonblocking_io import NetworkIO
+from v9711_live.execution.submit_errors import ConfirmedSubmitRejection
 
 
 class DurableSaveTests(unittest.TestCase):
@@ -107,7 +108,7 @@ class IndependentRotationTests(unittest.TestCase):
         tracked['OLD0'] = dict(row('OLD0', .02), cancel_requested=True)
         tracked['OLD1'] = row('OLD1', .019)
         plan = select_physical_orders([*tracked.values(), row('NEW', .0167)], tracked)
-        self.assertEqual(plan.cancel, ('OLD1',))
+        self.assertEqual(plan.cancel, ('OLD0', 'OLD1'))
         self.assertEqual([r.symbol for r in plan.place], ['NEW'])
         self.assertEqual(plan.rotation_placement, 'NEW')
         self.assertGreater(plan.place[0].gap, cfg.FILL_PLACE_GAP)
@@ -168,6 +169,7 @@ class FlashOwnerTests(unittest.TestCase):
     place = fixtures.DualAdmissionTests.place
     cancel = fixtures.DualAdmissionTests.cancel
     publish = fixtures.DualAdmissionTests.publish
+    held = fixtures.DualAdmissionTests.held
 
     def plans(self, count):
         self.targets = []
@@ -276,7 +278,8 @@ class FlashOwnerTests(unittest.TestCase):
             self.assertTrue(sent.wait(.5), 'a free-slot entry waited behind cancellation')
             self.assertIn('N1USDT', self.trade.tracked)
             self.assertIn('N5USDT', self.trade.tracked)
-            self.assertEqual(self.trade._ordinary_pending_count(), 6)
+            self.assertEqual(self.trade._ordinary_pending_count(), 5)
+            self.assertEqual(len(self.trade.tracked), 6)
             if cooling:
                 self.assertFalse(started.is_set())
             else:
@@ -287,7 +290,8 @@ class FlashOwnerTests(unittest.TestCase):
             self.plans(7)
             self.event('N6USDT', 1.0177)
             self.assertTrue(second_sent.wait(.5))
-            self.assertEqual(self.trade._ordinary_pending_count(), 7)
+            self.assertEqual(self.trade._ordinary_pending_count(), 5)
+            self.assertEqual(len(self.trade.tracked), 7)
             self.assertTrue(all(self.trade.tracked[s].get('cancel_requested') for s in ('N0USDT', 'N1USDT')))
             self.assertGreater(self.trade.tracked['N6USDT']['entry_gap_ceiling'], cfg.FILL_PLACE_GAP)
         finally:
@@ -325,6 +329,86 @@ class FlashOwnerTests(unittest.TestCase):
             self.assertEqual(self.trade._ordinary_pending_count(), 8)
         finally:
             self.trade.shutdown_io()
+
+    def test_full_eight_can_overlap_two_cancels_then_restart_without_duplicate(self):
+        self.plans(8)
+        self.event('N0USDT', 1.01)
+        io = NetworkIO(workers=2)
+        io._entry_cancel_after = time.monotonic()+60
+        self.trade._network_io = self.trade.client.network_io = io
+        first, second = threading.Event(), threading.Event()
+        def place(**kwargs):
+            value = self.place(**kwargs)
+            if kwargs['symbol'] == 'N8USDT':
+                first.set()
+            if kwargs['symbol'] == 'AUSDT':
+                second.set()
+            return value
+        self.trade.client.place_limit_for_bar = Mock(side_effect=place)
+        try:
+            self.plans(9)
+            self.event('N8USDT', .99)
+            self.assertTrue(first.wait(.5))
+            self.assertEqual(len(self.trade.tracked), 9)
+            self.assertEqual(self.trade._ordinary_pending_count(), 8)
+            self.assertTrue(self.trade.ledger.owns_client(self.trade.tracked['N7USDT']['client_order_id']))
+            self.templates.append(dict(self.templates[0], symbol='AUSDT'))
+            self.publish()
+            self.event('AUSDT', .98)
+            self.assertTrue(second.wait(.5))
+            self.assertEqual(len(self.trade.tracked), 10)
+            self.assertEqual(self.trade._ordinary_pending_count(), 8)
+            self.assertEqual(len(self.cancels), 0)
+            compare = self.trade._comparison(snapshot=self.payload, price_map=self.trade.market.prices(),
+                signal_desired_count=10, priced_desired_count=10, near_place_count=10,
+                positions=self.trade.positions, open_orders=self.trade.tracked)
+            self.assertEqual(compare['capacity']['pending_order_count'], 8)
+            self.assertEqual(compare['capacity']['cancel_pending_order_count'], 2)
+            self.assertEqual(compare['capacity']['total_pending_order_count'], 10)
+        finally:
+            self.trade.shutdown_io()
+        sent_count = len(self.submits)
+        self.make_trade()
+        self.trade.market.update('AUSDT', '.98', int(self.now*1000))
+        self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        self.event('N8USDT', .99)
+        self.assertEqual(len(self.submits), sent_count)
+        self.assertEqual(len(self.cancels), 2)
+        self.assertEqual(len(self.trade.tracked), 8)
+
+    def overlap_with_failed_cancel(self):
+        self.plans(8)
+        self.event('N0USDT', 1.01)
+        self.cancel_error = TimeoutError('cancel reply unavailable')
+        self.plans(9)
+        self.event('N8USDT', .99)
+        self.assertEqual(len(self.trade.tracked), 9)
+        self.assertEqual(self.trade._ordinary_pending_count(), 8)
+        return self.trade.tracked['N7USDT']
+
+    def test_cancel_failure_retries_after_replacement_has_already_sent(self):
+        self.overlap_with_failed_cancel()
+        self.assertEqual(len(self.cancels), 1)
+        self.cancel_error = None
+        self.now += 11
+        self.publish()
+        self.event('N8USDT', .99)
+        self.assertEqual(len(self.cancels), 2)
+        self.assertNotIn('N7USDT', self.trade.tracked)
+        self.assertEqual(len(self.submits), 9)
+
+    def test_late_victim_fill_is_booked_and_still_enforces_three_positions(self):
+        old = self.overlap_with_failed_cancel()
+        self.orders[old['client_order_id']].update(status='FILLED', executedQty=str(old['qty']), avgPrice='1')
+        self.trade.reconcile_orders(now=self.now)
+        self.assertEqual(self.trade.positions['N7USDT']['quantity'], old['qty'])
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.held(2)
+        self.trade._publish_entry_gate()
+        io = object.__new__(NetworkIO)
+        io._entry_gate, io._closed = self.trade.client.entry_gate, False
+        with self.assertRaises(ConfirmedSubmitRejection):
+            io.check_entry('N8USDT', self.trade.tracked['N8USDT']['client_order_id'], self.bar)
 
 
 class ReboundTransportTests(unittest.TestCase):

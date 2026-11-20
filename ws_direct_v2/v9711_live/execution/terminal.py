@@ -150,9 +150,10 @@ class TradeTerminalView:
             f'区别部分收益: signal-only浮动={parts["signal_only_unrealized_pnl"]:+.6f}  '
             f'trade-only浮动={parts["trade_only_unrealized_pnl"]:+.6f}  '
             f'匹配仓浮动差={parts["matched_unrealized_difference_signal_minus_trade"]:+.6f}',
-            f'8挂单/3仓限制: signal目标={capacity["signal_target_count"]} '
+            f'8有效挂单/3仓限制: signal目标={capacity["signal_target_count"]} '
             f'trade持仓={capacity["actual_position_count"]} '
             f'普通挂单={capacity["pending_order_count"]} '
+            f'待撤普通={capacity.get("cancel_pending_order_count", 0)} '
             f'补挂单={capacity.get("signal_follow_order_count", 0)}/{cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS} '
             f'signal应挂单={capacity["signal_desired_count"]} '
             f'有价可评估={capacity["priced_desired_count"]} '

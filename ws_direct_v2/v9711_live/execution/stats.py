@@ -226,7 +226,9 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
     near_place_count = max(0, _as_int(near_place_count))
     pending_rows = _position_rows(open_orders)
     follow_count = sum(bool(row.get('signal_follow')) for row in pending_rows.values())
-    pending_count = len(pending_rows) - follow_count
+    cancel_count = sum(not row.get('signal_follow') and bool(row.get('cancel_requested'))
+                       for row in pending_rows.values())
+    pending_count = len(pending_rows) - follow_count - cancel_count
 
     difference = {
         'sign_convention': 'signal_minus_trade; positive means signal model is ahead',
@@ -267,7 +269,8 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
         'actual_position_count': len(actual),
         'pending_order_count': pending_count,
         'signal_follow_order_count': follow_count,
-        'total_pending_order_count': pending_count + follow_count,
+        'cancel_pending_order_count': cancel_count,
+        'total_pending_order_count': len(pending_rows),
         'signal_desired_count': signal_desired_count,
         'priced_desired_count': priced_desired_count,
         'near_place_count': near_place_count,
@@ -287,7 +290,8 @@ def compute_comparison(*, actual_positions: Any, open_orders: Any,
         'initial_equity': equity0,
         'actual': {**trade, 'pending_order_count': pending_count,
                    'signal_follow_order_count': follow_count,
-                   'total_pending_order_count': pending_count + follow_count},
+                   'cancel_pending_order_count': cancel_count,
+                   'total_pending_order_count': len(pending_rows)},
         'signal': signal,
         'difference': difference,
         'capacity': capacity,

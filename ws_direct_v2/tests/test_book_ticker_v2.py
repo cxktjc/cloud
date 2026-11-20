@@ -386,10 +386,12 @@ class DualAdmissionTests(unittest.TestCase):
         self.assertFalse(self.cancels)  # old's bid is closer: advantage <0.22pp
         self.bid(1.021, symbol='N7USDT', update_id=2)
         self.assertEqual([r['symbol'] for r in self.cancels], ['N7USDT'])
-        self.assertNotIn('N8USDT', self.trade.tracked)
-        # An unchanged bid needs no new price event. The regular owner
-        # maintenance still consumes the now-confirmed cancel reservation.
+        self.assertIn('N8USDT', self.trade.tracked)
+        # Full-book replacements send before the victim's cancel ACK.
+        # Maintenance must not submit the replacement a second time.
+        placements = len(self.submits)
         self.trade.step(now=self.now)
+        self.assertEqual(len(self.submits), placements)
         row = self.trade.tracked['N8USDT']
         self.assertAlmostEqual(row['entry_gap_ceiling'], .0188)
         self.assertTrue(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))

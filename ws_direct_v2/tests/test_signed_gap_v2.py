@@ -50,7 +50,7 @@ class SignedGapTests(unittest.TestCase):
         plan = select_physical_orders([*tracked.values(), row('NEW', -.0032)], tracked)
         self.assertEqual(plan.cancel, ('OLD7',))
         self.assertEqual(plan.rotation['challenger'], 'NEW')
-        self.assertFalse(plan.place)  # No free physical slot until the exact cancel settles.
+        self.assertEqual([r.symbol for r in plan.place], ['NEW'])
 
     def test_tick_and_bid_send_qualification_accept_negative_gaps(self):
         for tick, bid, expected in ((.8, 1.03, 'tick'), (1.03, .8, 'depth'), (.8, .9, 'all')):
