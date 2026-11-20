@@ -194,7 +194,7 @@ class TradeTerminalView:
                     lines.insert(-1, f'  {source} group={group} error={error}')
             recent = ws.get('recent_errors') or []
             if recent:
-                block = ['WS 最近报错（UTC，恢复后保留；相同错误合并计数）:']
+                block = ['WS 最近报错（UTC，恢复后连续正常 10 分钟隐藏；相同错误合并计数）:']
                 for row in recent[:5]:
                     status = '已恢复' if row.get('recovered') else '未恢复'
                     block.append(f'  {iso(row["last_epoch"]*1000)} {row["source"]} group={row["group"]} '

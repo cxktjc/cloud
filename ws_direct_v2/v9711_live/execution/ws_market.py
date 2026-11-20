@@ -19,6 +19,7 @@ from ..contracts import atomic_write_json, utc_now_iso
 from collectors import ticker_ws
 
 LOG = logging.getLogger('v9711.ws_direct.market')
+RECOVERED_ERROR_HIDE_SECONDS = 10 * 60
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class DirectMarket:
         self.receipts = {}
         self.errors = {}
         self.error_history = []
+        self._recovered_since = {}
         self._overflow_groups = set()
         self.latest_ingress = {}
         self.processed = {}  # owner thread only
@@ -80,12 +82,14 @@ class DirectMarket:
             self.generation[index] += 1
             self._overflow_groups.discard(index)
             self.receipts.pop(index, None)
+            self._recovered_since.pop(index, None)
             self.errors[index] = 'waiting_for_first_data'
         self._wake()
 
     def group_failed(self, index, message):
         with self._lock:
             self.receipts.pop(index, None)
+            self._recovered_since.pop(index, None)
             self.errors[index] = str(message)
             if message not in ('scheduled reconnect', 'collector stopped'):
                 detail = str(message)[:700]
@@ -102,10 +106,22 @@ class DirectMarket:
 
     def recent_errors(self):
         with self._lock:
-            return [dict(row, source='depth' if self.source == 'bid0' else 'tick',
-                         recovered=(row['group'] in self.receipts and row['group'] not in self.errors
-                                    and time.monotonic()-self.receipts[row['group']][0] <= ticker_ws.MAX_SILENCE_SECONDS))
-                    for row in self.error_history]
+            now = time.monotonic()
+            visible, retained = [], []
+            for row in self.error_history:
+                group = row['group']
+                recovered = (group in self.receipts and group not in self.errors
+                             and now-self.receipts[group][0] <= ticker_ws.MAX_SILENCE_SECONDS)
+                if not recovered:
+                    self._recovered_since.pop(group, None)
+                since = self._recovered_since.get(group)
+                if recovered and since is not None and now-since >= RECOVERED_ERROR_HIDE_SECONDS:
+                    continue  # Retire panel history only; the full log remains on disk.
+                retained.append(row)
+                visible.append(dict(row, source='depth' if self.source == 'bid0' else 'tick',
+                                    recovered=recovered))
+            self.error_history[:] = retained
+            return visible
 
     def group_received(self, index):
         pass  # update() validates/marks receipt before making its event visible
@@ -139,7 +155,14 @@ class DirectMarket:
                     return True
                 self._overflow_groups.discard(group)
                 old = None  # the recovery quote must reach the owner
-            self.receipts[group] = (time.monotonic(), now)
+            receipt_time = time.monotonic()
+            previous_receipt = self.receipts.get(group)
+            if (group in self.errors or previous_receipt is None
+                    or receipt_time-previous_receipt[0] > ticker_ws.MAX_SILENCE_SECONDS):
+                self._recovered_since[group] = receipt_time
+            else:
+                self._recovered_since.setdefault(group, receipt_time)
+            self.receipts[group] = (receipt_time, now)
             self.errors.pop(group, None)
             if (self.dedupe_unchanged and not self.overloaded and old and old.generation == generation
                     and old.valid == valid and float(old.price) == value):

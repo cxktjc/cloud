@@ -122,6 +122,105 @@ class DualMarketTests(unittest.TestCase):
         self.assertNotIn('collector stopped', str(self.market.book.error_history))
 
 
+class WSRecoveryHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.elapsed = 0.
+        self.epoch = time.time()
+        for target, clock in (('time.monotonic', lambda: self.elapsed),
+                              ('time.time', lambda: self.epoch+self.elapsed)):
+            patcher = patch(target, side_effect=clock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.market = DualMarket(['XUSDT', 'YUSDT'], Path(self.tmp.name)/'prices.json', group_size=1)
+        self.feed = self.market.book
+        self.feed.group_failed(1, 'disconnected')
+
+    def receive(self, elapsed, group=1):
+        self.elapsed = elapsed
+        symbol = 'XUSDT' if group == 1 else 'YUSDT'
+        self.assertTrue(self.feed.update(symbol, '1', int(time.time()*1000)))
+
+    def keep_receiving(self, start, end, group=1):
+        elapsed = start
+        while elapsed < end:
+            self.receive(elapsed, group)
+            elapsed += 20
+        self.receive(end, group)
+
+    def test_recovered_error_retires_at_ten_minutes_of_valid_data(self):
+        self.keep_receiving(0, 599.999)
+        self.assertTrue(self.feed.recent_errors()[0]['recovered'])
+        self.receive(600)
+        self.assertEqual(self.feed.recent_errors(), [])
+        self.assertEqual(self.feed.error_history, [])
+        self.feed.group_failed(1, 'another disconnect')
+        self.assertEqual([row['error'] for row in self.feed.recent_errors()], ['another disconnect'])
+
+    def test_recurrence_resets_timer_and_merges_count(self):
+        self.keep_receiving(0, 500)
+        self.feed.group_failed(1, 'disconnected')
+        self.assertFalse(self.feed.recent_errors()[0]['recovered'])
+        self.keep_receiving(510, 1109)
+        row = self.feed.recent_errors()[0]
+        self.assertEqual(row['count'], 2)
+        self.assertTrue(row['recovered'])
+        self.receive(1110)
+        self.assertEqual(self.feed.recent_errors(), [])
+
+    def test_reconnect_and_invalid_data_do_not_start_recovery_timer(self):
+        self.elapsed = 2000
+        self.feed.group_connected(1)
+        self.assertFalse(self.feed.update('XUSDT', '1', int((time.time()-120)*1000)))
+        self.assertFalse(self.feed.recent_errors()[0]['recovered'])
+        self.keep_receiving(2001, 2600)
+        self.assertTrue(self.feed.recent_errors()[0]['recovered'])
+        self.receive(2601)
+        self.assertEqual(self.feed.recent_errors(), [])
+
+    def test_scheduled_reconnect_restarts_continuous_recovery(self):
+        self.keep_receiving(0, 500)
+        self.feed.group_failed(1, 'scheduled reconnect')
+        self.feed.group_connected(1)
+        self.keep_receiving(510, 1109)
+        self.assertEqual(len(self.feed.recent_errors()), 1)
+        self.receive(1110)
+        self.assertEqual(self.feed.recent_errors(), [])
+
+    def test_silent_gap_restarts_timer_even_without_panel_refresh(self):
+        for refresh_during_gap in (False, True):
+            with self.subTest(refresh_during_gap=refresh_during_gap):
+                self.feed.group_failed(1, 'disconnected')
+                start = self.elapsed+1
+                self.keep_receiving(start, start+500)
+                self.elapsed = start+531
+                if refresh_during_gap:
+                    self.assertFalse(self.feed.recent_errors()[0]['recovered'])
+                self.keep_receiving(start+531, start+1130)
+                self.assertTrue(self.feed.recent_errors()[0]['recovered'])
+                self.receive(start+1131)
+                self.assertEqual(self.feed.recent_errors(), [])
+
+    def test_other_groups_and_sources_cannot_expire_unrecovered_errors(self):
+        self.feed.group_failed(2, 'depth group 2 down')
+        self.market.group_failed(1, 'tick group 1 down')
+        self.keep_receiving(0, 600)
+        rows = self.market.metrics()['recent_errors']
+        self.assertEqual({(row['source'], row['group']) for row in rows}, {('depth', 2), ('tick', 1)})
+        self.assertTrue(all(not row['recovered'] for row in rows))
+        self.elapsed = 10000
+        self.assertEqual(len(self.market.metrics()['recent_errors']), 2)
+
+    def test_wall_clock_jump_does_not_expire_recovered_error(self):
+        self.keep_receiving(0, 300)
+        self.epoch += 86400
+        self.keep_receiving(320, 599)
+        self.assertTrue(self.feed.recent_errors()[0]['recovered'])
+        self.receive(600)
+        self.assertEqual(self.feed.recent_errors(), [])
+
+
 class DualAdmissionTests(unittest.TestCase):
     setUp = fixtures.CapacityGateTests.setUp
     target = fixtures.CapacityGateTests.target
