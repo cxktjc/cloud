@@ -163,7 +163,7 @@ class AccountStreamView:
             db.close()
 
     def manual_flat_evidence(self, *, symbol: str, since_ms: int,
-                             owned_qty: float, excluded_client_ids=()) -> dict[str, Any] | None:
+                             owned_qty: float, excluded_client_ids=(), diagnostics=None) -> dict[str, Any] | None:
         """Explicit LONG-flat account state plus sufficient non-bot SELL fills.
 
         Aggregate account state alone is not enough to book a strategy close.
@@ -171,6 +171,8 @@ class AccountStreamView:
         exclude this executor's already reconciled close IDs to avoid double
         counting. Full REST snapshot absence is accepted only after its fence.
         """
+        info = diagnostics if isinstance(diagnostics, dict) else {}
+        info.update(reason='checking', since_ms=since_ms, owned_qty=owned_qty)
         self.health()
         if since_ms <= 0 or owned_qty <= 0:
             return None
@@ -186,12 +188,15 @@ class AccountStreamView:
                                  (symbol + ':LONG',)).fetchone()
             fence_row = db.execute("SELECT value FROM meta WHERE key='snapshot_fence_ms'").fetchone()
             fence = int(_finite(json.loads(fence_row[0]))) if fence_row else 0
+            info['snapshot_fence_ms'] = fence
             if current:
                 version, raw = current
                 row = json.loads(raw)
+                info.update(account_version_ms=int(version), account_quantity=row.get('quantity'))
                 if (_text(row.get('symbol')).upper() != symbol
                         or row.get('position_side') != 'LONG'
                         or _finite(row.get('quantity'), float('nan')) != 0):
+                    info['reason'] = 'account_LONG_not_zero'
                     return None
                 flat_ms = int(version)
                 if row.get('source') == 'REST_BOOTSTRAP':
@@ -200,8 +205,11 @@ class AccountStreamView:
             elif fence >= since_ms:
                 flat_ms, flat_basis = fence, 'post_entry_full_REST_snapshot_absence'
             else:
+                info.update(reason='no_post_entry_flat_snapshot', flat_candidate_ms=fence)
                 return None
+            info['flat_candidate_ms'] = flat_ms
             if flat_ms < since_ms:
+                info['reason'] = 'flat_before_entry_lower_bound'
                 return None
             fills = []
             for transaction_ms, raw in db.execute(
@@ -238,7 +246,10 @@ class AccountStreamView:
                 if remaining <= max(1e-12, owned_qty * 1e-9):
                     break
             if remaining > max(1e-12, owned_qty * 1e-9):
+                info.update(reason='insufficient_external_SELL_fills',
+                            matched_quantity=owned_qty-remaining, missing_quantity=remaining)
                 return None
+            info.update(reason='confirmed', matched_quantity=owned_qty)
             return dict(symbol=symbol, account_id=self.account_id, orders=allocated,
                         closed_owned_qty=float(owned_qty), average_price=quote/owned_qty,
                         flat_version_ms=flat_ms, flat_basis=flat_basis,

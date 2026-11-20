@@ -4,6 +4,7 @@ import logging
 from .stream import StreamUnavailable
 from .. import config as cfg
 from .position_identity import position_identity
+from .order_identity import exact_entry_fill_time_ms
 
 LOG = logging.getLogger('v9711_live_trade')
 
@@ -23,15 +24,38 @@ class ManualCloseMixin:
         for symbol, pos in list(self.positions.items()):
             if pos.get('side') != 'LONG':
                 continue
-            since_ms = int(max(self._finite(pos.get('order_bar_open_ms')),
-                               self._finite(pos.get('entry_epoch')) * 1000,
-                               self._finite(pos.get('external_evidence_since_ms'))))
+            fence = max(self._finite(pos.get('order_bar_open_ms')),
+                        self._finite(pos.get('external_evidence_since_ms')))
+            entry_time = self._finite(pos.get('entry_fill_time_ms')) or self._finite(pos.get('entry_epoch'))*1000
+            since_ms = int(max(fence, entry_time))
             own_close = str(pos.get('close_client_order_id') or '')
             try:
+                diagnostics = {}
                 evidence = self.client.stream.manual_flat_evidence(
                     symbol=symbol, since_ms=since_ms,
                     owned_qty=self._finite(pos.get('quantity')),
-                    excluded_client_ids=(own_close,))
+                    excluded_client_ids=(own_close,), diagnostics=diagnostics)
+                if (not evidence and not pos.get('entry_fill_time_ms')
+                        and diagnostics.get('flat_candidate_ms', 0) > 0):
+                    # Upgrade legacy delayed-booking positions only from this
+                    # exact entry's retained BUY trades. Do not weaken the
+                    # adoption/sync fence or infer an entry from symbol totals.
+                    entry = self.client.stream.lookup_order(symbol=symbol,
+                        order_id=pos.get('entry_order_id'),
+                        client_order_id=str(pos.get('entry_client_order_id') or ''))
+                    actual = exact_entry_fill_time_ms(entry, symbol=symbol,
+                        order_id=pos.get('entry_order_id'),
+                        client_order_id=str(pos.get('entry_client_order_id') or ''))
+                    corrected = int(max(fence, actual))
+                    if actual > 0 and corrected < since_ms:
+                        evidence = self.client.stream.manual_flat_evidence(
+                            symbol=symbol, since_ms=corrected, owned_qty=self._finite(pos.get('quantity')),
+                            excluded_client_ids=(own_close,), diagnostics=diagnostics)
+                        if evidence:
+                            evidence = dict(evidence, recovered_entry_fill_time_ms=actual,
+                                            previous_since_ms=since_ms, corrected_since_ms=corrected)
+                if not evidence and diagnostics.get('flat_candidate_ms', 0) > 0:
+                    self._close_warning(symbol, 'manual-flat evidence pending: '+str(diagnostics), now=now)
             except StreamUnavailable as exc:
                 self._close_warning(symbol, str(exc), now=now)
                 continue

@@ -52,6 +52,10 @@ trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bo
   日志附连接存续时间、收包/有效数。Python 3.11+ 接收不再为每条报文创建额外 Task，
   并每 64 帧让出执行机会，避免单组缓冲持续占用事件循环；Python 3.10 保留兼容路径。
   面板显示接收/决策速率、队列/峰值、未变买一更新数、远价快速处理数与过载丢弃数。
+- 手动平仓对账：新仓保存精确入场订单的交易所成交时间，筛选后续平仓证据时不再以延迟的本地记账时间为起点。
+  旧仓若已看到归零而没有匹配到 SELL，可从同一精确入场 CID/OID 的账户 BUY 成交恢复时间下界，
+  再核对归零与足量外部 SELL。仍保留导入/同步后的时间屏障，不凭价格或交易所总仓位删除策略持仓。
+  证据仍不足会在 trade.log 写出 `manual-flat evidence pending`、筛选起点、归零时间、匹配量/缺量。
 
 仍从本目录使用原 `v9711_live.execution.runner` 启动 trade；进程内部启动两路订阅，不需要额外行情进程。
 接口依据：[Binance USDⓈ-M bookTicker 文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#individual-symbol-book-ticker-streams)。

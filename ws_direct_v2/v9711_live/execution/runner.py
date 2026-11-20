@@ -48,7 +48,7 @@ from .cancel_pacing import exact_entry_cancel_key
 from .session_entries import SessionEntryStats
 from .nonblocking_io import NetworkTradeMixin
 from .submit_errors import require_submit_ack, submit_error_is_ambiguous, EntryQuoteUnavailable
-from .order_identity import matches_order_identity
+from .order_identity import matches_order_identity, exact_entry_fill_time_ms
 from .entry_quotes import QUOTE_FIELDS
 from .stream import StreamUnavailable
 from .terminal import TradeTerminalView, MarketConsoleFilter
@@ -268,6 +268,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             self.positions[symbol] = {
                 'symbol': symbol, 'side': 'LONG', 'entry_price': delta_quote / delta,
                 'quantity': delta, 'entry_epoch': time.time(),
+                'entry_fill_time_ms': exact_entry_fill_time_ms(order, symbol=symbol,
+                    client_order_id=str(row.get('client_order_id') or ''),
+                    order_id=row.get('order_id'), allow_update_time=True),
                 **{k: row[k] for k in ('sizing_weight', 'sizing_position_count', 'sizing_balance', 'sizing_raw_notional') if k in row},
                 'exit_due_epoch': self._finite(row.get('exit_due_epoch')),
                 'exit_due_ms': int(self._finite(row.get('exit_due_ms'))),
