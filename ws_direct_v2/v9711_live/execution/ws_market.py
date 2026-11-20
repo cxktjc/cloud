@@ -1,7 +1,8 @@
 """WS ingress -> owner decision -> committed mirror, never file -> decision.
 
 Receiver and snapshot writer are independent of the execution state owner.
-Every accepted tick is queued, not last-price-coalesced before admission.
+Every price/validity change is queued, not last-price-coalesced before admission.
+Identical consecutive book prices only refresh receipt/quantity freshness.
 Overflow, stale backlog, reconnect generations and silence fail closed.
 """
 from __future__ import annotations
@@ -34,8 +35,9 @@ class Tick:
 
 
 class DirectMarket:
-    def __init__(self, symbols, output: Path, *, group_size=200, queue_size=None, source='tick'):
+    def __init__(self, symbols, output: Path, *, group_size=200, queue_size=None, source='tick', dedupe_unchanged=False):
         self.source = source
+        self.dedupe_unchanged = dedupe_unchanged
         self.symbols = tuple(symbols)
         self.output = Path(output)
         self.groups = [list(self.symbols[i:i+group_size]) for i in range(0, len(self.symbols), group_size)]
@@ -48,13 +50,18 @@ class DirectMarket:
         self.receipts = {}
         self.errors = {}
         self.error_history = []
+        self._overflow_groups = set()
         self.latest_ingress = {}
         self.processed = {}  # owner thread only
         self.committed = {}
         self.committed_receipts = {}
         self.sequence = 0
         self.overloaded = False
-        self.counts = dict(received=0, decided=0, rejected_old=0, rejected_backlog=0, overflow=0)
+        self.counts = dict(received=0, decided=0, rejected_old=0, rejected_backlog=0, overflow=0,
+                           enqueued=0, unchanged=0, overload_discarded=0)
+        self._rate_sample = (time.monotonic(), 0, 0)
+        self._rates = (0., 0.)
+        self.queue_peak = 0
         self.latencies_us = []
         self.admission_latencies_us = []
         self._closing = threading.Event()
@@ -71,6 +78,7 @@ class DirectMarket:
     def group_connected(self, index):
         with self._lock:
             self.generation[index] += 1
+            self._overflow_groups.discard(index)
             self.receipts.pop(index, None)
             self.errors[index] = 'waiting_for_first_data'
         self._wake()
@@ -119,18 +127,47 @@ class DirectMarket:
             if old and stamp < old.exchange_ms:
                 self.counts['rejected_old'] += 1
                 return False
-            self.receipts[group] = (time.monotonic(), now)
-            self.errors.pop(group, None)
             tick = Tick(symbol, str(price), stamp, received_ns, group, generation, self.source, valid, quantity)
             self.latest_ingress[symbol] = tick
             self.counts['received'] += 1
+            if group in self._overflow_groups:
+                # The explicit overflow has revoked ALL queued prices of this
+                # generation. Keep the socket draining, but admit no old work.
+                watermark = min(256, self.events.maxsize//4) if self.events.maxsize else 256
+                if self.events.qsize() > watermark:
+                    self.counts['overload_discarded'] += 1
+                    return True
+                self._overflow_groups.discard(group)
+                old = None  # the recovery quote must reach the owner
+            self.receipts[group] = (time.monotonic(), now)
+            self.errors.pop(group, None)
+            if (self.dedupe_unchanged and not self.overloaded and old and old.generation == generation
+                    and old.valid == valid and float(old.price) == value):
+                # Only consecutive identical decision inputs are redundant.
+                # A->B->A is always three events; zero quantity is a change.
+                self.counts['unchanged'] += 1
+                return True
         try:
             self.events.put_nowait(tick)
         except queue.Full:
-            self.counts['overflow'] += 1
-            self.group_failed(group, 'WS owner queue overflow; admissions disabled')
-            raise BufferError('WS decision queue overflow; reconnect without silent coalescing')
+            with self._lock:
+                self.counts['overflow'] += 1
+                self.counts['overload_discarded'] += 1
+                self.generation[group] += 1
+                self._overflow_groups.add(group)
+                self.group_failed(group, 'WS owner queue overflow; old generation revoked; socket kept open')
+            raise BufferError('WS decision queue overflow; old generation revoked; draining without reconnect')
+        self.counts['enqueued'] += 1
+        self.queue_peak = max(self.queue_peak, self.events.qsize())
         return True
+
+    def quote_tick(self, symbol, tick):
+        """Refresh unchanged book timestamps without publishing a new price."""
+        latest = self.latest_ingress.get(symbol)
+        if (self.dedupe_unchanged and latest and tick and latest.generation == tick.generation
+                and latest.valid == tick.valid and float(latest.price) == float(tick.price)):
+            return latest
+        return tick
 
     def healthy(self):
         with self._lock:
@@ -222,9 +259,16 @@ class DirectMarket:
 
     def metrics(self):
         with self._lock:
+            now = time.monotonic()
+            previous, received, decided = self._rate_sample
+            if now-previous >= 1:
+                self._rates = ((self.counts['received']-received)/(now-previous),
+                               (self.counts['decided']-decided)/(now-previous))
+                self._rate_sample = (now, self.counts['received'], self.counts['decided'])
             values = sorted(self.latencies_us)
             percentile = lambda p: values[min(len(values)-1, int((len(values)-1)*p))] if values else None
-            return dict(self.counts, queue=self.events.qsize(), healthy=self.healthy(),
+            return dict(self.counts, queue=self.events.qsize(), queue_peak=self.queue_peak,
+                        receive_per_second=self._rates[0], decide_per_second=self._rates[1], healthy=self.healthy(),
                         subscribed=len(self.symbols), received_symbols=len(self.processed),
                         fresh_symbols=len(self.prices()),
                         receive_to_decision_us_p50=percentile(.5),
@@ -296,11 +340,10 @@ class DualMarket(DirectMarket):
     """Independent aggTrade/bookTicker feeds; only aggTrade values mark positions."""
     def __init__(self, symbols, output, **kwargs):
         super().__init__(symbols, output, **kwargs)
-        self.book = DirectMarket(symbols, output, source='bid0', **kwargs)
+        self.book = DirectMarket(symbols, output, source='bid0', dedupe_unchanged=True, **kwargs)
         self.book.events = self.events  # one owner, distinct per-feed generations
         self.book.update_book = self.update_book
         self._book_ids = {}
-        self.bid_quantities = {}
 
     def update_book(self, symbol, bid, quantity, stamp, update_id):
         try:
@@ -323,6 +366,7 @@ class DualMarket(DirectMarket):
     def _quote(self, feed, symbol, tick=None):
         with feed._lock:
             tick = feed.processed.get(symbol) if tick is None else tick
+            tick = feed.quote_tick(symbol, tick)
             if (self._closing.is_set() or feed.overloaded or -1 in self.errors or not tick or not tick.valid
                     or tick.group in feed.errors or tick.group not in feed.receipts
                     or tick.generation != feed.generation[tick.group]
@@ -348,8 +392,11 @@ class DualMarket(DirectMarket):
         tick, bid = self._quote(self, symbol), self._quote(self.book, symbol)
         candidates = [(price, source) for price, source in ((tick, 'tick'), (bid, 'bid0')) if price is not None]
         selected, source = min(candidates, default=(None, None))
+        with self.book._lock:
+            book_tick = self.book.quote_tick(symbol, self.book.processed.get(symbol))
+            quantity = float(book_tick.quantity or 0) if book_tick and bid is not None else None
         return dict(tick=tick, bid0=bid, selected=selected, source=source,
-                    bid_quantity=self.bid_quantities.get(symbol))
+                    bid_quantity=quantity)
 
     def entry_prices(self, symbols=None):
         return {symbol: price for symbol in (self.symbols if symbols is None else symbols)
@@ -374,10 +421,7 @@ class DualMarket(DirectMarket):
 
     def decide(self, tick, callback):
         if tick is not None and tick.source == 'bid0':
-            def decide_book(event):
-                self.bid_quantities[event.symbol] = float(event.quantity or 0)
-                return callback(event)
-            return self.book.decide(tick, decide_book)
+            return self.book.decide(tick, callback)
         return super().decide(tick, callback)
 
     def metrics(self):
@@ -386,8 +430,13 @@ class DualMarket(DirectMarket):
         for suffix, fraction in (('p50', .5), ('p95', .95), ('p99', .99)):
             result['receive_to_decision_us_'+suffix] = values[int((len(values)-1)*fraction)] if values else None
         result['receive_to_decision_us_max'] = max(values, default=None)
-        for key in ('received', 'decided', 'rejected_old', 'rejected_backlog', 'overflow'):
+        book_metrics = self.book.metrics()
+        for key in ('received', 'decided', 'rejected_old', 'rejected_backlog', 'overflow',
+                    'enqueued', 'unchanged', 'overload_discarded'):
             result[key] += self.book.counts[key]
+        result['queue_peak'] = max(self.queue_peak, self.book.queue_peak)
+        result['receive_per_second'] += book_metrics['receive_per_second']
+        result['decide_per_second'] += book_metrics['decide_per_second']
         result.update(bid0_symbols=sum(self._quote(self.book, s) is not None for s in self.symbols),
                       entry_symbols=len(self.entry_prices()),
                       book_received=self.book.counts['received'], book_decided=self.book.counts['decided'],

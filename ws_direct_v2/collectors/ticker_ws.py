@@ -38,6 +38,7 @@ BOOK_WS_BASE = "wss://fstream.binance.com/public/stream"
 DEFAULT_WS_BASES = (WS_BASE, BOOK_WS_BASE, "wss://fstream.binance.com/stream")
 FIRST_DATA_TIMEOUT = 15.0
 MAX_SILENCE_SECONDS = 30.0
+STABLE_CONNECTION_SECONDS = 30.0
 
 
 def endpoint_candidates(base: str, stream_kind='aggTrade') -> tuple[str, ...]:
@@ -224,6 +225,8 @@ async def consume_group(
         started = time.monotonic()
         selected_base = endpoints[endpoint_index % len(endpoints)]
         received = False
+        connected_at = None
+        raw_count = valid_count = 0
         try:
             url = stream_url(group, selected_base, stream_kind)
             LOG.info("market stream=%s group=%s connecting symbols=%s endpoint=%s proxy=disabled/direct",
@@ -254,14 +257,23 @@ async def consume_group(
                     if remaining <= 0:
                         raise TimeoutError(f"no valid {stream_kind}; received_messages={raw_count} valid={valid_count} rejected={rejected}")
                     try:
-                        raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
+                        if hasattr(asyncio, 'timeout'):
+                            # Python 3.11+: avoid creating a separate Task for
+                            # every frame on high-rate bookTicker connections.
+                            async with asyncio.timeout(remaining):
+                                raw = await socket.recv()
+                        else:
+                            raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
                     except asyncio.TimeoutError as exc:
                         raise TimeoutError(
                             f"no valid {stream_kind}; endpoint={selected_base} received_messages={raw_count} "
                             f"valid={valid_count} rejected={rejected} waiting_for={'next_data' if received else 'first_data'}") from exc
-                    if hasattr(state, '_last_wire_ns'):
-                        state._last_wire_ns = time.monotonic_ns()
+                    wire_ns = time.monotonic_ns()
                     raw_count += 1
+                    if raw_count % 64 == 0:
+                        # recv() may complete synchronously from a full buffer.
+                        # Give other groups, pings and reconnects a fair turn.
+                        await asyncio.sleep(0)
                     message = json.loads(raw)
                     if not isinstance(message, dict):
                         raise ValueError("expected JSON object from combined stream")
@@ -289,8 +301,21 @@ async def consume_group(
                     if not -5 <= time.time() - stamp / 1000 <= live_cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS:
                         reject('stale_or_future_timestamp')
                         continue
-                    accepted = (state.update_book(symbol, data.get('b'), data.get('B'), stamp, data.get('u'))
-                                if stream_kind == 'bookTicker' else state.update(symbol, str(data.get('p', '')), stamp))
+                    if hasattr(state, '_last_wire_ns'):
+                        # Set immediately before update: another group may
+                        # have run during the explicit fairness yield above.
+                        state._last_wire_ns = wire_ns
+                    try:
+                        accepted = (state.update_book(symbol, data.get('b'), data.get('B'), stamp, data.get('u'))
+                                    if stream_kind == 'bookTicker' else state.update(symbol, str(data.get('p', '')), stamp))
+                    except BufferError as exc:
+                        # Local overload is NOT a failed socket. The market
+                        # revoked its old generation and blocks until drained.
+                        # Reading must continue so TCP/ping buffers can drain.
+                        LOG.warning('market stream=%s group=%s local overload; socket kept open: %s',
+                                    stream_kind, group_index, exc)
+                        last_data_at = time.monotonic()
+                        continue
                     if not accepted:
                         reject('invalid_or_duplicate_quote')
                         continue
@@ -299,7 +324,6 @@ async def consume_group(
                     valid_count += 1
                     if not received:
                         received = True
-                        retry = 1.0
                         LOG.info("market stream=%s group=%s DATA READY endpoint=%s first_symbol=%s latency=%.3fs",
                                  stream_kind, group_index, selected_base, symbol, last_data_at - started)
         except asyncio.CancelledError:
@@ -307,8 +331,12 @@ async def consume_group(
             raise
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"[:700]
-            LOG.warning("market stream=%s group=%s disconnected endpoint=%s proxy=disabled/direct retry=%.1fs error=%s",
-                        stream_kind, group_index, selected_base, retry, detail)
+            lifetime = time.monotonic()-connected_at if connected_at is not None else 0.
+            if received and lifetime >= STABLE_CONNECTION_SECONDS:
+                retry = 1.0
+            LOG.warning("market stream=%s group=%s disconnected endpoint=%s proxy=disabled/direct "
+                        "lifetime=%.3fs messages=%d valid=%d retry=%.1fs error=%s",
+                        stream_kind, group_index, selected_base, lifetime, raw_count, valid_count, retry, detail)
             state.group_failed(group_index, detail)
             if not received:
                 endpoint_index += 1

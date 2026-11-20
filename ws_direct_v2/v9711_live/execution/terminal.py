@@ -183,6 +183,11 @@ class TradeTerminalView:
                          '(decision/dispatch, not exchange ACK; mirror runs after decision)')
             lines.insert(-1, f'tick/bid0 OR准入: tick有效={ws.get("fresh_symbols", 0)} '
                          f'bid0有效={ws.get("bid0_symbols", 0)} 任一路有效={ws.get("entry_symbols", 0)}；估值仍用tick。')
+            lines.insert(-1, f'行情负载: 接收={ws.get("receive_per_second", 0):.0f}/s '
+                         f'决策={ws.get("decide_per_second", 0):.0f}/s 积压={ws.get("queue", 0)} '
+                         f'峰值={ws.get("queue_peak", 0)} 买一未变={ws.get("unchanged", 0)} '
+                         f'远价快速处理={ws.get("skipped_far_events", 0)} '
+                         f'过载丢弃={ws.get("overload_discarded", 0)}')
             lines.insert(-1, f'depth WS: endpoint={ws.get("depth_endpoint", "-")} proxy={ws.get("proxy", "-")}')
             for source in ('tick', 'depth'):
                 for group, error in list((ws.get(source+'_errors') or {}).items())[:3]:

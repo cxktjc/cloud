@@ -288,7 +288,9 @@ class DualAdmissionTests(unittest.TestCase):
         self.bid(1.021, symbol='N7USDT', update_id=2)
         self.assertEqual([r['symbol'] for r in self.cancels], ['N7USDT'])
         self.assertNotIn('N8USDT', self.trade.tracked)
-        self.bid(1.0188, symbol='N8USDT', update_id=2)
+        # An unchanged bid needs no new price event. The regular owner
+        # maintenance still consumes the now-confirmed cancel reservation.
+        self.trade.step(now=self.now)
         row = self.trade.tracked['N8USDT']
         self.assertAlmostEqual(row['entry_gap_ceiling'], .0188)
         self.assertTrue(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))

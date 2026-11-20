@@ -41,6 +41,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._rank_heap = []
         self._quote_versions = {}
         self._active_price_symbols = None
+        self._skipped_far_events = 0
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.market_guard = self._market_send_allowed
@@ -203,12 +204,27 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def on_tick(self, tick):
         now = time.time()
+        previous_revision = self._template_revision
         snapshot, status = self.desired_snapshot(now=now)
         self._io_signal = snapshot, status
         self._publish_entry_gate()
-        self._drain_network()
+        completed = self._drain_network()
         previous_ids = {row.get('client_order_id') for row in self.tracked.values()}
         targets = self._target_positions(snapshot)
+        # A new far quote cannot enter the shortlist, change any incumbent's
+        # distance, or become a follow order. Still process every crossing and
+        # every update of an existing eligible/owned/target symbol. Periodic
+        # maintenance handles all time/state changes independently of ingress.
+        if (status == 'valid' and previous_revision == self._template_revision and not completed
+                and tick.symbol not in self.tracked and tick.symbol not in self.positions and tick.symbol not in targets
+                and tick.symbol not in self._eligible and not self.ledger.state.get('pending_rotation')):
+            template = self._templates.get(tick.symbol) or {}
+            limit = self._finite(template.get('limit_price'))
+            quote = self.market.entry_quote(tick.symbol)['selected']
+            if not template or (quote is not None and limit > 0 and (quote-limit)/limit > cfg.CANCEL_GAP):
+                self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
+                self._skipped_far_events += 1
+                return False
         working = self._fast_snapshot(snapshot, tick, now)
         # All mutations, rankings and capacity reservations have one owner.
         self._fast_tick = True
@@ -225,6 +241,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         # Exposed in the persistent diagnostics snapshot, not printed per tick.
         self._entry_diagnostics = dict(getattr(self, '_entry_diagnostics', {}),
                                        ws_direct=self.market.metrics())
+        self._entry_diagnostics['ws_direct']['skipped_far_events'] = self._skipped_far_events
         super().write_feedback(**kwargs)
 
     def _run_loop(self):

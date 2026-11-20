@@ -39,6 +39,19 @@ trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bo
   trade 控制台不再穿插行情连接/重连日志，所有原始日志继续完整写入 `var/state/trade.log`，
   也可用 `tail -f var/state/trade.log` 单独观察。普通订单等其他日志仍正常输出。
   已移除面板的“当前准入价差上限”“挂单分档”和总览 `Sizing 50/30/20` 三段文案。
+- 高负载接入：bookTicker 连续买一价格与有效性相同的更新仅刷新时间戳/买量，
+  不重复进入交易队列；买一任何价格变化、买量从正数到零/从零恢复、重连后的第一笔均须进入 owner。
+  `A→B→A` 三次价格变化按序保留，不按最新价覆盖短暂跨线；tick 事件继续逐笔处理。
+  已远于 2.1%、未入候选排序且未持有/挂出/作为 signal 目标的币对只快速更新排名；
+  一旦跨线、旧单价格改变、signal 模板更新或网络结果完成，继续完整判断，定时维护独立运行。
+- 本地队列溢出时立即撤销受影响来源分组的旧代次、禁用其旧报价，并显式计数。
+  保持 WS 读取以排空网络缓冲；队列降至低水位后，仅由新报价经 owner 确认恢复。
+  溢出恢复期间丢弃的事件计入 `overload_discarded`，不拿遗漏期间的报价补做交易。
+  0.5s 事件积压保护继续生效；队列默认容量仍为 8192，没有靠扩容/放宽过期要求掩盖积压。
+- 短连接重试按 1/2/4/8/16/30s 退避，连接有效运行至少 30s 后才重置；
+  日志附连接存续时间、收包/有效数。Python 3.11+ 接收不再为每条报文创建额外 Task，
+  并每 64 帧让出执行机会，避免单组缓冲持续占用事件循环；Python 3.10 保留兼容路径。
+  面板显示接收/决策速率、队列/峰值、未变买一更新数、远价快速处理数与过载丢弃数。
 
 仍从本目录使用原 `v9711_live.execution.runner` 启动 trade；进程内部启动两路订阅，不需要额外行情进程。
 接口依据：[Binance USDⓈ-M bookTicker 文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#individual-symbol-book-ticker-streams)。

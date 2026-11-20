@@ -371,9 +371,9 @@ class NetworkTradeMixin:
         if self._network_io is not None:
             self._network_io.shutdown()
 
-    def _drain_network(self) -> None:
+    def _drain_network(self) -> int:
         if self._network_io is not None:
-            self._network_io.drain()
+            completed = self._network_io.drain()
             valid = set()
             for row in list(self.tracked.values()) + list(self.positions.values()):
                 symbol = str(row.get('symbol') or '')
@@ -384,3 +384,5 @@ class NetworkTradeMixin:
                 if oid:
                     valid.add(('query', 'get_order', symbol, str(oid)))
             self._network_io.prune_queries(valid)
+            return completed
+        return 0
