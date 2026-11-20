@@ -2,6 +2,7 @@
 import asyncio
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from websockets.exceptions import ConnectionClosedError
@@ -101,6 +102,13 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExceptionChainTests(unittest.TestCase):
+    def test_transport_exception_supports_old_and_current_library_attributes(self):
+        error = ConnectionResetError(104, 'Connection reset by peer')
+        for socket in (SimpleNamespace(recv_exc=error), SimpleNamespace(connection_exc=error),
+                       SimpleNamespace(connection_exc=None, recv_exc=error)):
+            self.assertIs(diagnostic.transport_exception(socket), error)
+        self.assertIsNone(diagnostic.transport_exception(None))
+
     def test_exception_chain_is_bounded_even_when_cyclic(self):
         error = OSError('lost')
         error.__cause__ = error

@@ -27,6 +27,12 @@ def emit(**row):
                      ensure_ascii=False), flush=True)
 
 
+def transport_exception(socket):
+    # 17.4 renamed this private diagnostic attribute. Missing recv_exc must
+    # not be mistaken for evidence that the transport had no exception.
+    return getattr(socket, 'connection_exc', None) or getattr(socket, 'recv_exc', None)
+
+
 async def probe(name, symbols, base, stream, seconds, *, subscribe=False):
     started = time.monotonic()
     connected = first = last = socket = None
@@ -86,7 +92,7 @@ async def probe(name, symbols, base, stream, seconds, *, subscribe=False):
         lifetime_seconds=round(ended-connected, 3) if connected is not None else None,
         total_seconds=round(ended-started, 3),
         last_data_age_ms=round((ended-last)*1000, 3) if last is not None else None,
-        transport_error=exception_chain(getattr(socket, 'recv_exc', None)),
+        transport_error=exception_chain(transport_exception(socket)),
         protocol_error=exception_chain(getattr(getattr(socket, 'protocol', None), 'parser_exc', None)))
     emit(**result)
     return result
