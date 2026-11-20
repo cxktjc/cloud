@@ -153,7 +153,7 @@ class SignalFollowMixin:
                           else 'signal_follow_order_cap')
                 self._request_cancel(symbol, row, reason)
         if status == 'valid' and complete and len(self.positions) < FOLLOW_POSITION_CAP:
-            prices = self.refresh_prices(now=now)
+            prices = self.refresh_entry_prices(now=now)
             for symbol, target in sorted(targets.items(), key=lambda p: (p[1]['order_bar_open_ms'], p[0])):
                 if sum(bool(r.get('signal_follow')) for r in self.tracked.values()) >= FOLLOW_ORDER_CAP:
                     break  # unresolved cancels also occupy an extra slot

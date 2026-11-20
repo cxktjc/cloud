@@ -3,6 +3,31 @@
 本版本对应 2026-11-16 原对话的 v2 任务。以相邻 `ws_direct_v1` 为工程基础，
 参考 `baseline_503020_stop25_20261116` 的三仓资金比例，独立保存所有新版本输出。
 
+## tick / bid0 双路挂单（2026-11-20）
+
+trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bookTicker`。
+后者从 `/public/stream` 读取 `b`（买一价）、`B`（买一量），只使用最优一档，不维护多档深度簿。
+两路独立分组、连接和重连代次，任意有效事件都进入同一状态线程触发判断。
+
+- 普通单判断价取有效 tick/bid0 的较小值：`gap=(判断价-原入场限价)/原入场限价`。
+  前 5 单 ≤1.85%、第 6～8 单 ≤1.65%；替换仍按任意单数 ≥0.30pp、≥5 单 ≥0.22pp 优势。
+  比较新旧挂单时都采用这个口径，撤后复核及实际发送前也使用当前双路报价。
+- 所有有效来源距离都严格超过 2.1% 才发起距离撤单；只有一路有效就用该路。
+  两路均不可用时暂停新挂，不因行情缺失猜测距离超限撤单。
+- 过期、断线、重连前缓存、重复/倒退 book updateId，以及零价格/零买量不参与准入。
+  采用现有 `PRICE_EXCHANGE_MAX_AGE_SECONDS`（默认 60s）、每路分组 30s 静默和 0.5s 积压保护。
+  一路断线不阻断另一路；币对本身必须至少有一路有效，不能用别的币的就绪状态替代。
+- 单笔 WS 下单及 REST batch 的实际发送前均重查双路门槛，价格临时离开门槛时不发送。
+  这种本地未发送拒绝允许合格报价回来后重新评估，不把整个 bar 的信号永久封住。
+- 估值、盈亏与 `latest.json` 镜像继续只使用 tick，不把 bid0 写成成交价。
+  signal、QV、96 根历史 warmup、入场限价及平仓逻辑不变，无需增加历史数据。
+- 补挂只使用双路行情的就绪状态，不套普通距离门槛，保留原价格/数量和独立 2 单名额。
+  普通 8 单、实际持仓约束、补挂 6 仓停止、精确订单身份及撤单回包后 1.5 秒间隔继续生效。
+- 面板显示两路有效币数、tick/bid0 距离和决策来源，订单/反馈保存准入时两路价格及来源。
+
+仍从本目录使用原 `v9711_live.execution.runner` 启动 trade；进程内部启动两路订阅，不需要额外行情进程。
+接口依据：[Binance USDⓈ-M bookTicker 文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#individual-symbol-book-ticker-streams)。
+
 ## 下单金额
 
 金额基数是 **trade 自己账本的 realized_balance**，不是 signal 资金、交易所钱包余额或含浮盈权益。

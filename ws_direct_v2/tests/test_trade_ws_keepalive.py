@@ -353,11 +353,14 @@ class LostAckLedgerTests(unittest.TestCase):
         for key,value in values.items():
             self.stack.enter_context(patch.object(cfg,key,value))
         cfg.EXCHANGE_INFO_CACHE_FILE.write_text(json.dumps({'symbols':{'TESTUSDT':dict(tick='.01',step='1',min_qty='1',min_notional='5')}}))
+        # Keep the simulated +8s reconciliation inside the entry bar even when
+        # the suite happens to run just before a real 3m boundary.
+        self.bar = int(time.time()*1000)//cfg.BAR_MS*cfg.BAR_MS
+        self.now = self.bar/1000 + 30
+        self.stack.enter_context(patch('time.time', return_value=self.now))
         self.trade = LiveTrade(enabled=True,dry_run=False,once=True,nonblocking_io=False)
         self.broker = self.make_broker()
         self.trade.client._broker = self.broker
-        self.now = time.time()
-        self.bar = int(self.now*1000)//cfg.BAR_MS*cfg.BAR_MS
         self.row = dict(symbol='TESTUSDT',limit_price=1.,notional=5.,order_bar_open_ms=self.bar,
                         reference_bar_open_ms=self.bar-cfg.BAR_MS,exit_due_epoch=self.now+900)
 

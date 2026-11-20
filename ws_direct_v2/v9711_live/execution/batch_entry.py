@@ -10,7 +10,7 @@ import os
 import time
 from typing import Any, Mapping
 
-from .submit_errors import ConfirmedSubmitRejection, require_submit_ack
+from .submit_errors import ConfirmedSubmitRejection, EntryQuoteUnavailable, require_submit_ack
 from .signal_follow import follow_send_allowed
 
 
@@ -29,10 +29,13 @@ class BatchEntryMixin:
         bar = int(row['order_bar_open_ms'])
         market_guard = getattr(self, 'market_guard', None)
         if callable(market_guard) and not market_guard(symbol):
-            raise ConfirmedSubmitRejection('internal WS quote/group not ready before batch send')
+            raise EntryQuoteUnavailable('internal WS quotes unavailable before batch send')
         following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, cid, bar, now=time.time())
         if self.network_io is not None:
             following = self.network_io.check_entry(symbol, cid, bar)
+        quote_guard = getattr(self, 'entry_quote_guard', None)
+        if callable(quote_guard) and not quote_guard(symbol, cid, float(row['limit_price'])):
+            raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before batch send')
         from .. import config as cfg
         if not following and not bar <= time.time() * 1000 < bar + cfg.BAR_MS:
             raise ConfirmedSubmitRejection('entry order bar expired/not active before batch send')

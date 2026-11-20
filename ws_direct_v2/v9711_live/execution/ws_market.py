@@ -28,10 +28,14 @@ class Tick:
     received_ns: int
     group: int
     generation: int
+    source: str = 'tick'
+    valid: bool = True
+    quantity: str | None = None
 
 
 class DirectMarket:
-    def __init__(self, symbols, output: Path, *, group_size=200, queue_size=None):
+    def __init__(self, symbols, output: Path, *, group_size=200, queue_size=None, source='tick'):
+        self.source = source
         self.symbols = tuple(symbols)
         self.output = Path(output)
         self.groups = [list(self.symbols[i:i+group_size]) for i in range(0, len(self.symbols), group_size)]
@@ -79,7 +83,7 @@ class DirectMarket:
     def group_received(self, index):
         pass  # update() validates/marks receipt before making its event visible
 
-    def update(self, symbol, price, exchange_time_ms):
+    def update(self, symbol, price, exchange_time_ms, *, valid=True, quantity=None):
         received_ns = self._last_wire_ns or time.monotonic_ns()
         self._last_wire_ns = 0
         now = time.time()
@@ -87,7 +91,7 @@ class DirectMarket:
             value, stamp = float(price), int(exchange_time_ms)
         except (ValueError, TypeError, OverflowError):
             return False
-        if symbol not in self.group_for or not math.isfinite(value) or value <= 0 or not -5 <= now-stamp/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS:
+        if symbol not in self.group_for or not math.isfinite(value) or (valid and value <= 0) or not -5 <= now-stamp/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS:
             return False
         group = self.group_for[symbol]
         with self._lock:
@@ -98,7 +102,7 @@ class DirectMarket:
                 return False
             self.receipts[group] = (time.monotonic(), now)
             self.errors.pop(group, None)
-            tick = Tick(symbol, str(price), stamp, received_ns, group, generation)
+            tick = Tick(symbol, str(price), stamp, received_ns, group, generation, self.source, valid, quantity)
             self.latest_ingress[symbol] = tick
             self.counts['received'] += 1
         try:
@@ -154,7 +158,10 @@ class DirectMarket:
             return False
         self.overloaded = False
         with self._lock:
-            self.processed[tick.symbol] = tick
+            if tick.valid:
+                self.processed[tick.symbol] = tick
+            else:
+                self.processed.pop(tick.symbol, None)
         # callback includes durable intent registration and network dispatch.
         # Do not expose this tick to the file writer until it returns.
         admitted = bool(callback(tick))
@@ -168,7 +175,10 @@ class DirectMarket:
                     del self.admission_latencies_us[:2048]
             if len(self.latencies_us) > 4096:
                 del self.latencies_us[:2048]
-            self.committed[tick.symbol] = tick
+            if tick.valid:
+                self.committed[tick.symbol] = tick
+            else:
+                self.committed.pop(tick.symbol, None)
             self.committed_receipts[tick.group] = (tick.generation, time.time()-(time.monotonic_ns()-tick.received_ns)/1e9)
         return True
 
@@ -254,3 +264,133 @@ class DirectMarket:
             self.write_mirror()
         except Exception:
             LOG.exception('cannot publish stopped market state')
+
+    def entry_prices(self, symbols=None):
+        return self.prices(symbols)
+
+    def entry_quote(self, symbol):
+        price = self.entry_prices([symbol]).get(symbol)
+        return dict(tick=price, bid0=None, selected=price, source='tick' if price is not None else None)
+
+
+class DualMarket(DirectMarket):
+    """Independent aggTrade/bookTicker feeds; only aggTrade values mark positions."""
+    def __init__(self, symbols, output, **kwargs):
+        super().__init__(symbols, output, **kwargs)
+        self.book = DirectMarket(symbols, output, source='bid0', **kwargs)
+        self.book.events = self.events  # one owner, distinct per-feed generations
+        self.book.update_book = self.update_book
+        self._book_ids = {}
+        self.bid_quantities = {}
+
+    def update_book(self, symbol, bid, quantity, stamp, update_id):
+        try:
+            bid, quantity, update_id = float(bid), float(quantity), int(update_id)
+        except (ValueError, TypeError, OverflowError):
+            return False
+        if symbol not in self.group_for or update_id <= 0 or not all(math.isfinite(v) for v in (bid, quantity)):
+            return False
+        group = self.group_for[symbol]
+        key = (self.book.generation[group], update_id)
+        old = self._book_ids.get(symbol)
+        if old and key[0] == old[0] and key[1] <= old[1]:
+            return False
+        valid = bid > 0 and quantity > 0
+        accepted = self.book.update(symbol, str(bid if valid else 0), stamp, valid=valid, quantity=str(quantity))
+        if accepted:
+            self._book_ids[symbol] = key
+        return accepted
+
+    def _quote(self, feed, symbol, tick=None):
+        with feed._lock:
+            tick = feed.processed.get(symbol) if tick is None else tick
+            if (self._closing.is_set() or feed.overloaded or -1 in self.errors or not tick or not tick.valid
+                    or tick.group in feed.errors or tick.group not in feed.receipts
+                    or tick.generation != feed.generation[tick.group]
+                    or time.monotonic()-feed.receipts[tick.group][0] > ticker_ws.MAX_SILENCE_SECONDS
+                    or not -5 <= time.time()-tick.exchange_ms/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS
+                    or (time.monotonic_ns()-tick.received_ns)/1e9 > cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS):
+                return None
+            return float(tick.price)
+
+    def healthy(self):
+        return any(self._quote(feed, symbol) is not None
+                   for symbol in self.symbols for feed in (self, self.book))
+
+    def order_allowed(self, symbol):
+        return self._quote(self, symbol) is not None or self._quote(self.book, symbol) is not None
+
+    def prices(self, symbols=None):
+        # Deliberately keep tick-only valuation and the signal price mirror.
+        return {symbol: price for symbol in (self.symbols if symbols is None else symbols)
+                if (price := self._quote(self, symbol)) is not None}
+
+    def entry_quote(self, symbol):
+        tick, bid = self._quote(self, symbol), self._quote(self.book, symbol)
+        candidates = [(price, source) for price, source in ((tick, 'tick'), (bid, 'bid0')) if price is not None]
+        selected, source = min(candidates, default=(None, None))
+        return dict(tick=tick, bid0=bid, selected=selected, source=source,
+                    bid_quantity=self.bid_quantities.get(symbol))
+
+    def entry_prices(self, symbols=None):
+        return {symbol: price for symbol in (self.symbols if symbols is None else symbols)
+                if (price := self.entry_quote(symbol)['selected']) is not None}
+
+    def quote_state(self, symbol):
+        if self.order_allowed(symbol):
+            return 'quote_ready'
+        if symbol not in self.processed and symbol not in self.book.processed:
+            return 'quote_waiting_first_tick'
+        return 'quote_stale_or_disconnected_both_sources'
+
+    def snapshot(self):
+        result = super().snapshot()
+        with self._lock:
+            result['prices'] = {s: dict(price=tick.price, exchange_time_ms=tick.exchange_ms)
+                                for s, tick in self.committed.items() if self._quote(self, s, tick) is not None}
+            tick_ready = (not self.overloaded and not self.errors and len(self.receipts) == len(self.groups)
+                          and all(time.monotonic()-r[0] <= ticker_ws.MAX_SILENCE_SECONDS for r in self.receipts.values()))
+            result['status'] = 'ok' if tick_ready and result['status'] == 'ok' else 'error'
+        return result
+
+    def decide(self, tick, callback):
+        if tick is not None and tick.source == 'bid0':
+            def decide_book(event):
+                self.bid_quantities[event.symbol] = float(event.quantity or 0)
+                return callback(event)
+            return self.book.decide(tick, decide_book)
+        return super().decide(tick, callback)
+
+    def metrics(self):
+        result = super().metrics()
+        values = sorted(self.latencies_us + self.book.latencies_us)
+        for suffix, fraction in (('p50', .5), ('p95', .95), ('p99', .99)):
+            result['receive_to_decision_us_'+suffix] = values[int((len(values)-1)*fraction)] if values else None
+        result['receive_to_decision_us_max'] = max(values, default=None)
+        for key in ('received', 'decided', 'rejected_old', 'rejected_backlog', 'overflow'):
+            result[key] += self.book.counts[key]
+        result.update(bid0_symbols=sum(self._quote(self.book, s) is not None for s in self.symbols),
+                      entry_symbols=len(self.entry_prices()),
+                      book_received=self.book.counts['received'], book_decided=self.book.counts['decided'],
+                      book_rejected_backlog=self.book.counts['rejected_backlog'],
+                      book_overflow=self.book.counts['overflow'])
+        return result
+
+    async def _receive(self):
+        self._loop = asyncio.get_running_loop()
+        self._async_stop = asyncio.Event()
+        tasks = []
+        for feed, stream, base in ((self, 'aggTrade', ticker_ws.WS_BASE),
+                                  (self.book, 'bookTicker', 'wss://fstream.binance.com/public/stream')):
+            for index, group in enumerate(self.groups, 1):
+                tasks.append(asyncio.create_task(ticker_ws.consume_group(group, feed,
+                    base=base, stream_kind=stream, ping_interval=30, ping_timeout=20, read_timeout=30,
+                    reconnect_before=23*3600, stop=self._async_stop, group_index=index)))
+        if self._closing.is_set():
+            self._async_stop.set()
+        try:
+            await self._async_stop.wait()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

@@ -15,6 +15,10 @@ class ConfirmedSubmitRejection(RuntimeError):
     """An exact submission response explicitly rejected without any fills."""
 
 
+class EntryQuoteUnavailable(ConfirmedSubmitRejection):
+    """No request sent; a fresh qualifying quote may retry the same signal plan."""
+
+
 _TRANSPORT = (
     'network', 'ssl', 'eof', 'connection', 'timeout', 'timed out',
     'remote end closed', 'no close frame', 'broken pipe',

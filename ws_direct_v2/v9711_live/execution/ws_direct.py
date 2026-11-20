@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from .. import config as cfg
 from .runner import LiveTrade
-from .ws_market import DirectMarket
+from .ws_market import DirectMarket, DualMarket
 from .metadata_sync import MetadataSync
 from .position_identity import CAPITAL_MODE
 from .sizing import CountSizingMixin
@@ -30,7 +30,7 @@ def check_inputs():
 
 class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def __init__(self, **kwargs):
-        self.market = DirectMarket(load_symbols(cfg.SYMBOLS_FILE), cfg.PRICE_FILE)
+        self.market = DualMarket(load_symbols(cfg.SYMBOLS_FILE), cfg.PRICE_FILE)
         self._fast_tick = False
         self._account_deadline = 0.0
         self._template_revision = -1
@@ -42,6 +42,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.market_guard = self._market_send_allowed
+        self.client.entry_quote_guard = self._entry_quote_send_allowed
         self._refresh_precision_readiness()
 
     def _refresh_precision_readiness(self):
@@ -54,6 +55,17 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         account_ready = (not self.client.enabled or self.client.dry_run
                          or time.time() <= self._account_deadline)
         return account_ready and self.market.order_allowed(symbol)
+
+    def _entry_quote_send_allowed(self, symbol, cid, limit):
+        from ..entry_policy import at_most
+        gate = self.client.entry_gate  # immutable owner snapshot; no worker ledger access
+        price = self.market.entry_quote(symbol)['selected']
+        if price is None or limit <= 0:
+            return False
+        if cid in gate.get('follow_entries', {}):
+            return True
+        ceiling = gate.get('entry_gap_limits', {}).get(cid)
+        return ceiling is not None and at_most((price-limit)/limit, ceiling)
 
     def step(self, *, now=None):
         stamp = time.time() if now is None else now
@@ -80,12 +92,26 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                                for row in snapshot.get('desired', []) if isinstance(row, dict)]
         result = super()._execute_entries(snapshot, status, **kwargs)
         self._entry_diagnostics['template_total'] = len(self._templates)
+        symbols = set(self.tracked) | set(self._entry_diagnostics.get('selected_to_place', []))
+        symbols.update(row.get('symbol') for row in snapshot.get('desired', [])[:3] if isinstance(row, dict))
+        quotes = {}
+        for symbol in sorted(s for s in symbols if s):
+            quote = self.market.entry_quote(symbol)
+            limit = self._finite((self.tracked.get(symbol) or self._templates.get(symbol) or {}).get('limit_price'))
+            quotes[symbol] = dict(quote, **{key+'_gap': (quote[key]-limit)/limit
+                if quote.get(key) is not None and limit > 0 else None for key in ('tick', 'bid0', 'selected')})
+        self._entry_diagnostics['entry_quotes'] = quotes
         for symbol, reason in self._entry_diagnostics['filtered'].items():
             if reason == 'missing_or_stale_price_or_invalid_limit':
                 limit = self._finite(self._templates.get(symbol, {}).get('limit_price'))
                 self._entry_diagnostics['filtered'][symbol] = (
                     'invalid_limit' if limit <= 0 else self.market.quote_state(symbol))
         return result
+
+    def _place_order(self, row):
+        quote = self.market.entry_quote(str(row.get('symbol') or '').upper())
+        return super()._place_order(dict(row, entry_quote_source=quote['source'],
+            entry_tick=quote['tick'], entry_bid0=quote['bid0']))
 
     def desired_snapshot(self, *, now):
         payload, status = super().desired_snapshot(now=now)
@@ -100,7 +126,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                                if isinstance(row, dict) and row.get('symbol')}
             self._eligible.clear()
             self._rank_heap.clear()
-            for symbol, price in self.market.prices().items():
+            for symbol, price in self.market.entry_prices().items():
                 self._update_rank(symbol, price)
             self._template_revision = self._desired_reader.revision
         self._promote_signal_follow_orders(payload, now=now)
@@ -108,6 +134,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def refresh_prices(self, *, now=None):
         return self.market.prices(self._active_price_symbols if self._fast_tick else None)
+
+    def refresh_entry_prices(self, *, now=None):
+        return self.market.entry_prices(self._active_price_symbols if self._fast_tick else None)
 
     def _publish_entry_gate(self):
         snapshot, status = self._io_signal
@@ -135,7 +164,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             heapq.heapify(self._rank_heap)
 
     def _fast_snapshot(self, snapshot, tick, now):
-        self._update_rank(tick.symbol, float(tick.price))
+        effective = self.market.entry_prices([tick.symbol]).get(tick.symbol, float('inf'))
+        self._update_rank(tick.symbol, effective)
         target_symbols = set(self._target_positions(snapshot))
         selected, restore = set(self.tracked) | target_symbols, []
         valid = 0
@@ -146,6 +176,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 continue
             if not self.market.order_allowed(symbol):
                 self._eligible.pop(symbol, None)
+                continue
+            effective = self.market.entry_prices([symbol]).get(symbol, float('inf'))
+            limit = float(self._templates[symbol]['limit_price'])
+            if (effective-limit)/limit != gap:
+                self._update_rank(symbol, effective)
                 continue
             restore.append(item)
             row = self._entry_sizing_row(self._templates[symbol])

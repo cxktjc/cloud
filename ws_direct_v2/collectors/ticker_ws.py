@@ -87,8 +87,8 @@ def chunks(items: list[str], size: int):
         yield items[start:start + size]
 
 
-def stream_url(symbols: list[str], base: str) -> str:
-    streams = "/".join(f"{symbol.lower()}@aggTrade" for symbol in symbols)
+def stream_url(symbols: list[str], base: str, stream_kind='aggTrade') -> str:
+    streams = "/".join(f"{symbol.lower()}@{stream_kind}" for symbol in symbols)
     return f"{base}?{urlencode({'streams': streams})}"
 
 
@@ -209,7 +209,7 @@ class SnapshotState:
 async def consume_group(
     group: list[str], state: SnapshotState, *, base: str, ping_interval: float,
     ping_timeout: float, read_timeout: float, reconnect_before: float,
-    stop: asyncio.Event, group_index: int,
+    stop: asyncio.Event, group_index: int, stream_kind='aggTrade',
 ) -> None:
     retry = 1.0
     endpoints = endpoint_candidates(base)
@@ -220,7 +220,7 @@ async def consume_group(
         selected_base = endpoints[endpoint_index % len(endpoints)]
         received = False
         try:
-            url = stream_url(group, selected_base)
+            url = stream_url(group, selected_base, stream_kind)
             LOG.info("ticker group=%s connecting symbols=%s endpoint=%s", group_index, len(group), selected_base)
             async with websockets.connect(
                 url, ping_interval=ping_interval, ping_timeout=ping_timeout,
@@ -228,8 +228,8 @@ async def consume_group(
                 **binance_network.websocket_connect_kwargs(),
             ) as socket:
                 state.group_connected(group_index)
-                LOG.info("ticker group=%s handshake complete; waiting for first valid aggTrade endpoint=%s",
-                         group_index, selected_base)
+                LOG.info("ticker group=%s handshake complete; waiting for first valid %s endpoint=%s",
+                         group_index, stream_kind, selected_base)
                 connected_at = time.monotonic()
                 last_data_at = connected_at
                 valid_count = 0
@@ -243,12 +243,12 @@ async def consume_group(
                                 if received else connected_at + FIRST_DATA_TIMEOUT)
                     remaining = deadline - now_mono
                     if remaining <= 0:
-                        raise TimeoutError(f"no valid aggTrade; received_messages={raw_count} valid={valid_count}")
+                        raise TimeoutError(f"no valid {stream_kind}; received_messages={raw_count} valid={valid_count}")
                     try:
                         raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
                     except asyncio.TimeoutError as exc:
                         raise TimeoutError(
-                            f"no valid aggTrade; endpoint={selected_base} received_messages={raw_count} "
+                            f"no valid {stream_kind}; endpoint={selected_base} received_messages={raw_count} "
                             f"valid={valid_count} waiting_for={'next_data' if received else 'first_data'}") from exc
                     if hasattr(state, '_last_wire_ns'):
                         state._last_wire_ns = time.monotonic_ns()
@@ -259,15 +259,19 @@ async def consume_group(
                     data = message.get("data", message)
                     if "code" in message:
                         raise ValueError(f"subscription error code={message.get('code')} msg={str(message.get('msg'))[:200]}")
-                    if not isinstance(data, dict) or data.get("e") != "aggTrade":
+                    if not isinstance(data, dict) or data.get("e") != stream_kind:
                         if raw_count == 1:
                             LOG.warning("ticker group=%s unexpected first message keys=%s", group_index, list(message)[:8])
                         continue
                     symbol = str(data.get("s", "")).upper()
+                    if data.get('st', 1) != 1:
+                        continue
                     stamp = int(data.get("T", data.get("E", 0)))
                     if symbol not in allowed or not -5 <= time.time() - stamp / 1000 <= 60:
                         continue
-                    if not state.update(symbol, str(data.get("p", "")), stamp):
+                    accepted = (state.update_book(symbol, data.get('b'), data.get('B'), stamp, data.get('u'))
+                                if stream_kind == 'bookTicker' else state.update(symbol, str(data.get('p', '')), stamp))
+                    if not accepted:
                         continue
                     state.group_received(group_index)
                     last_data_at = time.monotonic()

@@ -47,7 +47,7 @@ from .stats import compute_comparison
 from .cancel_pacing import exact_entry_cancel_key
 from .session_entries import SessionEntryStats
 from .nonblocking_io import NetworkTradeMixin
-from .submit_errors import require_submit_ack, submit_error_is_ambiguous
+from .submit_errors import require_submit_ack, submit_error_is_ambiguous, EntryQuoteUnavailable
 from .order_identity import matches_order_identity
 from .stream import StreamUnavailable
 from .terminal import TradeTerminalView
@@ -173,6 +173,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             return {}
         return {symbol: q.price for symbol, q in snapshot.prices.items()
                 if -5 <= now - q.exchange_time_ms / 1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS}
+
+    def refresh_entry_prices(self, *, now=None):
+        return self.refresh_prices(now=now)
 
     def reconcile_orders(self, *, now: float) -> None:
         """Advance exact-order state from the local account stream + own fallback."""
@@ -465,7 +468,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         # Guard the signal plan, not a physical send ID. New IDs must not reset
         # rotation suppression, definitive rejection, or bounded absence retry.
         for name in ('rotated_out_plans', 'entry_submit_rejections'):
-            if any(record.get('symbol') == symbol and record.get('plan_signature') == signature
+            if any(not record.get('retryable') and record.get('symbol') == symbol and record.get('plan_signature') == signature
                    for record in self.ledger.state.get(name, {}).values()):
                 return True
         if self._entry_recovery_count(row) > cfg.ENTRY_RECOVERY_MAX_RETRIES:
@@ -498,13 +501,15 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'order_bar_open_ms': int(self._finite(row.get('order_bar_open_ms'))),
             'plan_signature': self._entry_plan_signature(row),
             'rejected_at_epoch': time.time(), 'error': str(exc),
+            'retryable': isinstance(exc, EntryQuoteUnavailable),
         }
         self.stats['entry_rejected'] += 1
         # Only called for a newly registered submission known not to be accepted.
         # Never forget a previously ambiguous or acknowledged order here.
         self.ledger.forget(symbol=symbol, client_order_id=cid)
-        LOG.warning('entry rejected; slot released symbol=%s id=%s err=%s; '
-                    'same signal plan suppressed until changed/new bar', symbol, cid, exc)
+        LOG.warning('entry rejected; slot released symbol=%s id=%s err=%s; %s', symbol, cid, exc,
+                    'fresh qualifying quote may retry' if isinstance(exc, EntryQuoteUnavailable)
+                    else 'same signal plan suppressed until changed/new bar')
 
     def _place_order(self, row: Mapping[str, Any]) -> None:
         if hasattr(self, '_entry_sizing_row'):
@@ -584,6 +589,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'gap': self._finite(row.get('gap'), 0.0),
             'placed_at_epoch': submit_now, 'last_status': 'SUBMITTING',
             'entry_identity_version': 2,
+            **{k: row[k] for k in ('entry_quote_source', 'entry_tick', 'entry_bid0') if k in row},
+            'entry_gap_ceiling': row.get('entry_gap_ceiling', GapPolicy().admission_gap(self._ordinary_pending_count())),
             'fate_unknown': True,
         }
         origin = row.get('_rotation_origin')
@@ -732,6 +739,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 'status': row.get('last_status', 'NEW'),
                 'signal_follow': bool(row.get('signal_follow')),
                 'signal_follow_position_id': row.get('signal_follow_position_id'),
+                **{k: row[k] for k in ('entry_quote_source', 'entry_tick', 'entry_bid0') if k in row},
             }
         payload = {
             'schema_version': 1,
@@ -874,7 +882,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         desired_rows = snapshot.get('desired')
         if not isinstance(desired_rows, list):
             desired_rows = []
-        price_map = self.refresh_prices(now=now)
+        price_map = self.refresh_entry_prices(now=now)
         self._cancel_prices = price_map
         bar_ms = int(self._finite(snapshot.get('bar_open_ms')))
         plan_ready = (status == 'valid' and bool(snapshot.get('signal_ready'))
@@ -965,9 +973,13 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     'exit_due_ms': row.exit_due_ms,
                     'exit_due_utc': row.exit_due_utc,
                     'position_id': (targets.get(row.symbol) or {}).get('position_id', ''),
+                    'entry_gap_ceiling': GapPolicy().admission_gap(self._ordinary_pending_count()),
                 }
                 if plan.rotation_action == 'consume':
                     raw['_rotation_origin'] = dict(self.ledger.state.get('pending_rotation') or {})
+                    origin = raw['_rotation_origin']
+                    raw['entry_gap_ceiling'] = min(cfg.CANCEL_GAP, self._finite(origin.get('victim_gap'))
+                        - GapPolicy().minimum_improvement(int(self._finite(origin.get('original_order_count')))))
                 self._place_order(raw)
         self._consume_rotation(plan)
         filtered_entries.update(self._submit_skip_reasons)
@@ -997,7 +1009,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             if diagnostic_key != getattr(self, '_last_entry_diagnostic_key', None):
                 LOG.debug('entry diagnostics %s', diagnostic_key)
                 self._last_entry_diagnostic_key = diagnostic_key
-        return desired_rows, live_desired, price_map, plan
+        return desired_rows, live_desired, self.refresh_prices(now=now), plan
 
     def run(self) -> int:
         try:

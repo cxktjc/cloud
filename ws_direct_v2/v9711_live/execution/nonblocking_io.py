@@ -266,6 +266,8 @@ class NetworkTradeMixin:
             expires=self._finite(snapshot.get('expires_at_epoch')), ttl=cfg.DESIRED_TTL_SECONDS,
             refreshed=now, held=len(self.positions), position_cap=cfg.SLOTS,
             follow_entries=follow_entries,
+            entry_gap_limits={str(row.get('client_order_id')): row.get('entry_gap_ceiling', cfg.CANCEL_GAP)
+                              for row in self.tracked.values() if not row.get('signal_follow')},
             # Only the owner reads positions. Workers receive a normalized,
             # immutable snapshot, never signal targets or a mutable ledger.
             position_exit_due_epochs=tuple(self._finite(pos.get('exit_due_epoch'))

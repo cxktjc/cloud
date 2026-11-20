@@ -23,7 +23,7 @@ from .. import config as cfg
 from ..contracts import atomic_write_json, read_json
 from ..local_poll import CachedJsonFile
 from .stream import AccountStreamView, StreamUnavailable
-from .submit_errors import ConfirmedSubmitRejection, is_transport_error
+from .submit_errors import ConfirmedSubmitRejection, EntryQuoteUnavailable, is_transport_error
 from .nonblocking_io import NetworkPending
 from .batch_entry import BatchEntryMixin
 from .signal_follow import follow_send_allowed
@@ -454,11 +454,14 @@ class ExchangeClient(BatchEntryMixin):
         def check_bar() -> None:
             market_guard = getattr(self, 'market_guard', None)
             if callable(market_guard) and not market_guard(symbol.upper()):
-                raise ConfirmedSubmitRejection('internal WS quote/group not ready before send')
+                raise EntryQuoteUnavailable('internal WS quotes unavailable before send')
             following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, client_order_id,
                                             int(order_bar_open_ms or 0), now=time.time())
             if self.network_io is not None:
                 following = self.network_io.check_entry(symbol, client_order_id, int(order_bar_open_ms or 0))
+            quote_guard = getattr(self, 'entry_quote_guard', None)
+            if callable(quote_guard) and not quote_guard(symbol.upper(), client_order_id, limit_price):
+                raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send')
             if not following and order_bar_open_ms is not None and not (
                     order_bar_open_ms > 0
                     and order_bar_open_ms <= time.time() * 1000 < order_bar_open_ms + cfg.BAR_MS):

@@ -169,6 +169,14 @@ class TradeTerminalView:
                          f'prices={ws.get("fresh_symbols", 0)}/{ws.get("subscribed", 0)} decided={ws.get("decided")} stale={ws.get("rejected_backlog")} '
                          f'overflow={ws.get("overflow")} p95_us={ws.get("receive_to_decision_us_p95")} '
                          '(decision/dispatch, not exchange ACK; mirror runs after decision)')
+            lines.insert(-1, f'tick/bid0 OR准入: tick有效={ws.get("fresh_symbols", 0)} '
+                         f'bid0有效={ws.get("bid0_symbols", 0)} 任一路有效={ws.get("entry_symbols", 0)}；估值仍用tick。')
+        for symbol, quote in list(diagnostics.get('entry_quotes', {}).items())[:3]:
+            def shown(key):
+                value = quote.get(key+'_gap')
+                return f'{value*100:.4f}%' if value is not None else '无效'
+            lines.insert(-1, f'  {symbol} tick距离={shown("tick")} bid0距离={shown("bid0")} '
+                         f'判断来源={quote.get("source") or "无"}')
         sync = f.get('manual_signal_sync') or {}
         if sync:
             lines.insert(-1, '账本模式: 手动同步一次后trade独立维护；'
