@@ -9,7 +9,10 @@ trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bo
 后者从 `/public/stream` 读取 `b`（买一价）、`B`（买一量），只使用最优一档，不维护多档深度簿。
 两路独立分组、连接和重连代次，任意有效事件都进入同一状态线程触发判断。
 trade 两路均按每连接最多 100 个币对分组，继续订阅完整币池；647 币时每路 7 组，最后一组 47 币。
-本次仅调整 trade 分组大小，更新后重启 trade 生效，signal 无需重启。
+每组连接不带 `?streams=` 的原端点后，发送一次 `SUBSCRIBE`，`params` 包含本组全部
+`symbol@aggTrade` 或 `symbol@bookTicker`，每次重连重新发送。日志显示 `subscription=SUBSCRIBE`、
+`SUBSCRIBE sent` 和 `SUBSCRIBE acknowledged`；确认回包不代替首笔有效行情，不刷新行情时效。
+更新后重启 trade 生效，signal 无需重启；独立 ticker collector 保留原 URL 订阅行为。
 
 - 普通单判断价取有效 tick/bid0 的较小值：`gap=(判断价-原入场限价)/原入场限价`。
   前 5 单 ≤1.85%、第 6～8 单 ≤1.65%；替换仍按任意单数 ≥0.30pp、≥5 单 ≥0.22pp 优势。

@@ -34,3 +34,19 @@
 现有 305 项回归继续覆盖订单身份、重试上限、重启、资金档位、部分成交和原撤单排队节奏。
 其中丢 ACK 重启测试固定到 bar 内第 30 秒，避免实际测试运行时间临近 bar 结束时，模拟 +8 秒跨 bar 导致偶发失败；生产过期与对账逻辑未因此调整。
 本地模拟验证不代替服务器网络连通性或实盘成交验证。
+
+## trade 每组 100 币 + SUBSCRIBE（2026-11-20）
+
+- trade 的 aggTrade/bookTicker 均按最多 100 币分组，连接不带 `?streams=` 的原端点，
+  每次建立连接后发送一次本组完整 `SUBSCRIBE`，使用数值请求 ID；重连重新订阅。
+- `result: null` 的匹配确认只记录日志，不标记行情就绪、不刷新行情时间。
+  错误响应触发现有失效/重连流程；仍支持原始事件及 `data` 包装格式。
+- 默认 DNS、直连、自动 pong、30s ping、TLS 验证及现有重试/时效要求保留。
+  独立 ticker collector 默认继续 URL 订阅，诊断工具仍保留历史 200 币分组边界。
+- 647 币的实际双路 receiver 调度验证：每路 7 组，大小为 100×6+47，全币池无遗漏。
+- 本次命令：`& D:\program\python.exe -B -m unittest tests.test_book_ticker_v2 tests.test_ws_direct tests.test_ws_pressure_v2 tests.test_ticker_readiness tests.test_ws_connection_probe -q`。
+  **109 项通过**，含真实本地回环 WS 的两种流/两种报文格式，以及仅 ACK 无行情、
+  重连重订阅、订阅拒绝等验证；未发送真实订单，未修改生产账本。
+- 服务器是否仍会异常断线需更新后观察；本地测试不证明此前故障根因已消除。
+
+订阅协议依据：[Binance USDⓈ-M Live Subscribing/Unsubscribing](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Live-Subscribing-Unsubscribing-to-streams)。

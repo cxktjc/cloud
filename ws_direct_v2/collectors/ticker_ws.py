@@ -215,7 +215,7 @@ class SnapshotState:
 async def consume_group(
     group: list[str], state: SnapshotState, *, base: str, ping_interval: float,
     ping_timeout: float, read_timeout: float, reconnect_before: float,
-    stop: asyncio.Event, group_index: int, stream_kind='aggTrade',
+    stop: asyncio.Event, group_index: int, stream_kind='aggTrade', subscribe=False,
 ) -> None:
     retry = 1.0
     endpoints = endpoint_candidates(base, stream_kind)
@@ -228,9 +228,9 @@ async def consume_group(
         connected_at = None
         raw_count = valid_count = 0
         try:
-            url = stream_url(group, selected_base, stream_kind)
-            LOG.info("market stream=%s group=%s connecting symbols=%s endpoint=%s proxy=disabled/direct",
-                     stream_kind, group_index, len(group), selected_base)
+            url = selected_base if subscribe else stream_url(group, selected_base, stream_kind)
+            LOG.info("market stream=%s group=%s connecting symbols=%s endpoint=%s proxy=disabled/direct subscription=%s",
+                     stream_kind, group_index, len(group), selected_base, 'SUBSCRIBE' if subscribe else 'URL')
             async with websockets.connect(
                 url, ping_interval=ping_interval, ping_timeout=ping_timeout,
                 open_timeout=15, close_timeout=3, max_queue=4096, compression=None,
@@ -241,6 +241,12 @@ async def consume_group(
                          group_index, stream_kind, selected_base)
                 connected_at = time.monotonic()
                 last_data_at = connected_at
+                if subscribe:
+                    await asyncio.wait_for(socket.send(json.dumps(dict(method='SUBSCRIBE',
+                        params=[f'{symbol.lower()}@{stream_kind}' for symbol in group], id=group_index))),
+                        timeout=FIRST_DATA_TIMEOUT)
+                    LOG.info("market stream=%s group=%s SUBSCRIBE sent symbols=%d id=%s endpoint=%s",
+                             stream_kind, group_index, len(group), group_index, selected_base)
                 valid_count = 0
                 raw_count = 0
                 rejected = {}
@@ -280,6 +286,12 @@ async def consume_group(
                     data = message.get("data", message)
                     if "code" in message:
                         raise ValueError(f"subscription error code={message.get('code')} msg={str(message.get('msg'))[:200]}")
+                    if subscribe and message.get('id') == group_index and 'result' in message:
+                        if message['result'] is not None:
+                            raise ValueError(f"unexpected SUBSCRIBE result={str(message['result'])[:200]}")
+                        LOG.info("market stream=%s group=%s SUBSCRIBE acknowledged id=%s; waiting for valid data",
+                                 stream_kind, group_index, group_index)
+                        continue  # An ACK must not mark ready or refresh market-data freshness.
                     if not isinstance(data, dict) or data.get("e") != stream_kind:
                         if raw_count == 1:
                             LOG.warning("market stream=%s group=%s unexpected first message keys=%s",

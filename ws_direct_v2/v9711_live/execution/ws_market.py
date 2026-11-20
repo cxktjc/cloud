@@ -313,7 +313,7 @@ class DirectMarket:
         self._async_stop = asyncio.Event()
         tasks = [asyncio.create_task(ticker_ws.consume_group(group, self,
                  base=ticker_ws.WS_BASE, ping_interval=30, ping_timeout=20, read_timeout=30,
-                 reconnect_before=23*3600, stop=self._async_stop, group_index=index))
+                 reconnect_before=23*3600, stop=self._async_stop, group_index=index, subscribe=True))
                  for index,group in enumerate(self.groups, 1)]
         if self._closing.is_set():
             self._async_stop.set()
@@ -551,7 +551,7 @@ class DualMarket(DirectMarket):
             for index, group in enumerate(self.groups, 1):
                 tasks.append(asyncio.create_task(ticker_ws.consume_group(group, feed,
                     base=base, stream_kind=stream, ping_interval=30, ping_timeout=20, read_timeout=30,
-                    reconnect_before=23*3600, stop=self._async_stop, group_index=index)))
+                    reconnect_before=23*3600, stop=self._async_stop, group_index=index, subscribe=True)))
         if self._closing.is_set():
             self._async_stop.set()
         try:

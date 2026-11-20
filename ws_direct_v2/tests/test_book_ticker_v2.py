@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from collectors import ticker_ws
 from tests import test_capacity_gate_v2 as fixtures
@@ -486,6 +486,100 @@ class DualAdmissionTests(unittest.TestCase):
             self.assertEqual(select(snapshot['desired']), select(working['desired']), str(scenario))
 
 
+class SubscribeReceiverTests(unittest.IsolatedAsyncioTestCase):
+    async def consume(self, state, stop, *, base=ticker_ws.BOOK_WS_BASE, stream='bookTicker', symbols=None):
+        await ticker_ws.consume_group(symbols or ['XUSDT'], state, base=base, stream_kind=stream,
+            ping_interval=30, ping_timeout=20, read_timeout=30, reconnect_before=3600,
+            stop=stop, group_index=3, subscribe=True)
+
+    async def test_real_socket_sends_subscription_and_parses_both_event_formats(self):
+        for stream in ('aggTrade', 'bookTicker'):
+            for combined in (False, True):
+                with self.subTest(stream=stream, combined=combined):
+                    stop, state, requests = asyncio.Event(), Mock(), []
+                    def accepted(*args):
+                        stop.set()
+                        return True
+                    state.update.side_effect = state.update_book.side_effect = accepted
+                    async def server(socket):
+                        requests.append((socket.request.path, json.loads(await socket.recv())))
+                        await socket.send(json.dumps(dict(result=None, id=3)))
+                        data = dict(e=stream, s='XUSDT', p='1.01', b='1.01', B='4', u=7,
+                                    T=int(time.time()*1000))
+                        await socket.send(json.dumps(dict(data=data) if combined else data))
+                        await socket.wait_closed()
+                    async with ticker_ws.websockets.serve(server, '127.0.0.1', 0) as listener:
+                        port = listener.sockets[0].getsockname()[1]
+                        await asyncio.wait_for(self.consume(state, stop,
+                            base=f'ws://127.0.0.1:{port}/stream', stream=stream,
+                            symbols=['XUSDT', '币安人生USDT']), timeout=3)
+                    self.assertEqual(requests, [('/stream', dict(method='SUBSCRIBE',
+                        params=[f'xusdt@{stream}', f'币安人生usdt@{stream}'], id=3))])
+                    state.group_received.assert_called_once_with(3)
+                    (state.update_book if stream == 'bookTicker' else state.update).assert_called_once()
+                    state.group_failed.assert_not_called()
+
+    async def test_ack_without_data_does_not_mark_ready(self):
+        stop, state = asyncio.Event(), Mock()
+        class Socket:
+            send = AsyncMock()
+            async def recv(self):
+                if not getattr(self, 'sent_ack', False):
+                    self.sent_ack = True
+                    return json.dumps(dict(result=None, id=3))
+                state.group_received.assert_not_called()
+                raise asyncio.TimeoutError()
+        class Connection:
+            async def __aenter__(self): return Socket()
+            async def __aexit__(self, *args): pass
+        async def backoff(seconds): stop.set()
+        with patch.object(ticker_ws.websockets, 'connect', return_value=Connection()), \
+                patch.object(ticker_ws.asyncio, 'sleep', side_effect=backoff):
+            await self.consume(state, stop)
+        state.group_received.assert_not_called()
+        state.update_book.assert_not_called()
+        self.assertIn('waiting_for=first_data', state.group_failed.call_args.args[1])
+
+    async def test_reconnect_resubscribes_before_receiving(self):
+        stop, state, requests = asyncio.Event(), Mock(), []
+        class Socket:
+            async def send(self, raw): requests.append(json.loads(raw))
+            async def recv(self):
+                if len(requests) == 1:
+                    raise ConnectionResetError('peer reset')
+                stop.set()
+                return json.dumps(dict(e='bookTicker', s='XUSDT', b='1.01', B='4', u=7,
+                                       T=int(time.time()*1000)))
+        class Connection:
+            async def __aenter__(self): return Socket()
+            async def __aexit__(self, *args): pass
+        async def backoff(seconds): pass
+        with patch.object(ticker_ws.websockets, 'connect', return_value=Connection()) as connect, \
+                patch.object(ticker_ws.asyncio, 'sleep', side_effect=backoff):
+            await self.consume(state, stop)
+        self.assertEqual(requests, [dict(method='SUBSCRIBE', params=['xusdt@bookTicker'], id=3)]*2)
+        self.assertEqual([call.args[0] for call in connect.call_args_list], [ticker_ws.BOOK_WS_BASE]*2)
+        state.group_received.assert_called_once_with(3)
+
+    async def test_subscription_errors_fail_without_authorizing_quotes(self):
+        for response in (dict(code=2, msg='Invalid request', id=3), dict(result=False, id=3)):
+            with self.subTest(response=response):
+                stop, state = asyncio.Event(), Mock()
+                class Socket:
+                    send = AsyncMock()
+                    async def recv(self): return json.dumps(response)
+                class Connection:
+                    async def __aenter__(self): return Socket()
+                    async def __aexit__(self, *args): pass
+                async def backoff(seconds): stop.set()
+                with patch.object(ticker_ws.websockets, 'connect', return_value=Connection()), \
+                        patch.object(ticker_ws.asyncio, 'sleep', side_effect=backoff):
+                    await self.consume(state, stop)
+                state.group_received.assert_not_called()
+                state.update_book.assert_not_called()
+                self.assertIn('ValueError', state.group_failed.call_args.args[1])
+
+
 class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
     async def test_book_retry_never_switches_to_market_endpoint(self):
         self.assertEqual(ticker_ws.endpoint_candidates(ticker_ws.BOOK_WS_BASE, 'bookTicker'),
@@ -503,6 +597,7 @@ class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(market.groups, market.book.groups)
             calls = []
             async def consume(group, state, **kw):
+                self.assertIs(kw['subscribe'], True)
                 calls.append((kw['stream_kind'], tuple(group), kw['base']))
                 if len(calls) == 14:
                     kw['stop'].set()
