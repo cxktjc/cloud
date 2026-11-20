@@ -33,6 +33,7 @@ class Tick:
     source: str = 'tick'
     valid: bool = True
     quantity: str | None = None
+    received_epoch_ms: float = 0.
 
 
 class DirectMarket:
@@ -129,7 +130,9 @@ class DirectMarket:
     def update(self, symbol, price, exchange_time_ms, *, valid=True, quantity=None):
         received_ns = self._last_wire_ns or time.monotonic_ns()
         self._last_wire_ns = 0
+        clock_ns = time.monotonic_ns()
         now = time.time()
+        received_epoch_ms = now*1000-(clock_ns-received_ns)/1e6
         try:
             value, stamp = float(price), int(exchange_time_ms)
         except (ValueError, TypeError, OverflowError):
@@ -143,7 +146,8 @@ class DirectMarket:
             if old and stamp < old.exchange_ms:
                 self.counts['rejected_old'] += 1
                 return False
-            tick = Tick(symbol, str(price), stamp, received_ns, group, generation, self.source, valid, quantity)
+            tick = Tick(symbol, str(price), stamp, received_ns, group, generation, self.source, valid, quantity,
+                        received_epoch_ms)
             self.latest_ingress[symbol] = tick
             self.counts['received'] += 1
             if group in self._overflow_groups:
@@ -450,6 +454,16 @@ class DualMarket(DirectMarket):
 
     def entry_prices(self, symbols=None):
         return self.price_maps(symbols)[2]
+
+    def entry_timing(self, symbol, source):
+        feed = self.book if source == 'bid0' else self
+        with feed._lock:
+            tick = feed.quote_tick(symbol, feed.processed.get(symbol))
+            if tick is None or self._quote(feed, symbol, tick) is None:
+                return {}
+            return dict(quote_source='depth' if source == 'bid0' else 'tick',
+                        exchange_time_ms=tick.exchange_ms, received_epoch_ms=tick.received_epoch_ms,
+                        _received_ns=tick.received_ns)
 
     def quote_state(self, symbol):
         if self.order_allowed(symbol):

@@ -72,8 +72,11 @@ class BatchEntryMixin:
             raise ConfirmedSubmitRejection('duplicate batch identity/symbol; request never sent')
         outcome = {}
         sendable = []
+        timings = getattr(self, 'entry_timings', None)
         for row in requests:
             cid = str(row['client_order_id'])
+            if timings is not None:
+                timings.mark(cid, 'worker')
             try:
                 self._entry_send_check(row)
                 prepared = self.prepare_limit(str(row['symbol']), float(row['limit_price']), float(row['notional']))
@@ -116,7 +119,13 @@ class BatchEntryMixin:
                 price=w['price'],origQty=w['quantity']) for _,w in current]
         else:
             try:
+                if timings is not None:
+                    for row, wire in current:
+                        timings.mark(wire['newClientOrderId'], 'send', transport='REST_BATCH')
                 replies=self._post_batch_orders([w for _,w in current])
+                if timings is not None:
+                    for row, wire in current:
+                        timings.mark(wire['newClientOrderId'], 'response')
             except Exception as exc:
                 self._record_rate_limit(exc)
                 for row,wire in current:

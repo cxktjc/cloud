@@ -46,12 +46,21 @@ class _Job:
 class NetworkIO(EntryCancelPacing):
     def __init__(self, max_jobs: int = 64, workers: int | None = None, *,
                  cancel_interval_seconds: float = ENTRY_CANCEL_INTERVAL_SECONDS,
-                 cancel_clock: Callable[[], float] | None = None):
+                 cancel_clock: Callable[[], float] | None = None,
+                 worker_start: Callable[[], None] | None = None,
+                 owner_wake: Callable[[], None] | None = None):
         workers = cfg.env_int('V9711_LIVE_IO_WORKERS', 19) if workers is None else workers
         if not 1 <= workers <= 19:
             raise ValueError('I/O workers must be between 1 and 19')
         self.worker_count = workers
         self.worker_exit = None
+        self._worker_start = worker_start
+        self._owner_wake = owner_wake
+        self._warm_pending = workers if worker_start is not None else 0
+        self._warm_ready = self._warm_failed = 0
+        self._completed_callbacks = threading.Event()
+        self._valid_query_keys = None
+        self._query_keys = set()  # Only the owner adds/retires exact query identities.
         self._owner = threading.get_ident()
         self._condition = threading.Condition()
         self._jobs: dict[tuple, _Job] = {}
@@ -94,6 +103,9 @@ class NetworkIO(EntryCancelPacing):
             symbols = frozenset(str(k[2] if k[0] == 'query' else k[1]) for k in identities)
             self._jobs[key] = _Job(key, work, done, priority, symbols, aliases,
                                    entry_cancel=bool(entry_cancel))
+            if key[0] == 'query':
+                self._valid_query_keys = None
+                self._query_keys.add(key)
             for alias in aliases:
                 self._aliases[alias] = key
             heapq.heappush(self._heap, (priority, next(self._sequence), key))
@@ -106,6 +118,7 @@ class NetworkIO(EntryCancelPacing):
             job = self._jobs.get(key)
             if job is not None and job.state == 'done':
                 self._jobs.pop(key)
+                self._query_keys.discard(key)
                 if job.error is not None:
                     raise job.error
                 return job.value
@@ -115,13 +128,20 @@ class NetworkIO(EntryCancelPacing):
     def drain(self) -> int:
         """Apply completed mutations on owner only; never wait for a worker."""
         self._assert_owner()
+        if not self._completed_callbacks.is_set():
+            return 0
         with self._condition:
+            self._completed_callbacks.clear()
             ready = [job for job in self._jobs.values() if job.state == 'done' and job.done]
         count = 0
         for job in ready:
             # Retain the completion if accounting/save throws; cumulative fill
             # application is idempotent and can be retried next iteration.
-            job.done(job.value, job.error)
+            try:
+                job.done(job.value, job.error)
+            except BaseException:
+                self._completed_callbacks.set()  # accounting/save must retry on the owner
+                raise
             with self._condition:
                 if self._jobs.get(job.key) is job:
                     self._jobs.pop(job.key)
@@ -133,10 +153,14 @@ class NetworkIO(EntryCancelPacing):
 
     def prune_queries(self, valid: set[tuple]) -> None:
         self._assert_owner()
+        if valid == self._valid_query_keys:
+            return
         with self._condition:
+            self._valid_query_keys = frozenset(valid)
             for key, job in list(self._jobs.items()):
                 if key[0] == 'query' and key not in valid:
                     self._jobs.pop(key)
+                    self._query_keys.discard(key)
             # Remove stale heap tickets so a stream-only workload cannot grow
             # an unbounded queue of canceled/retired query identities.
             self._heap = [ticket for ticket in self._heap if ticket[2] in self._jobs]
@@ -174,6 +198,8 @@ class NetworkIO(EntryCancelPacing):
                     'running': sum(j.state == 'running' for j in self._jobs.values()),
                     'completed': sum(j.state == 'done' for j in self._jobs.values()),
                     'workers': self.worker_count,
+                    'transport_warmup': dict(pending=self._warm_pending, ready=self._warm_ready,
+                                             failed=self._warm_failed),
                     'entry_cancel_pacing': self._entry_cancel_health()}
 
     def _take_ready_job(self) -> _Job | None:
@@ -206,6 +232,22 @@ class NetworkIO(EntryCancelPacing):
 
     def _loop(self) -> None:
         try:
+            if self._worker_start is not None:
+                try:
+                    self._worker_start()
+                except Exception:
+                    with self._condition:
+                        self._warm_failed += 1
+                        first_failure = self._warm_failed == 1
+                    if first_failure:
+                        LOG.warning('trade WS startup warmup failed; normal exact requests may retry transport',
+                                    exc_info=True)
+                else:
+                    with self._condition:
+                        self._warm_ready += 1
+                finally:
+                    with self._condition:
+                        self._warm_pending -= 1
             while True:
                 with self._condition:
                     job = None
@@ -224,7 +266,11 @@ class NetworkIO(EntryCancelPacing):
                 with self._condition:
                     self._entry_cancel_completed(job)
                     job.value, job.error, job.state = value, error, 'done'
+                    if job.done is not None:
+                        self._completed_callbacks.set()
                     self._condition.notify_all()
+                if job.done is not None and self._owner_wake is not None:
+                    self._owner_wake()
 
         finally:
             if self.worker_exit is not None:
@@ -239,6 +285,8 @@ class NetworkIO(EntryCancelPacing):
                 if job.state == 'queued':
                     job.state = 'done'
                     job.error = ConfirmedSubmitRejection('trade stopping; queued request never sent')
+                    if job.done is not None:
+                        self._completed_callbacks.set()
             self._condition.notify_all()
         for thread in self._threads:
             thread.join()  # only shutdown waits for the bounded in-flight requests
@@ -249,7 +297,9 @@ class NetworkTradeMixin:
     def enable_nonblocking_io(self) -> None:
         if self._network_io is not None:
             return
-        self._network_io = NetworkIO(cancel_interval_seconds=ENTRY_CANCEL_INTERVAL_SECONDS)
+        self._network_io = NetworkIO(cancel_interval_seconds=ENTRY_CANCEL_INTERVAL_SECONDS,
+                                     worker_start=self.client.warm_worker_transport,
+                                     owner_wake=getattr(self, '_network_wake', None))
         self.client.network_io = self._network_io
         self._network_io.worker_exit = self.client.close_worker_transport
         self._publish_entry_gate()
@@ -374,6 +424,8 @@ class NetworkTradeMixin:
     def _drain_network(self) -> int:
         if self._network_io is not None:
             completed = self._network_io.drain()
+            if not self._network_io._query_keys:
+                return completed
             valid = set()
             for row in list(self.tracked.values()) + list(self.positions.values()):
                 symbol = str(row.get('symbol') or '')

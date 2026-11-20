@@ -78,6 +78,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             account_stream_dir=cfg.ACCOUNT_STREAM_DIR,
             exchange_info_cache_file=cfg.EXCHANGE_INFO_CACHE_FILE,
             price_file=cfg.PRICE_FILE)
+        self.client.entry_timings = self.session_entries.timings
         self.ledger = OwnershipLedger(
             path=cfg.EXECUTION_INTENT_FILE,
             state_path=cfg.EXECUTION_LEDGER_FILE)
@@ -575,6 +576,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'sizing_target_notional': self._finite(prepared.get('target_notional'), notional),
         }
         client_id = plan_id if following else self.ledger.reserve_entry_client_id(symbol, bar_ms)
+        self.session_entries.timings.register(symbol, client_id, row,
+            session_id=(self._io_signal[0] or {}).get('signal_session_id'))
         # Persist BOTH exact identity and its occupied physical slot before I/O.
         # A process interruption between send and ACK must not lose this slot.
         self.tracked[symbol] = {
@@ -606,6 +609,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self.ledger.register(symbol=symbol, client_order_id=client_id,
                              kind='entry', limit_price=price, qty=qty,
                              exit_due_epoch=self._finite(row.get('exit_due_epoch')))
+        self.session_entries.timings.mark(client_id, 'registered')
         LOG.info('entry registered symbol=%s id=%s 满足=%s tick=%s depth_bid0=%s gap_ceiling=%s',
                  symbol, client_id, self.tracked[symbol].get('entry_qualified_by', 'unknown'),
                  row.get('entry_tick'), row.get('entry_bid0'), row.get('entry_gap_ceiling'))
@@ -613,6 +617,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             self.stats['entry_retries'] += 1
         source_row = dict(row)
         def send():
+            self.session_entries.timings.mark(client_id, 'worker')
             guarded_place = getattr(self.client, 'place_limit_for_bar', None)
             kwargs = dict(symbol=symbol, client_order_id=client_id,
                           limit_price=price, notional=notional)
@@ -646,6 +651,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 self.ledger.save()
                 return
             order_id = str(place_result.get('orderId') or '')
+            self.session_entries.timings.mark(client_id, 'owner_ack')
+            current['entry_timing'] = self.session_entries.timings.order(client_id)
             send_quote = place_result.get('_entry_send_quote')
             if isinstance(send_quote, Mapping) and send_quote.get('entry_qualified_by'):
                 current['entry_send_quote'] = {k: send_quote[k] for k in QUOTE_FIELDS if k in send_quote}
@@ -671,6 +678,12 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                      symbol, price, sizing_details['submitted_limit_price'],
                      notional, sizing_details['submitted_notional'], qty_text, client_id, order_id,
                      (current.get('entry_send_quote') or current).get('entry_qualified_by', 'unknown'))
+            timing = current['entry_timing']
+            LOG.info('entry timing symbol=%s id=%s quote_received_ms=%s first_send_ms=%s '
+                     'response_ms=%s owner_ack_ms=%s transport=%s latency_ms=%s',
+                     symbol, client_id, timing.get('received_epoch_ms'), timing.get('send_epoch_ms'),
+                     timing.get('response_epoch_ms'), timing.get('owner_ack_epoch_ms'),
+                     timing.get('transport'), timing.get('latencies_ms'))
             self.ledger.save()
         self._run_network(('entry', symbol, client_id), send, complete, priority=10,
             entry_request=None if following else dict(symbol=symbol, client_order_id=client_id, limit_price=price,
@@ -864,6 +877,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self._cancel_all_for_full_capacity(now=now)
         desired_rows, live_desired, price_map, plan = self._execute_entries(
             snapshot, status, now=now, targets=targets, final_exit_bar=final_exit_bar)
+        for row in self.tracked.values():
+            timing = self.session_entries.timings.order(str(row.get('client_order_id') or ''))
+            if timing:
+                row['entry_timing'] = timing
         self.ledger.save()
         stream_health = self._stream_health()
         comparison = self._comparison(

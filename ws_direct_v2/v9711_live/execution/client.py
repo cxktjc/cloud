@@ -28,6 +28,7 @@ from .nonblocking_io import NetworkPending
 from .batch_entry import BatchEntryMixin
 from .signal_follow import follow_send_allowed
 from .order_identity import matches_order_identity
+from .entry_timing import EntrySendProbe
 
 LOG = logging.getLogger('v9711_live_trade.client')
 
@@ -167,6 +168,7 @@ class ExchangeClient(BatchEntryMixin):
         self._metadata_lock = threading.RLock()
         self.price_file = Path(price_file)
         self.network_io = None
+        self.entry_timings = None
         self._transport_local = threading.local()
         self._transport_lock = threading.Lock()
         self._transport_lanes = {}
@@ -251,6 +253,10 @@ class ExchangeClient(BatchEntryMixin):
         if lane is not None:
             with self._transport_lock:
                 self._transport_lanes.pop(threading.get_ident(), None)
+
+    def warm_worker_transport(self) -> None:
+        if self.enabled and not self.dry_run:
+            self._worker_transport()._ready_broker()  # Connect/keepalive only, never send an order.
 
     def _record_rate_limit(self, value) -> None:
         code = str(value.get('code', '')) if isinstance(value, Mapping) else str(getattr(value, 'code', ''))
@@ -472,7 +478,8 @@ class ExchangeClient(BatchEntryMixin):
         result = self._broker_call(
             'place_order', symbol.upper(), 'BUY', qty_text,
             price=price_text, position_side='LONG',
-            client_order_id=client_order_id, before_send=check_bar)
+            client_order_id=client_order_id,
+            before_send=EntrySendProbe(check_bar, self.entry_timings, client_order_id))
         return dict(result, _entry_send_quote=send_quote) if send_quote and isinstance(result, Mapping) else result
 
     def cancel(self, *, symbol: str, order_id: Any = None,

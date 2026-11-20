@@ -34,6 +34,30 @@ def iso(ms: Any) -> str:
     return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat(timespec='seconds')
 
 
+def iso_ms(ms: Any) -> str:
+    if not ms:
+        return '未记录'
+    return datetime.fromtimestamp(float(ms)/1000, tz=timezone.utc).isoformat(timespec='milliseconds')
+
+
+def entry_timing_lines(timing):
+    timing = timing or {}
+    line = (f'      首次下单={iso_ms(timing.get("send_epoch_ms"))} '
+            f'收到行情={iso_ms(timing.get("received_epoch_ms"))} '
+            f'来源={timing.get("quote_source", "未记录")} '
+            f'通道={timing.get("transport", "未记录")} '
+            f'行情时间={iso_ms(timing.get("exchange_time_ms"))}')
+    labels = (('quote_to_decision', '收行情→判断'), ('decision_to_registered', '判断→登记'),
+              ('registered_to_worker', '登记→线程'), ('worker_to_send', '线程→发送'),
+              ('send_to_response', '发送→回包'), ('response_to_owner', '回包→主线程确认'))
+    delays = timing.get('latencies_ms') or {}
+    details = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in labels if key in delays)
+    stages = (f'      该单登记={iso_ms(timing.get("registered_epoch_ms"))} '
+              f'回包={iso_ms(timing.get("response_epoch_ms"))} '
+              f'主线程确认={iso_ms(timing.get("owner_ack_epoch_ms"))}')
+    return [line]+([stages] if timing else [])+([f'      分段耗时: {details}'] if details else [])
+
+
 def compact_positions(rows: Any, limit: int) -> str:
     if isinstance(rows, Mapping):
         source: Any = rows.values()
@@ -256,6 +280,7 @@ class TradeTerminalView:
                     state = 'signal仍持仓' if row['signal_active'] else 'signal已结束/撤回'
                     block.append(f'    {row["symbol"]} 入场bar={iso(row["entry_bar_open_ms"])} '
                                  f'确认={iso(row["entry_available_ms"])} [{state}]')
+                    block.extend(entry_timing_lines(row.get('first_order_timing')))
             else:
                 block.append('  未成交明细: （暂无）')
             block.append('  口径: 只计启动后完成3m确认的signal入场；部分成交算已开仓；'
@@ -278,6 +303,10 @@ class TradeTerminalView:
             lines.insert(-1, f'网络I/O: 后台运行={io.get("running", 0)} '
                          f'排队={io.get("queued", 0)} 待主循环确认={io.get("completed", 0)} '
                          '（信号轮询不等待网络响应）')
+            warmup = io.get('transport_warmup') or {}
+            if warmup:
+                lines.insert(-1, f'交易连接启动预热: 就绪={warmup.get("ready", 0)} '
+                             f'进行中={warmup.get("pending", 0)} 失败={warmup.get("failed", 0)}')
         pacing = io.get('entry_cancel_pacing') or {}
         if pacing:
             active = ', '.join(pacing.get('active', ())) or '(空)'

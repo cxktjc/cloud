@@ -14,17 +14,27 @@ from tests import test_book_ticker_v2 as fixtures
 from v9711_live import config as cfg
 
 
-def run(rate=5000, seconds=3, symbols=800, pattern='mixed'):
+def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False):
     case = fixtures.DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     stop, errors = threading.Event(), []
     threads = []
+    simulated_batch_ids = []
     try:
         case.symbols = [f'S{i:04d}USDT' for i in range(symbols)]
         cfg.SYMBOLS_FILE.write_text('\n'.join(case.symbols))
         cfg.EXCHANGE_INFO_CACHE_FILE.write_text(json.dumps({'symbols': {
             s: dict(tick='.0001', step='1', min_qty='1', min_notional='5') for s in case.symbols}}))
         case.make_trade()
+        if nonblocking:
+            original_batch = case.trade.client.place_limit_batch
+            def batch(requests):
+                replies = original_batch(requests)
+                simulated_batch_ids.extend(cid for cid, (value, error) in replies.items()
+                    if error is None and isinstance(value, dict) and value.get('_simulated'))
+                return replies
+            case.trade.client.place_limit_batch = batch
+            case.trade.enable_nonblocking_io()  # Disabled exchange: simulation only.
         market = case.trade.market
         for feed in (market, market.book):
             for group in feed.generation:
@@ -104,18 +114,20 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed'):
         maintenance_ms.sort()
         decision_ms.sort()
         percentile = lambda p: round(decision_ms[int((len(decision_ms)-1)*p)], 3) if decision_ms else None
-        return dict(symbols=symbols, pattern=pattern, target_frames=frames, target_rate=rate,
+        return dict(symbols=symbols, pattern=pattern, nonblocking_io=nonblocking,
+            target_frames=frames, target_rate=rate,
             elapsed_seconds=round(time.perf_counter()-started, 3), counters=counters,
             queue_peak=result.get('queue_peak'), p95_receive_to_decision_ms=percentile(.95),
             p99_receive_to_decision_ms=percentile(.99), latency_scope='all decided events in this run; includes mirror commit',
             maintenance_p95_ms=round(maintenance_ms[int((len(maintenance_ms)-1)*.95)], 3) if maintenance_ms else None,
-            pending=len(case.trade.tracked), simulated_submissions=len(case.submits),
+            pending=len(case.trade.tracked), simulated_submissions=len(case.submits)+len(simulated_batch_ids),
             maintenance_cycles=cycles, skipped_far_events=getattr(case.trade, '_skipped_far_events', 0),
             errors=errors, scope='in-memory ingress with real owner/temporary durable files; mocked exchange')
     finally:
         stop.set()
         for thread in threads:
             thread.join()
+        case.trade.shutdown_io()
         case.doCleanups()
 
 
@@ -124,11 +136,12 @@ if __name__ == '__main__':
     parser.add_argument('--rate', type=int, default=5000)
     parser.add_argument('--seconds', type=float, default=3)
     parser.add_argument('--pattern', choices=('mixed', 'changing'), default='mixed')
+    parser.add_argument('--nonblocking', action='store_true')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     if args.rate <= 0 or args.seconds <= 0:
         parser.error('rate and seconds must be positive')
-    result = run(args.rate, args.seconds, pattern=args.pattern)
+    result = run(args.rate, args.seconds, pattern=args.pattern, nonblocking=args.nonblocking)
     text = json.dumps(result, indent=2)
     print(text)
     if args.output:

@@ -405,8 +405,15 @@ class BinanceFuturesTradeWS(TradeWSLifecycle):
             request_id = str(uuid.uuid4())
             payload = dict(id=request_id, method=method, params=request_params)
             try:
-                await self._ws.send(json.dumps(payload, separators=(',', ':')))
+                wire = json.dumps(payload, separators=(',', ':'))
+                on_send = getattr(before_send, 'wire_sent', None)
+                if callable(on_send):
+                    on_send()
+                await self._ws.send(wire)
                 response = await asyncio.wait_for(self._read_response(request_id), timeout=self.request_timeout)
+                on_reply = getattr(before_send, 'reply_received', None)
+                if callable(on_reply):
+                    on_reply()
             except (Exception, asyncio.CancelledError):
                 # Sending may already have succeeded. Recover the CONNECTION
                 # only; exact intent/query/stream reconciliation resolves fate.

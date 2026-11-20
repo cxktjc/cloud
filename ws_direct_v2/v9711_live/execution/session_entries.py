@@ -13,6 +13,7 @@ from typing import Any
 
 from .. import config as cfg
 from .position_identity import is_manual_position
+from .entry_timing import EntryTimings
 
 
 def positive(value: Any) -> float:
@@ -39,6 +40,8 @@ class SessionEntryStats:
         self._filled_bars: set[tuple[str, int]] = set()
         self._cache: dict[str, Any] | None = None
         self._cache_limit = -1
+        self.timings = EntryTimings()
+        self._cache_timing_revision = -1
 
     def observe_fill(self, symbol: str, row: Mapping[str, Any], *, quantity: Any) -> None:
         """Caller supplies a booked, positive, exact-owned ENTRY fill only."""
@@ -144,7 +147,9 @@ class SessionEntryStats:
     def snapshot(self, *, max_rows: int = 12) -> dict[str, Any]:
         """Stable, cached display data; no clocks/ages that force periodic redraws."""
         limit = max(0, int(max_rows))
-        if self._cache is not None and self._cache_limit == limit:
+        timing_revision = self.timings.revision
+        if (self._cache is not None and self._cache_limit == limit
+                and self._cache_timing_revision == timing_revision):
             return self._cache
         missing = [entry for entry in self._entries.values() if not self._has_fill(entry)]
         active = sum(bool(entry['signal_active']) for entry in missing)
@@ -158,8 +163,10 @@ class SessionEntryStats:
             'unfilled_entries': len(missing),
             'active_unfilled_entries': active,
             'ended_unfilled_entries': len(missing) - active,
-            'recent_unfilled_entries': [dict(entry) for entry in missing[:limit]],
+            'recent_unfilled_entries': [dict(entry, first_order_timing=self.timings.first_for(entry))
+                                       for entry in missing[:limit]],
             'details_truncated': len(missing) > limit,
         }
         self._cache_limit = limit
+        self._cache_timing_revision = timing_revision
         return self._cache

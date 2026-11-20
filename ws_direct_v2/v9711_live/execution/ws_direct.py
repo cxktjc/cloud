@@ -31,6 +31,9 @@ def check_inputs():
 
 
 class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
+    def _network_wake(self):
+        self.market._wake()  # Worker only enqueues; the owner applies all results.
+
     def __init__(self, **kwargs):
         self.market = DualMarket(load_symbols(cfg.SYMBOLS_FILE), cfg.PRICE_FILE)
         self._fast_tick = False
@@ -123,11 +126,13 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return result
 
     def _place_order(self, row):
+        context = dict(decision_epoch_ms=time.time()*1000, _decision_ns=time.monotonic_ns())
         quote = self.market.entry_quote(str(row.get('symbol') or '').upper())
+        context.update(self.market.entry_timing(str(row.get('symbol') or '').upper(), quote.get('source')))
         ceiling = row.get('entry_gap_ceiling', GapPolicy().admission_gap(self._ordinary_pending_count()))
         detail = qualify_quote(quote, self._finite(row.get('limit_price')), ceiling,
                                following=bool(row.get('signal_follow')))
-        return super()._place_order(dict(row, **detail))
+        return super()._place_order(dict(row, **detail, _entry_timing_context=context))
 
     def desired_snapshot(self, *, now):
         payload, status = super().desired_snapshot(now=now)
@@ -299,6 +304,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                     continue
                 try:
                     if tick is None:
+                        if self._drain_network():
+                            next_maintenance = 0  # Reconcile/replacement without a 250ms polling wait.
                         self._publish_entry_gate()
                     else:
                         self.market.decide(tick, self.on_tick)
