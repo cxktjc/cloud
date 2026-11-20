@@ -7,9 +7,11 @@ import contextlib
 import ipaddress
 import json
 import logging
+import ssl
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
+from functools import partial
 from urllib.parse import urlsplit
 
 import websockets
@@ -70,15 +72,20 @@ class ControlTrace(logging.Logger):
 
 
 async def probe(name, symbols, base, stream, seconds, *, subscribe=False,
-                ping_interval=30, peer_ip=None):
+                ping_interval=30, peer_ip=None, tls12=False):
     started = time.monotonic()
     connected = first = last = socket = None
     count = events = acknowledgements = 0
     peer, outcome, chain = None, 'observation_finished', []
     allowed = set(symbols)
     trace = ControlTrace(name)
+    tls_version = None
     observation_end_requested = False
     connection_options = dict(logger=trace)
+    if tls12:
+        context = ssl.create_default_context()
+        context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_2
+        connection_options['ssl'] = context
     if peer_ip:
         connection_options.update(host=str(ipaddress.ip_address(peer_ip)),
                                   server_hostname=urlsplit(base).hostname)
@@ -89,8 +96,12 @@ async def probe(name, symbols, base, stream, seconds, *, subscribe=False,
                 **connection_options) as socket:
             connected = time.monotonic()
             peer = socket.remote_address
+            transport = getattr(socket, 'transport', None)
+            tls_socket = transport.get_extra_info('ssl_object') if transport is not None else None
+            tls_version = tls_socket.version() if tls_socket is not None else None
             emit(case=name, phase='connected', peer=peer, symbols=len(symbols),
-                 connect_ms=round((connected-started)*1000, 3), ping_interval=ping_interval)
+                 connect_ms=round((connected-started)*1000, 3), ping_interval=ping_interval,
+                 tls_version=tls_version)
             if subscribe:
                 await socket.send(json.dumps(dict(method='SUBSCRIBE',
                     params=[f'{s.lower()}@{stream}' for s in symbols], id='readonly-probe')))
@@ -138,6 +149,7 @@ async def probe(name, symbols, base, stream, seconds, *, subscribe=False,
         lifetime_seconds=round(ended-connected, 3) if connected is not None else None,
         total_seconds=round(ended-started, 3),
         ping_interval=ping_interval, observation_end_requested=observation_end_requested,
+        tls_version=tls_version,
         ws_control_counts=dict(trace.counts), ws_control_events=list(trace.events),
         control_note='out means library generated frame; does not prove peer receipt',
         last_data_age_ms=round((ended-last)*1000, 3) if last is not None else None,
@@ -147,7 +159,7 @@ async def probe(name, symbols, base, stream, seconds, *, subscribe=False,
     return result
 
 
-async def run(symbols, seconds, *, heartbeat_compare=False, peer_ip=None):
+async def run(symbols, seconds, *, heartbeat_compare=False, peer_ip=None, tls12=False):
     lag = [0.]
     async def watch():
         while True:
@@ -155,19 +167,20 @@ async def run(symbols, seconds, *, heartbeat_compare=False, peer_ip=None):
             await asyncio.sleep(.1)
             lag[0] = max(lag[0], time.monotonic()-began-.1)
     watcher = asyncio.create_task(watch())
+    run_probe = partial(probe, tls12=True) if tls12 else probe
     try:
         if heartbeat_compare:
             results = await asyncio.gather(
-                probe('depth_BTC_ping30', ['BTCUSDT'], BOOK_WS_BASE, 'bookTicker', seconds,
+                run_probe('depth_BTC_ping30', ['BTCUSDT'], BOOK_WS_BASE, 'bookTicker', seconds,
                       ping_interval=30, peer_ip=peer_ip),
-                probe('depth_BTC_ping2', ['BTCUSDT'], BOOK_WS_BASE, 'bookTicker', seconds,
+                run_probe('depth_BTC_ping2', ['BTCUSDT'], BOOK_WS_BASE, 'bookTicker', seconds,
                       ping_interval=2, peer_ip=peer_ip))
         else:
             results = await asyncio.gather(
-                probe('depth_group_url', symbols, BOOK_WS_BASE, 'bookTicker', seconds),
-                probe('depth_single_url', ['BTCUSDT'], BOOK_WS_BASE, 'bookTicker', seconds),
-                probe('tick_group_url', symbols, WS_BASE, 'aggTrade', seconds),
-                probe('depth_group_subscribe', symbols, BOOK_WS_BASE, 'bookTicker', seconds, subscribe=True))
+                run_probe('depth_group_url', symbols, BOOK_WS_BASE, 'bookTicker', seconds),
+                run_probe('depth_single_url', ['BTCUSDT'], BOOK_WS_BASE, 'bookTicker', seconds),
+                run_probe('tick_group_url', symbols, WS_BASE, 'aggTrade', seconds),
+                run_probe('depth_group_subscribe', symbols, BOOK_WS_BASE, 'bookTicker', seconds, subscribe=True))
     finally:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -181,12 +194,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=float, default=20.)
     parser.add_argument('--group', type=int, default=2, help='same 200-symbol grouping as trade')
+    parser.add_argument('--limit-symbols', type=int, default=200,
+                        help='use first N symbols within original group (1..200); do not shift group boundaries')
     parser.add_argument('--heartbeat-compare', action='store_true',
                         help='compare single-BTC sockets with 30s and 2s ping, retaining automatic pong')
     parser.add_argument('--peer-ip', help='pin both heartbeat cases to one IP; preserve original TLS hostname')
+    parser.add_argument('--tls12', action='store_true',
+                        help='diagnostic TLS 1.2 only; certificate/hostname verification remains enabled')
     args = parser.parse_args()
     if not 1 <= args.seconds <= 60 or args.group < 1:
         parser.error('seconds must be 1..60; group must be positive')
+    if not 1 <= args.limit_symbols <= 200:
+        parser.error('--limit-symbols must be 1..200')
     if args.peer_ip:
         if not args.heartbeat_compare:
             parser.error('--peer-ip requires --heartbeat-compare')
@@ -194,14 +213,16 @@ def main():
             ipaddress.ip_address(args.peer_ip)
         except ValueError:
             parser.error('--peer-ip must be a literal IP address')
-    symbols = load_symbols(DEFAULT_SYMBOLS)[(args.group-1)*200:args.group*200]
+    symbols = load_symbols(DEFAULT_SYMBOLS)[(args.group-1)*200:args.group*200][:args.limit_symbols]
     if not symbols:
         parser.error('group is outside configured symbols')
     emit(phase='start', group=None if args.heartbeat_compare else args.group,
          symbols=1 if args.heartbeat_compare else len(symbols), seconds=args.seconds,
          mode='heartbeat_compare' if args.heartbeat_compare else 'subscription_compare', peer_ip=args.peer_ip,
+         tls_policy='TLSv1.2' if args.tls12 else 'system_default',
          websockets=websockets.__version__, proxy='disabled/direct')
-    results = asyncio.run(run(symbols, args.seconds, heartbeat_compare=args.heartbeat_compare, peer_ip=args.peer_ip))
+    results = asyncio.run(run(symbols, args.seconds, heartbeat_compare=args.heartbeat_compare,
+                             peer_ip=args.peer_ip, tls12=args.tls12))
     return int(any(row['status'] == 'failed' or not row['matching_events'] for row in results))
 
 

@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import ssl
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -128,6 +129,31 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['ping_interval'], 2)
         self.assertFalse(result['observation_end_requested'])
 
+    async def test_tls12_comparison_keeps_certificate_and_hostname_verification(self):
+        connection, socket = self.connection([self.quote()])
+        socket.transport = SimpleNamespace(get_extra_info=lambda name:
+            SimpleNamespace(version=lambda: 'TLSv1.2') if name == 'ssl_object' else None)
+        with patch.object(diagnostic.websockets, 'connect', return_value=connection) as connect, \
+                patch.object(diagnostic, 'emit'):
+            result = await diagnostic.probe('tls12', ['XUSDT'], diagnostic.BOOK_WS_BASE,
+                                            'bookTicker', 20, tls12=True)
+        context = connect.call_args.kwargs['ssl']
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+        self.assertEqual(context.maximum_version, ssl.TLSVersion.TLSv1_2)
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(result['tls_version'], 'TLSv1.2')
+
+    async def test_tls12_option_applies_to_every_comparison_socket(self):
+        calls = []
+        async def probe(*args, **kwargs):
+            calls.append(kwargs)
+            return dict(case=args[0], matching_events=1, status='observation_finished')
+        with patch.object(diagnostic, 'probe', side_effect=probe), patch.object(diagnostic, 'emit'):
+            await diagnostic.run(['XUSDT'], 20, tls12=True)
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(call['tls12'] for call in calls))
+
     async def test_real_library_automatically_pongs_and_records_control_frames(self):
         from websockets.asyncio.server import serve
         confirmed = []
@@ -182,3 +208,21 @@ class ExceptionChainTests(unittest.TestCase):
         error = OSError('lost')
         error.__cause__ = error
         self.assertEqual(diagnostic.exception_chain(error), ['OSError: lost'])
+
+
+class CLIComparisonTests(unittest.TestCase):
+    def test_100_symbol_cli_keeps_original_group_and_applies_count_to_all_group_sockets(self):
+        symbols = [f'S{index:03d}USDT' for index in range(450)]
+        calls = []
+        async def probe(*args, **kwargs):
+            calls.append((args, kwargs))
+            return dict(status='observation_finished', matching_events=1)
+        with patch('sys.argv', ['probe', '--group', '2', '--limit-symbols', '100', '--seconds', '20']), \
+                patch.object(diagnostic, 'load_symbols', return_value=symbols), \
+                patch.object(diagnostic, 'probe', side_effect=probe), patch.object(diagnostic, 'emit') as emit:
+            self.assertEqual(diagnostic.main(), 0)
+        self.assertEqual([args[1] for args, _ in calls],
+                         [symbols[200:300], ['BTCUSDT'], symbols[200:300], symbols[200:300]])
+        self.assertEqual(emit.call_args_list[0].kwargs['symbols'], 100)
+        self.assertEqual(emit.call_args_list[0].kwargs['tls_policy'], 'system_default')
+        self.assertTrue(all('peer_ip' not in kw and 'tls12' not in kw for _, kw in calls))
