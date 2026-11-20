@@ -286,6 +286,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             self.stats['fill'] += 1
         row['accounted_entry_qty'] = qty
         row['accounted_entry_quote'] = qty * avg
+        timing = self.session_entries.timings.order(str(row.get('client_order_id') or '')) or row.get('entry_timing')
+        if timing:
+            self.positions[symbol]['entry_timing'] = timing
         self.session_entries.observe_fill(symbol, row, quantity=qty)
         self.ledger.save()
         self._publish_entry_gate()
@@ -905,10 +908,11 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         desired_rows, live_desired, price_map, plan = self._execute_entries(
             snapshot, status, now=now, targets=targets, final_exit_bar=final_exit_bar)
         checkpoint('entry_plan')
-        for row in self.tracked.values():
-            timing = self.session_entries.timings.order(str(row.get('client_order_id') or ''))
+        for row in (*self.tracked.values(), *self.positions.values()):
+            timing = self.session_entries.timings.order(str(row.get('client_order_id') or row.get('entry_client_order_id') or ''))
             if timing:
                 row['entry_timing'] = timing
+        self.session_entries.observe_owned_state(self.positions, self.tracked)
         self.ledger.save()
         checkpoint('ledger')
         stream_health = self._stream_health()

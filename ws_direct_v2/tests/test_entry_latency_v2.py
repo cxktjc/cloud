@@ -11,7 +11,8 @@ from v9711_live.exchange.binance_futures_trade_ws import BinanceFuturesTradeWS
 from v9711_live.execution.entry_timing import EntrySendProbe, EntryTimings
 from v9711_live.execution.nonblocking_io import NetworkIO
 from v9711_live.execution.session_entries import SessionEntryStats
-from v9711_live.execution.terminal import entry_timing_lines
+from v9711_live.execution.stats import compute_comparison
+from v9711_live.execution.terminal import entry_timing_lines, TradeTerminalView
 
 
 class EntryLatencyTests(unittest.TestCase):
@@ -99,6 +100,64 @@ class EntryLatencyTests(unittest.TestCase):
         self.nano += 25_000_000
         self.timing.mark('first', 'response')
         self.assertEqual(self.timing.order('first')['latencies_ms']['send_to_response'], 25)
+
+    def test_older_same_symbol_position_explains_missing_without_borrowing_its_send_time(self):
+        self.register('older', bar=self.bar-cfg.BAR_MS)
+        self.timing.mark('older', 'send', transport='WS')
+        position = dict(symbol='THEUSDT', quantity=1, entry_client_order_id='older',
+                        order_bar_open_ms=self.bar-cfg.BAR_MS, entry_fill_time_ms=self.bar-1000)
+        self.stats.observe_owned_state({'THEUSDT': position}, {})
+        entry = self.observe_signal()
+        self.assertEqual(self.stats.snapshot()['trade_filled_entries'], 0)
+        self.assertEqual(entry['first_order_timing'], {})
+        other = entry['same_symbol_trade']
+        self.assertEqual(other['mismatch_reason'], 'different_entry_bar')
+        self.assertIn('send_epoch_ms', other['first_order_timing'])
+        # The table compares floating PnL even when both sides hold the symbol.
+        comparison = compute_comparison(actual_positions={'THEUSDT': position}, open_orders={},
+            signal_portfolio={}, target_positions=[self.target], price_map={}, realized_balance=15)
+        output = TradeTerminalView()._format(dict(comparison=comparison, clock_utc='test',
+            session_entry_stats=self.stats.snapshot()))
+        self.assertIn('持仓浮盈差异（含双方持有', output)
+        self.assertIn('[双方持有]', output)
+        self.assertIn('入场bar不同，不计入该笔signal成交', output)
+        self.assertIn('同币trade这笔持仓的下单记录（另笔入场）', output)
+
+    def test_same_bar_different_explicit_position_id_remains_unmatched(self):
+        self.stats.observe_owned_state({'THEUSDT': dict(quantity=1,
+            entry_client_order_id='older', order_bar_open_ms=self.bar, position_id='book:OTHER')}, {})
+        entry = self.observe_signal()
+        self.assertEqual(self.stats.snapshot()['trade_filled_entries'], 0)
+        self.assertEqual(entry['same_symbol_trade']['mismatch_reason'], 'entry_identity_not_matched')
+
+    def test_same_entry_positive_fill_is_not_reported_as_missing(self):
+        self.stats.observe_owned_state({'THEUSDT': dict(quantity=.1,
+            entry_client_order_id='filled', order_bar_open_ms=self.bar)}, {})
+        self.stats.observe_signal(dict(signal_ready=True, signal_session_id='book', portfolio={},
+            target_positions=[self.target]), status='valid', now=self.bar/1000+181)
+        self.assertEqual(self.stats.snapshot()['trade_filled_entries'], 1)
+        self.assertEqual(self.stats.snapshot()['recent_unfilled_entries'], [])
+
+    def test_existing_position_context_is_removed_when_position_closes(self):
+        self.stats.observe_owned_state({'THEUSDT': dict(quantity=1,
+            entry_client_order_id='older', order_bar_open_ms=self.bar-cfg.BAR_MS)}, {})
+        self.assertIn('same_symbol_trade', self.observe_signal())
+        self.stats.observe_owned_state({}, {})
+        self.assertNotIn('same_symbol_trade', self.stats.snapshot()['recent_unfilled_entries'][0])
+
+    def test_persisted_position_timing_can_be_shown_without_recreating_send_evidence(self):
+        self.stats.observe_owned_state({'THEUSDT': dict(quantity=1, entry_client_order_id='older',
+            order_bar_open_ms=self.bar-cfg.BAR_MS,
+            entry_timing=dict(send_epoch_ms=self.bar-1000, transport='WS'))}, {})
+        entry = self.observe_signal()
+        self.assertEqual(entry['first_order_timing'], {})
+        self.assertEqual(entry['same_symbol_trade']['first_order_timing']['send_epoch_ms'], self.bar-1000)
+        self.assertEqual(self.timing.order('older'), {})
+
+    def test_legacy_model_timing_text_is_not_treated_as_a_real_send(self):
+        self.stats.observe_owned_state({'THEUSDT': dict(quantity=1, entry_client_order_id='older',
+            order_bar_open_ms=self.bar-cfg.BAR_MS, entry_timing='unknown_within_3m_confirmed_after_close')}, {})
+        self.assertEqual(self.observe_signal()['same_symbol_trade']['first_order_timing'], {})
 
 
 class WireProbeTests(unittest.IsolatedAsyncioTestCase):
@@ -240,6 +299,22 @@ class BatchLatencyTests(unittest.TestCase):
     ordinary_plan = fixtures.DualAdmissionTests.ordinary_plan
     plans = fixtures.DualAdmissionTests.plans
     tick = fixtures.DualAdmissionTests.tick
+
+    def test_exact_fill_preserves_recorded_times_after_entry_order_is_retired(self):
+        self.plans()
+        self.tick(1.01)
+        row = self.trade.tracked['N0USDT']
+        cid = row['client_order_id']
+        self.trade.session_entries.timings.mark(cid, 'send', transport='WS')
+        self.assertTrue(self.trade._register_fill('N0USDT', row,
+            dict(symbol='N0USDT', clientOrderId=cid, orderId=row['order_id'], updateTime=self.now*1000),
+            row['qty'], 1.))
+        self.trade._retire_order('N0USDT', row, 'FILLED')
+        timing = self.trade.positions['N0USDT']['entry_timing']
+        self.assertEqual(timing['client_order_id'], cid)
+        self.assertIn('received_epoch_ms', timing)
+        self.assertIn('send_epoch_ms', timing)
+        self.assertNotIn('N0USDT', self.trade.tracked)
 
     def test_batch_marks_each_exact_members_own_quote_and_request_times(self):
         fixtures.DualAdmissionTests.test_batch_send_retains_each_members_own_qualification(self)

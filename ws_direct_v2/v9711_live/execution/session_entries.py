@@ -42,6 +42,7 @@ class SessionEntryStats:
         self._cache_limit = -1
         self.timings = EntryTimings()
         self._cache_timing_revision = -1
+        self._current_trade_positions: dict[str, dict[str, Any]] = {}
 
     def observe_fill(self, symbol: str, row: Mapping[str, Any], *, quantity: Any) -> None:
         """Caller supplies a booked, positive, exact-owned ENTRY fill only."""
@@ -67,9 +68,20 @@ class SessionEntryStats:
     def observe_owned_state(self, positions: Mapping[str, Any],
                             tracked_orders: Mapping[str, Any]) -> None:
         """Seed/recheck booked evidence without treating a submitted order as filled."""
+        current = {}
         for symbol, row in positions.items():
             if isinstance(row, Mapping):
                 self.observe_fill(symbol, row, quantity=row.get('quantity'))
+                if positive(row.get('quantity')):
+                    current[str(symbol).upper()] = dict(
+                        position_id=str(row.get('position_id') or ''),
+                        entry_bar_open_ms=int(positive(row.get('order_bar_open_ms') or row.get('entry_bar_open_ms'))),
+                        client_order_id=str(row.get('entry_client_order_id') or ''),
+                        entry_fill_time_ms=int(positive(row.get('entry_fill_time_ms'))),
+                        entry_timing=dict(row['entry_timing']) if isinstance(row.get('entry_timing'), Mapping) else {})
+        if current != self._current_trade_positions:
+            self._current_trade_positions = current
+            self._cache = None
         for symbol, row in tracked_orders.items():
             if isinstance(row, Mapping):
                 self.observe_fill(symbol, row, quantity=row.get('accounted_entry_qty'))
@@ -144,6 +156,20 @@ class SessionEntryStats:
                  and (symbol, entry['position_id']) in self._filled_ids)
                 or (symbol, entry['entry_bar_open_ms']) in self._filled_bars)
 
+    def _detail(self, entry):
+        result = dict(entry, first_order_timing=self.timings.first_for(entry))
+        current = self._current_trade_positions.get(entry['symbol'])
+        if current:
+            # Context only: a same-symbol position must never fabricate a
+            # fill or supply the first-send timestamp of a different signal.
+            result['same_symbol_trade'] = dict(current,
+                mismatch_reason=('different_entry_bar' if current['entry_bar_open_ms']
+                                 and current['entry_bar_open_ms'] != entry['entry_bar_open_ms']
+                                 else 'entry_identity_not_matched'),
+                first_order_timing=(self.timings.order(current['client_order_id'])
+                                    or current['entry_timing']))
+        return result
+
     def snapshot(self, *, max_rows: int = 12) -> dict[str, Any]:
         """Stable, cached display data; no clocks/ages that force periodic redraws."""
         limit = max(0, int(max_rows))
@@ -163,8 +189,7 @@ class SessionEntryStats:
             'unfilled_entries': len(missing),
             'active_unfilled_entries': active,
             'ended_unfilled_entries': len(missing) - active,
-            'recent_unfilled_entries': [dict(entry, first_order_timing=self.timings.first_for(entry))
-                                       for entry in missing[:limit]],
+            'recent_unfilled_entries': [self._detail(entry) for entry in missing[:limit]],
             'details_truncated': len(missing) > limit,
         }
         self._cache_limit = limit

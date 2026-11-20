@@ -170,14 +170,15 @@ class TradeTerminalView:
             f'({parts["capacity_excluded_return_pct"]:+.4f}%)  '
             '说明：这是signal-only当前目标按同价估算，不是已实现收益。',
             '-' * 116,
-            '最大差异持仓（signal-trade，正=signal领先）:',
+            '持仓浮盈差异（含双方持有；signal-trade，正=signal领先）:',
         ]
         rows = f['comparison']['positions']['largest_difference'][:self.max_rows]
         if not rows:
             lines.append('  （暂无差异）')
         for row in rows:
+            kind = {'matched': '双方持有', 'signal_only': '仅signal持有', 'trade_only': '仅trade持有'}.get(row['kind'], row['kind'])
             lines.append(
-                f'  {row["symbol"]} [{row["kind"]}] signal_pnl={row["signal_unrealized_pnl"]:+.6f} '
+                f'  {row["symbol"]} [{kind}] signal_pnl={row["signal_unrealized_pnl"]:+.6f} '
                 f'trade_pnl={row["trade_unrealized_pnl"]:+.6f} '
                 f'diff={row["difference_signal_minus_trade"]:+.6f}')
         lines.extend([
@@ -299,7 +300,20 @@ class TradeTerminalView:
                     state = 'signal仍持仓' if row['signal_active'] else 'signal已结束/撤回'
                     block.append(f'    {row["symbol"]} 入场bar={iso(row["entry_bar_open_ms"])} '
                                  f'确认={iso(row["entry_available_ms"])} [{state}]')
-                    block.extend(entry_timing_lines(row.get('first_order_timing')))
+                    timing = row.get('first_order_timing')
+                    if timing:
+                        block.extend(entry_timing_lines(timing))
+                    else:
+                        block.append('      该笔signal尚无匹配的下单时间记录；不使用其他入场bar的记录代填。')
+                    current = row.get('same_symbol_trade')
+                    if current:
+                        reason = ('入场bar不同' if current.get('mismatch_reason') == 'different_entry_bar'
+                                  else '入场身份未匹配')
+                        block.append(f'      同币trade已有持仓：入场bar={iso(current.get("entry_bar_open_ms"))} '
+                                     f'成交={iso_ms(current.get("entry_fill_time_ms"))}；{reason}，不计入该笔signal成交。')
+                        if current.get('first_order_timing'):
+                            block.append('      同币trade这笔持仓的下单记录（另笔入场）:')
+                            block.extend(entry_timing_lines(current['first_order_timing']))
             else:
                 block.append('  未成交明细: （暂无）')
             block.append('  口径: 只计启动后完成3m确认的signal入场；部分成交算已开仓；'
