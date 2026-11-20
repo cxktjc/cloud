@@ -9,14 +9,18 @@ import queue
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from tests import test_book_ticker_v2 as fixtures
 from v9711_live import config as cfg
 
 
-def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False):
+def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, near_symbols=8):
     case = fixtures.DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
+    # Keep the fixture's stable bar clock without Mock call recording on each
+    # quote. That test-only overhead can dominate busy-market measurements.
+    case.stack.enter_context(patch('time.time', lambda: case.now))
     stop, errors = threading.Event(), []
     threads = []
     simulated_batch_ids = []
@@ -42,7 +46,7 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False):
         while not market.events.empty():
             market.events.get_nowait()
         for index, symbol in enumerate(case.symbols):
-            price = '1.01' if index < 8 else '1.03'
+            price = '1.01' if index < near_symbols else '1.03'
             market.update(symbol, price, int(case.now*1000))
             market.decide(market.events.get_nowait(), lambda event: None)
             market.update_book(symbol, price, '2', int(case.now*1000), index+1)
@@ -62,13 +66,14 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False):
                     if index % 32 == 0:
                         stop.wait(max(0, started+index/rate-time.perf_counter()))
                     symbol = case.symbols[index % symbols]
-                    if pattern == 'changing':
+                    if pattern in ('changing', 'changing_effective'):
                         # All sources change price on every revisit, including
                         # incumbent orders; no quantity-only dedupe benefit.
-                        base = 1.01 if index % symbols < 8 else 1.03
-                        price = base+(index//symbols % 2)*.0001
+                        base = 1.01 if index % symbols < near_symbols else 1.03
+                        revisit = index//symbols % 2
+                        price = base+(revisit*.0002-.0001 if pattern == 'changing_effective' else revisit*.0001)
                     else:
-                        price = 1.01 if index % symbols < 8 else 1.03+(index % 2)*.001
+                        price = 1.01 if index % symbols < near_symbols else 1.03+(index % 2)*.001
                     try:
                         if index % 5 == 0:
                             market.update(symbol, str(price), int(case.now*1000))
@@ -103,7 +108,13 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False):
                 event = market.events.get(timeout=.01)
             except queue.Empty:
                 continue
-            if market.decide(event, case.trade.on_tick):
+            if event is None:
+                # Match the production owner: a completed network operation
+                # can request immediate maintenance ahead of queued quotes.
+                if case.trade._drain_network():
+                    maintenance = 0
+                case.trade._publish_entry_gate()
+            elif market.decide(event, case.trade.on_tick):
                 decision_ms.append((time.monotonic_ns()-event.received_ns)/1e6)
             market.events.task_done()
         for thread in threads:
@@ -114,7 +125,7 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False):
         maintenance_ms.sort()
         decision_ms.sort()
         percentile = lambda p: round(decision_ms[int((len(decision_ms)-1)*p)], 3) if decision_ms else None
-        return dict(symbols=symbols, pattern=pattern, nonblocking_io=nonblocking,
+        return dict(symbols=symbols, near_symbols=near_symbols, pattern=pattern, nonblocking_io=nonblocking,
             target_frames=frames, target_rate=rate,
             elapsed_seconds=round(time.perf_counter()-started, 3), counters=counters,
             queue_peak=result.get('queue_peak'), p95_receive_to_decision_ms=percentile(.95),
@@ -135,13 +146,16 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rate', type=int, default=5000)
     parser.add_argument('--seconds', type=float, default=3)
-    parser.add_argument('--pattern', choices=('mixed', 'changing'), default='mixed')
+    parser.add_argument('--pattern', choices=('mixed', 'changing', 'changing_effective'), default='mixed')
     parser.add_argument('--nonblocking', action='store_true')
+    parser.add_argument('--near-symbols', type=int, default=8,
+                        help='Number of 800 symbols near the limit; 800 exercises broad selloffs')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    if args.rate <= 0 or args.seconds <= 0:
-        parser.error('rate and seconds must be positive')
-    result = run(args.rate, args.seconds, pattern=args.pattern, nonblocking=args.nonblocking)
+    if args.rate <= 0 or args.seconds <= 0 or not 0 <= args.near_symbols <= 800:
+        parser.error('rate/seconds must be positive and near-symbols must be in 0..800')
+    result = run(args.rate, args.seconds, pattern=args.pattern, nonblocking=args.nonblocking,
+                 near_symbols=args.near_symbols)
     text = json.dumps(result, indent=2)
     print(text)
     if args.output:
