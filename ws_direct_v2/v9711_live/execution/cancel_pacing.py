@@ -61,6 +61,8 @@ class EntryCancelPacing:
                         and job.key not in self._entry_cancel_orders):
                     job.state = 'done'
                     job.value = {'_cancel_not_sent': True}
+                    if job.done is not None:
+                        self._completed_callbacks.set()
             self._heap = [ticket for ticket in self._heap
                           if self._jobs.get(ticket[2]) is not None
                           and self._jobs[ticket[2]].state == 'queued']

@@ -13,7 +13,7 @@ from .position_identity import CAPITAL_MODE
 from .sizing import CountSizingMixin
 from .signal_follow import SignalFollowMixin
 from .entry_quotes import qualify_quote
-from ..entry_policy import GapPolicy
+from ..entry_policy import GapPolicy, at_most
 from collectors.ticker_ws import load_symbols
 
 LOG = logging.getLogger('v9711.ws_direct')
@@ -39,6 +39,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._fast_tick = False
         self._account_deadline = 0.0
         self._template_revision = -1
+        self._template_file_revision = -1
         self._templates = {}
         self._eligible = {}
         self._rank_heap = []
@@ -46,6 +47,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._active_price_symbols = None
         self._cycle_price_maps = None
         self._skipped_far_events = 0
+        self._skipped_noncompetitive_events = 0
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.market_guard = self._market_send_allowed
@@ -55,14 +57,13 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def _refresh_precision_readiness(self):
         # Only startup/maintenance reads the cache; no extra file read per tick.
-        with self.client._metadata_lock:
-            metadata = self.client._metadata_reader.read()
+        metadata = self.client.refresh_metadata_snapshot()
         self._precision_ready = isinstance(metadata, dict) and bool(metadata.get('symbols'))
 
     def _market_send_allowed(self, symbol):
         account_ready = (not self.client.enabled or self.client.dry_run
                          or time.time() <= self._account_deadline)
-        return account_ready and self.market.order_allowed(symbol)
+        return account_ready and self.market.send_quote(symbol)['selected'] is not None
 
     def _entry_quote_send_allowed(self, symbol, cid, limit):
         return self._entry_quote_send_snapshot(symbol, cid, limit)['entry_qualified_by'] != 'none'
@@ -70,7 +71,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def _entry_quote_send_snapshot(self, symbol, cid, limit):
         gate = self.client.entry_gate  # immutable owner snapshot; no worker ledger access
         ceiling = gate.get('entry_gap_limits', {}).get(cid)
-        return qualify_quote(self.market.entry_quote(symbol), limit, ceiling,
+        return qualify_quote(self.market.send_quote(symbol), limit, ceiling,
                              following=cid in gate.get('follow_entries', {}))
 
     def step(self, *, now=None):
@@ -142,14 +143,17 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             return self._fresh_fallback(), 'incompatible_ws_direct_contract'
         payload['signal_discovery_desired'] = payload.get('desired') or []
         payload['desired'] = payload['candidate_templates']
-        if self._template_revision != self._desired_reader.revision:
-            self._templates = {row['symbol']:dict(row) for row in payload['candidate_templates']
-                               if isinstance(row, dict) and row.get('symbol')}
-            self._eligible.clear()
-            self._rank_heap.clear()
-            for symbol, price in self.market.entry_prices().items():
-                self._update_rank(symbol, price)
-            self._template_revision = self._desired_reader.revision
+        if self._template_file_revision != self._desired_reader.revision:
+            templates = {row['symbol']:dict(row) for row in payload['candidate_templates']
+                         if isinstance(row, dict) and row.get('symbol')}
+            if templates != self._templates:
+                self._templates = templates
+                self._eligible.clear()
+                self._rank_heap.clear()
+                for symbol, price in self.market.entry_prices().items():
+                    self._update_rank(symbol, price)
+                self._template_revision += 1
+            self._template_file_revision = self._desired_reader.revision
         self._promote_signal_follow_orders(payload, now=now)
         return payload, status
 
@@ -225,7 +229,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def on_tick(self, tick):
         now = time.time()
-        previous_revision = self._template_revision
+        previous_revision = self._template_file_revision
         snapshot, status = self.desired_snapshot(now=now)
         self._io_signal = snapshot, status
         completed = self._drain_network()
@@ -235,7 +239,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         # distance, or become a follow order. Still process every crossing and
         # every update of an existing eligible/owned/target symbol. Periodic
         # maintenance handles all time/state changes independently of ingress.
-        if (status == 'valid' and previous_revision == self._template_revision and not completed
+        if (status == 'valid' and previous_revision == self._template_file_revision and not completed
                 and tick.symbol not in self.tracked and tick.symbol not in self.positions and tick.symbol not in targets
                 and tick.symbol not in self._eligible and not self.ledger.state.get('pending_rotation')):
             template = self._templates.get(tick.symbol) or {}
@@ -245,6 +249,33 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
                 self._skipped_far_events += 1
                 return False
+        # Empty books cannot admit a quote outside the first tier; full books
+        # cannot rotate without the required improvement. A conservative heap
+        # bound avoids a full plan but never drops a crossing or incumbent event.
+        ordinary = {s: r for s, r in self.tracked.items() if not r.get('signal_follow')}
+        if (status == 'valid' and previous_revision == self._template_file_revision and not completed
+                and len(ordinary) in (0, cfg.MAX_PENDING_ORDERS)
+                and tick.symbol not in self.tracked and tick.symbol not in self.positions and tick.symbol not in targets
+                and len(self.positions) < cfg.SLOTS and not self.ledger.state.get('pending_rotation')
+                and all(not r.get('cancel_requested') and
+                        int(r.get('order_bar_open_ms') or 0) <= now*1000 < int(r.get('order_bar_open_ms') or 0)+cfg.BAR_MS
+                        for r in ordinary.values())):
+            quote = self.market.entry_quote(tick.symbol)['selected']
+            self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
+            while self._rank_heap and self._eligible.get(self._rank_heap[0][1]) != self._rank_heap[0]:
+                heapq.heappop(self._rank_heap)
+            best = self._rank_heap[0][0] if self._rank_heap else float('inf')
+            if not ordinary and not at_most(best, GapPolicy().admission_gap(0)):
+                self._skipped_noncompetitive_events += 1
+                return False
+            prices = self.market.entry_prices(ordinary)
+            gaps = [(prices[s]-float(r['limit_price']))/float(r['limit_price'])
+                    for s, r in ordinary.items() if s in prices and float(r.get('limit_price') or 0) > 0]
+            if ordinary and len(gaps) == len(ordinary) and at_most(max(gaps), cfg.CANCEL_GAP):
+                if not GapPolicy().replacement_allowed(max(gaps), best,
+                        ceiling=cfg.CANCEL_GAP, count=len(ordinary)):
+                    self._skipped_noncompetitive_events += 1
+                    return False
         # A far quote changed no signal/order/position state. Rebuilding the
         # immutable worker gate for it cannot change admission; workers still
         # check live market health, quote distance, TTL and capacity at send.
@@ -267,6 +298,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._entry_diagnostics = dict(getattr(self, '_entry_diagnostics', {}),
                                        ws_direct=self.market.metrics())
         self._entry_diagnostics['ws_direct']['skipped_far_events'] = self._skipped_far_events
+        self._entry_diagnostics['ws_direct']['skipped_noncompetitive_events'] = self._skipped_noncompetitive_events
         super().write_feedback(**kwargs)
 
     def _run_loop(self):

@@ -1,4 +1,4 @@
-"""Pure tiered execution selection; exact-cancel-first rotation reservations.
+"""Tiered admission with independent paced cancels and exact slot ownership.
 
 The first five physical pending entries admit <=1.85%, orders 6-8 admit <=1.65%.
 At any count a >=0.30pp improvement rotates BEFORE filling a free slot;
@@ -85,6 +85,7 @@ class Plan:
     actions: tuple[Action, ...]
     rotation: Mapping[str, Any] | None = None
     rotation_action: str = ''  # reserve | consume | clear; durable owner applies it
+    rotation_placement: str = ''  # only this row may consume replacement qualification
 
 
 def select_physical_orders(
@@ -105,10 +106,10 @@ def select_physical_orders(
     pending_rotation: Mapping[str, Any] | None = None,
     ignore_position_capacity: bool = False,
 ) -> Plan:
-    """Select admissions or ONE cancel-first rotation, never a blind replacement.
+    """Use free slots immediately; wait only when reusing an occupied slot.
 
-    An unresolved rotation reserves the intended replacement, including when
-    the book has spare physical slots. Its original order count survives the
+    An unresolved victim keeps its physical slot until exact terminal evidence.
+    Other vacancies remain available. Its original order count survives the
     victim's retirement: a five-order rotation still uses the 0.22pp margin
     after cancellation leaves four orders. Fresh quotes also retire ordinary
     entries strictly beyond cancel_gap, independently of signal readiness.
@@ -178,14 +179,37 @@ def select_physical_orders(
         pending_rotation = None
         rotation_action = 'clear'
 
-    def result(placed=(), *, rotation=None, state=None):
+    def result(placed=(), *, rotation=None, state=None, replacement=''):
         return Plan(tuple(sorted(kept)), tuple(placed), tuple(cancel), tuple(actions),
-                    rotation, rotation_action if state is None else state)
+                    rotation, rotation_action if state is None else state, replacement)
+
+    def fill_independent_vacancies(excluded=(), reserved=0):
+        # A cancel keeps its OWN physical slot, never a global admission lock.
+        # A locally missing but unconfirmed victim reserves one virtual slot.
+        placed = []
+        for candidate in sorted((r for s, r in rows.items()
+                if s not in tracked and s not in excluded), key=lambda r: (r.gap, r.symbol)):
+            count = len(tracked)+reserved+len(placed)
+            if count >= max_orders:
+                break
+            if at_most(candidate.gap, policy.admission_gap(count)):
+                placed.append(candidate)
+                actions.append(Action('place', candidate.symbol, 'independent_slot_while_cancel_pending',
+                    candidate.limit_price, candidate.notional, candidate.gap, candidate.observed_price))
+        return placed
+
+    def replacement_candidates(pending):
+        count = int(_finite(pending.get('original_order_count')))
+        return sorted((r for r in rows.values()
+            if r.symbol not in tracked and r.symbol != pending.get('victim')
+            and r.order_bar_open_ms == int(_finite(pending.get('order_bar_open_ms')))
+            and policy.replacement_allowed(_finite(pending.get('victim_gap'), float('nan')), r.gap,
+                ceiling=policy.rotation_gap(count, max_orders), count=count)), key=lambda r: (r.gap, r.symbol))
 
     if slots == 0:
         return result(state='clear' if pending_rotation else rotation_action)
-    # A rotation is a transaction, not a newly free book. Never add into other
-    # vacancies while the exact victim cancellation/its accounting is unknown.
+    # Keep exact victim accounting, but let independent physical vacancies send
+    # immediately. The victim's occupied slot cannot be reused before terminal.
     if pending_rotation:
         victim = str(pending_rotation.get('victim') or '')
         current = tracked.get(victim)
@@ -202,12 +226,20 @@ def select_physical_orders(
                 actions.append(Action('cancel', victim, 'replaced_by_closer', order_id=current.get('order_id')))
             actions.append(Action('defer', str(pending_rotation.get('challenger') or ''),
                                   'await_reserved_rotation_terminal'))
-            return result()
+            candidates = replacement_candidates(pending_rotation) if signal_ready else []
+            if len(tracked) < max_orders and candidates:
+                best = candidates[0]
+                actions.append(Action('place', best.symbol, 'replacement_uses_existing_free_slot',
+                    best.limit_price, best.notional, best.gap, best.observed_price))
+                return result((best,), state='consume', replacement=best.symbol)
+            placed = fill_independent_vacancies((victim, pending_rotation.get('challenger'))) if signal_ready else ()
+            return result(placed)
         if not pending_rotation.get('victim_terminal'):
             # Missing local rows are not exact exchange negative evidence.
             actions.append(Action('defer', str(pending_rotation.get('challenger') or ''),
                                   'rotation_victim_fate_unknown'))
-            return result()
+            placed = fill_independent_vacancies((victim, pending_rotation.get('challenger')), reserved=1) if signal_ready else ()
+            return result(placed)
         if not signal_ready or len(tracked) >= max_orders:
             return result()
         original_count = int(_finite(pending_rotation.get('original_order_count')))
@@ -225,8 +257,10 @@ def select_physical_orders(
             best = challengers[0]
             actions.append(Action('place', best.symbol, 'complete_reserved_replacement',
                                   best.limit_price, best.notional, best.gap, best.observed_price))
-            return result((best,), state='consume')
-        return result()  # wait for a fresh qualifying replacement or original bar expiry
+            return result((best,), state='consume', replacement=best.symbol)
+        # Preserve one slot for this exact replacement even when its current
+        # quote is outside its promised improvement; other vacancies stay live.
+        return result(fill_independent_vacancies((victim, pending_rotation.get('challenger')), reserved=1))
 
     if not signal_ready:
         return result()
@@ -234,9 +268,9 @@ def select_physical_orders(
                          key=lambda r: (r.gap, r.symbol))
     count = len(tracked)
     # Relative improvement takes priority at every nonempty order count.
-    if (kept and not cancel and not in_flight
-            and len(ranked) == len(kept)):
-        worst = max(kept, key=lambda s: (ranked[s].gap, s))
+    active_kept = {s for s in kept if not tracked[s].get('cancel_requested')}
+    if active_kept and len(ranked) == len(active_kept):
+        worst = max(active_kept, key=lambda s: (ranked[s].gap, s))
         ceiling = policy.rotation_gap(count, max_orders)
         best = next((r for r in challengers if policy.replacement_allowed(
             ranked[worst].gap, r.gap, ceiling=ceiling, count=count)), None)
@@ -255,6 +289,10 @@ def select_physical_orders(
             r = ranked[worst]
             actions.append(Action('cancel', worst, 'replaced_by_closer', r.limit_price,
                                   r.notional, r.gap, r.observed_price, old.get('order_id')))
+            if count < max_orders:
+                actions.append(Action('place', best.symbol, 'replacement_uses_existing_free_slot',
+                    best.limit_price, best.notional, best.gap, best.observed_price))
+                return result((best,), rotation=rotation, state='reserve', replacement=best.symbol)
             actions.append(Action('defer', best.symbol, 'await_cancel_terminal_before_replace',
                                   best.limit_price, best.notional, best.gap, best.observed_price))
             return result(rotation=rotation, state='reserve')

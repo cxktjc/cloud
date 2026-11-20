@@ -1001,7 +1001,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     'position_id': (targets.get(row.symbol) or {}).get('position_id', ''),
                     'entry_gap_ceiling': GapPolicy().admission_gap(self._ordinary_pending_count()),
                 }
-                if plan.rotation_action == 'consume':
+                if plan.rotation_placement == row.symbol:
                     raw['_rotation_origin'] = dict(self.ledger.state.get('pending_rotation') or {})
                     origin = raw['_rotation_origin']
                     raw['entry_gap_ceiling'] = min(cfg.CANCEL_GAP, self._finite(origin.get('victim_gap'))
@@ -1058,7 +1058,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                  'replacement bypasses admission tiers; cancel gap>%.2f%%',
                  cfg.BOOTSTRAP_PLACE_GAP*100, cfg.FILL_PLACE_GAP*100,
                  cfg.SWITCH_TOLERANCE*100, cfg.CROWDED_SWITCH_TOLERANCE*100, cfg.CANCEL_GAP*100)
-        LOG.info('entry plans: singleton=WS multi=REST batchOrders chunks<=5; independent plans do not await previous ACK')
+        LOG.info('entry plans: immediate individual WS by default; optional V9711_LIVE_ENTRY_BATCH=1 REST chunks<=5; entry cancels independently paced')
         LOG.info('entry cancels: nearest absolute relative gap first; one at a time; '
                  '1.5s after previous response; exit/QUEUE cancels and other I/O bypass this lane')
         LOG.info('close policy normal=%s wait=%.1fs rounds=%d timed_exit_lead=%.1fs cancel_retry=%.1fs '

@@ -69,6 +69,7 @@ class OwnershipLedger:
         self.state.setdefault('unknown_since_epoch', {})
         self.state.setdefault('signal_session_id', None)
         self.state.setdefault('last_signal_revision', None)
+        self._saved_intents = self._saved_state = None
 
     def unknown_since(self, key: str, *, now: float) -> float:
         existing = _finite(self.state['unknown_since_epoch'].get(key))
@@ -89,12 +90,18 @@ class OwnershipLedger:
         return dict(value) if isinstance(value, Mapping) else dict(default)
 
     def save(self) -> None:
-        atomic_write_json(self.path, {
-            'schema_version': 1, 'component': 'execution',
-            'updated_at_epoch': time.time(), 'intents': self.intents})
-        atomic_write_json(self.state_path, {
-            'schema_version': 1, 'component': 'execution',
-            'updated_at_epoch': time.time(), 'state': self.state})
+        # A successful save is still durable before dispatch. Unchanged files
+        # need no new fsync; cache each document ONLY after its replace succeeds
+        # so an interrupted second write is retried on the next owner cycle.
+        for name, path, value in (('intents', self.path, self.intents),
+                                  ('state', self.state_path, self.state)):
+            encoded = json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+            attr = '_saved_' + name
+            if encoded != getattr(self, attr):
+                atomic_write_json(path, {
+                    'schema_version': 1, 'component': 'execution',
+                    'updated_at_epoch': time.time(), name: value})
+                setattr(self, attr, encoded)
 
     def client_id(self, symbol: str, bar_open_ms: int, kind: str) -> str:
         generation = self.state.get('sizing_generations', {}).get(f'{symbol.upper()}:{int(bar_open_ms)}', 0) if kind == 'entry' else 0
@@ -174,6 +181,10 @@ class ExchangeClient(BatchEntryMixin):
         self._transport_lanes = {}
         self._broker: Any = None
         self._meta_cache: dict[str, dict[str, Any]] = {}
+        self._metadata_snapshot_enabled = False
+        self._metadata_payload = None
+        self._meta_revision = -1
+        self._prepared_cache = {}
         self._order_queries: dict[str, dict[str, Any]] = {}
         self._io_broker: Any = None
         self._broker_last_io_mono = 0.0
@@ -322,10 +333,28 @@ class ExchangeClient(BatchEntryMixin):
         finally:
             self._broker_last_io_mono = time.monotonic()
 
+    def _metadata_view(self):
+        payload = self._metadata_payload if self._metadata_snapshot_enabled else self._metadata_reader.read()
+        if self._meta_revision != self._metadata_reader.revision:
+            self._meta_cache.clear()
+            self._prepared_cache.clear()
+            self._meta_revision = self._metadata_reader.revision
+        return payload
+
+    def refresh_metadata_snapshot(self):
+        """Owner maintenance publishes a revision; workers use memory only."""
+        with self._metadata_lock:
+            self._metadata_payload = self._metadata_reader.read()
+            self._metadata_snapshot_enabled = True
+            return self._metadata_view()
+
     def _symbol_meta(self, symbol: str) -> dict[str, Any]:
         symbol = str(symbol).upper()
         with self._metadata_lock:
-            payload = self._metadata_reader.read()
+            payload = self._metadata_view()
+            cached = self._meta_cache.get(symbol)
+            if cached is not None:
+                return cached
         symbols = payload.get('symbols') if isinstance(payload, dict) else None
         item = symbols.get(symbol) if isinstance(symbols, dict) else None
         if not isinstance(item, dict):
@@ -341,6 +370,9 @@ class ExchangeClient(BatchEntryMixin):
             meta[name] = value
         meta['tick_text'] = str(item['tick'])
         meta['step_text'] = str(item['step'])
+        with self._metadata_lock:
+            if payload is (self._metadata_payload if self._metadata_snapshot_enabled else self._metadata_reader.payload):
+                self._meta_cache[symbol] = meta
         return meta
 
     @staticmethod
@@ -355,6 +387,10 @@ class ExchangeClient(BatchEntryMixin):
 
     def price_text(self, symbol: str, price: float) -> str:
         meta = self._symbol_meta(symbol)
+        return self._price_text(meta, price, symbol)
+
+    @staticmethod
+    def _price_text(meta, price, symbol):
         with localcontext() as context:
             context.prec = 40
             tick = Decimal(meta['tick_text'])
@@ -379,12 +415,16 @@ class ExchangeClient(BatchEntryMixin):
     def validate_order(self, symbol: str, price: float, qty: float) -> tuple[bool, str]:
         """Validate exchange step, minimum quantity and minimum notional."""
         meta = self._symbol_meta(symbol)
+        return self._validate_order(meta, price, qty)
+
+    @classmethod
+    def _validate_order(cls, meta, price, qty):
         step = _finite(meta.get('step'))
         min_qty = _finite(meta.get('min_qty'), step)
         min_notional = _finite(meta.get('min_notional'))
         if price <= 0.0 or qty <= 0.0:
             return False, 'non-positive price or quantity'
-        aligned = self._align_down(qty, step)
+        aligned = cls._align_down(qty, step)
         if abs(aligned - qty) > max(1e-12, step * 1e-8):
             return False, f'quantity {qty} is not stepSize {step} aligned'
         if qty + max(1e-12, min_qty * 1e-9) < min_qty:
@@ -408,6 +448,12 @@ class ExchangeClient(BatchEntryMixin):
                 and math.isfinite(price) and price > 0.0):
             return {'ok': False, 'reason': 'non-positive/non-finite entry price or notional'}
         meta = self._symbol_meta(symbol)
+        cache_key = (str(symbol).upper(), price, requested, meta['tick_text'],
+                     meta['step_text'], meta['min_qty'], meta['min_notional'])
+        with self._metadata_lock:
+            cached = self._prepared_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
         step = _finite(meta.get('step'), float('nan'))
         min_qty = _finite(meta.get('min_qty'), step)
         min_notional = _finite(meta.get('min_notional'))
@@ -415,7 +461,7 @@ class ExchangeClient(BatchEntryMixin):
                 and math.isfinite(min_qty) and min_qty >= 0.0
                 and math.isfinite(min_notional) and min_notional >= 0.0):
             return {'ok': False, 'reason': 'invalid step/minimum entry metadata'}
-        price_text = self.price_text(symbol, price)
+        price_text = self._price_text(meta, price, symbol)
         # Decimal ceil avoids binary rounding that can leave qty just below a
         # minimum, especially when minQty itself is not a stepSize multiple.
         with localcontext() as context:
@@ -434,11 +480,16 @@ class ExchangeClient(BatchEntryMixin):
             if '.' in qty_text:
                 qty_text = qty_text.rstrip('0').rstrip('.')
             adjusted = actual_notional != requested_decimal
-        ok, why = self.validate_order(symbol, float(aligned_price), _finite(qty_text))
-        return {'ok': ok, 'reason': why, 'price': price_text, 'qty': qty_text,
+        ok, why = self._validate_order(meta, float(aligned_price), _finite(qty_text))
+        result = {'ok': ok, 'reason': why, 'price': price_text, 'qty': qty_text,
                 'requested_notional': requested, 'target_notional': float(target),
                 'actual_notional': float(actual_notional), 'sizing_adjusted': adjusted,
                 'min_qty': min_qty, 'min_notional': min_notional, 'step': step}
+        with self._metadata_lock:
+            if len(self._prepared_cache) >= 8192:
+                self._prepared_cache.clear()
+            self._prepared_cache[cache_key] = result
+        return dict(result)
 
     def place_limit_for_bar(self, *, order_bar_open_ms: int, **kwargs: Any) -> dict[str, Any]:
         """Entry runner capability: recheck the same bar after WS reconnection."""

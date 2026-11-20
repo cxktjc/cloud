@@ -89,10 +89,10 @@ def install_transport(case, fsyncs):
 
 def wait_for_sends(case, sends, count):
     deadline = time.perf_counter()+3
-    while sum(len(row['symbols']) for row in sends) < count and time.perf_counter() < deadline:
+    while any(job.state != 'done' for job in case.trade._network_io._jobs.values()) and time.perf_counter() < deadline:
         # Deliberately don't drain: callbacks mustn't perturb registration timing.
         threading.Event().wait(.001)
-    if sum(len(row['symbols']) for row in sends) != count:
+    if count is not None and sum(len(row['symbols']) for row in sends) != count:
         raise AssertionError(f'Expected {count} fake sends, got {sends}')
 
 
@@ -147,7 +147,7 @@ def probe(near, batch_enabled, rebound=False):
         else:
             trade.step(now=case.now)
         owner_ms = (time.perf_counter_ns()-started)/1e6
-        wait_for_sends(case, sends, near)
+        wait_for_sends(case, sends, None if rebound else near)
         result = dict(near=near, batch_enabled=batch_enabled, rebound=rebound,
             injected_owner_stall_ms=80 if rebound else 0,
             owner_call_ms=round(owner_ms, 3), fsync_count_before_drain=len(fsyncs),
@@ -167,6 +167,7 @@ def probe(near, batch_enabled, rebound=False):
             threading.Event().wait(.001)
         if trade._network_io._jobs:
             raise AssertionError('Offline callbacks did not settle')
+        result['pending_after_callbacks'] = len(trade.tracked)
         return result
     finally:
         if rebound_thread is not None:

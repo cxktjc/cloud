@@ -1,4 +1,4 @@
-"""Owner-thread durable state for a cancel-first pending-entry replacement."""
+"""Durable exact replacement qualification; unrelated free slots remain live."""
 from __future__ import annotations
 
 import logging

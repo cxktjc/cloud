@@ -35,14 +35,14 @@ class EntryTierTests(unittest.TestCase):
             with self.subTest(count=count):
                 plan = select(count, .020, .017)
                 self.assertEqual(plan.cancel, (f'OLD{count-1}',))
-                self.assertFalse(plan.place)
+                self.assertEqual([r.symbol for r in plan.place], ['NEW'] if count < 8 else [])
 
     def test_crowded_rotation_bypasses_all_old_admission_ceilings(self):
         for count in range(5, 9):
             with self.subTest(count=count):
                 plan = select(count, .021, .0188)
                 self.assertEqual(len(plan.cancel), 1)
-                self.assertFalse(plan.place)
+                self.assertEqual([r.symbol for r in plan.place], ['NEW'] if count < 8 else [])
                 self.assertEqual(plan.rotation['admission_gap'], .021)
                 self.assertAlmostEqual(plan.rotation['minimum_improvement'], .0022)
                 self.assertFalse(select(count, .021, .018801).cancel)
@@ -58,8 +58,8 @@ class EntryTierTests(unittest.TestCase):
         self.assertFalse(policy.beats(.01651, .01449, count=8))
         self.assertFalse(select(8, .01651, .01449).cancel)
 
-    def test_rotation_waits_for_exact_cancel_terminal_and_keeps_original_count(self):
-        tracked = {f'OLD{i}': row(f'OLD{i}', .01) for i in range(5)}
+    def test_full_rotation_waits_for_exact_cancel_terminal_and_keeps_original_count(self):
+        tracked = {f'OLD{i}': row(f'OLD{i}', .01) for i in range(8)}
         tracked['OLD4'] = row('OLD4', .020)
         new = row('NEW', .0178)
         first = select_physical_orders([*tracked.values(), new], tracked)
@@ -88,10 +88,11 @@ class EntryTierTests(unittest.TestCase):
         self.assertFalse(filled.place)
         self.assertEqual(filled.rotation_action, 'clear')
 
-    def test_underfilled_rotation_precedes_vacancy_fill(self):
+    def test_underfilled_rotation_uses_free_slot_without_cancel_wait(self):
         plan = select(5, .0185, .0135)
         self.assertEqual(len(plan.cancel), 1)
-        self.assertFalse(plan.place)
+        self.assertEqual([r.symbol for r in plan.place], ['NEW'])
+        self.assertEqual(plan.rotation_placement, 'NEW')
         self.assertEqual(plan.rotation['original_order_count'], 5)
 
     def test_ordinary_gap_cancel_is_strictly_beyond_2p1_percent(self):

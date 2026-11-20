@@ -361,7 +361,7 @@ class NetworkTradeMixin:
 
     @contextmanager
     def entry_plan(self):
-        if self._network_io is None or os.environ.get('V9711_LIVE_ENTRY_BATCH', '1') == '0':
+        if self._network_io is None or os.environ.get('V9711_LIVE_ENTRY_BATCH', '0') == '0':
             yield
             return
         if self._entry_plan_buffer is not None:

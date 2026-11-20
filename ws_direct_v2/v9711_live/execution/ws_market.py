@@ -452,6 +452,27 @@ class DualMarket(DirectMarket):
         return dict(tick=tick, bid0=bid, selected=selected, source=source,
                     bid_quantity=quantity)
 
+    def send_quote(self, symbol):
+        """Final guard reads ingress, without advancing ordered owner state.
+
+        A rebound/invalidation already received must revoke an older decision.
+        A quote must also remain within the owner's existing queue-age budget
+        at send, including time spent registering the exact durable intent.
+        """
+        clock = self._quote_clock()
+        prices, quantity = {}, None
+        for source, feed in (('tick', self), ('bid0', self.book)):
+            with feed._lock:
+                latest = feed.latest_ingress.get(symbol)
+                price = self._quote(feed, symbol, latest, clock=clock) if latest is not None else None
+                if latest is not None and (clock[2]-latest.received_ns)/1e9 > cfg.WS_MAX_QUEUE_AGE_SECONDS:
+                    price = None
+                prices[source] = price
+                if source == 'bid0' and price is not None:
+                    quantity = float(latest.quantity or 0)
+        selected, source = min(((p, s) for s, p in prices.items() if p is not None), default=(None, None))
+        return dict(prices, selected=selected, source=source, bid_quantity=quantity)
+
     def entry_prices(self, symbols=None):
         return self.price_maps(symbols)[2]
 
