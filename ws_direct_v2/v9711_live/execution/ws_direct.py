@@ -15,6 +15,7 @@ from .sizing import CountSizingMixin
 from .signal_follow import SignalFollowMixin
 from .entry_quotes import qualify_quote
 from .owner_work import OwnerWork
+from .feedback_writer import FeedbackWriter
 from ..entry_policy import GapPolicy, at_most
 from collectors.ticker_ws import load_symbols
 
@@ -51,8 +52,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._skipped_far_events = 0
         self._skipped_noncompetitive_events = 0
         self._owner_work = OwnerWork()
+        self._feedback_writer = None
         self._maintenance_mark = None
-        self._runtime_source = dict(build='20261120-owner-stream-v3', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261120-entry-first-v4', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -60,6 +62,23 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self.client.entry_quote_guard = self._entry_quote_send_allowed
         self.client.entry_quote_snapshot = self._entry_quote_send_snapshot
         self._refresh_precision_readiness()
+
+    def enable_nonblocking_io(self):
+        super().enable_nonblocking_io()
+        if self._feedback_writer is None:
+            self._feedback_writer = FeedbackWriter(cfg.EXECUTION_FEEDBACK_FILE)
+
+    def shutdown_io(self):
+        try:
+            super().shutdown_io()
+        finally:
+            if self._feedback_writer is not None:
+                self._feedback_writer.close()
+
+    def _write_feedback_payload(self, payload):
+        if self._feedback_writer is None:
+            return super()._write_feedback_payload(payload)
+        self._feedback_writer.submit(payload)
 
     def _refresh_precision_readiness(self):
         # Only startup/maintenance reads the cache; no extra file read per tick.
@@ -112,6 +131,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             self._maintenance_checkpoint('render')
 
     def _execute_entries(self, snapshot, status, **kwargs):
+        with self.ledger.batch_saves():
+            return self._execute_entries_batched(snapshot, status, **kwargs)
+
+    def _execute_entries_batched(self, snapshot, status, **kwargs):
         # Reuse one read within this decision only. No owner state or quote
         # view is cached across events, and worker send guards stay live.
         symbols = self._active_price_symbols if self._fast_tick else None
@@ -359,7 +382,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         started = self._quote_mark = time.perf_counter_ns()
         self._quote_segments, self._quote_route, self._quote_tail = {}, 'full', 'screening'
         try:
-            return self._on_tick(tick)
+            with self.ledger.batch_saves():
+                return self._on_tick(tick)
         finally:
             self._quote_checkpoint(self._quote_tail)
             self._owner_work.finish('quote', started, self._quote_segments, route=self._quote_route)
@@ -431,10 +455,31 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._entry_diagnostics['ws_direct']['skipped_noncompetitive_events'] = self._skipped_noncompetitive_events
         self._entry_diagnostics['ws_direct']['owner_work'] = self._owner_work.snapshot()
         self._entry_diagnostics['ws_direct']['runtime'] = self._runtime_source
+        self._entry_diagnostics['ws_direct']['feedback_writer'] = (
+            self._feedback_writer.health() if self._feedback_writer is not None else {'enabled': False})
         try:
             super().write_feedback(**kwargs)
         finally:
             self._maintenance_checkpoint('feedback')
+
+    def _service_pending_quotes(self, *, limit=32, budget_seconds=.002):
+        """Give queued entry opportunities a bounded turn before maintenance."""
+        started, count = time.perf_counter(), 0
+        while count < limit and time.perf_counter()-started < budget_seconds:
+            try:
+                tick = self.market.events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if tick is None:
+                    self._drain_network()
+                    self._publish_entry_gate()
+                else:
+                    self.market.decide(tick, self.on_tick)
+            finally:
+                self.market.events.task_done()
+            count += 1
+        return count
 
     def _run_loop(self):
         LOG.info('WS DIRECT runtime=%s mode=%s inputs=%s', self._runtime_source, cfg.WS_DIRECT_MODE, check_inputs())
@@ -459,6 +504,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                     # Exact fill/forced exit/close timers remain bounded even
                     # under continuous WS load; never wait for an exchange ACK.
                     try:
+                        self._service_pending_quotes()
                         self.step()
                     except Exception:
                         self._account_deadline = 0

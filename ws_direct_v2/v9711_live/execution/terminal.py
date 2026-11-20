@@ -227,6 +227,11 @@ class TradeTerminalView:
                     lines.insert(-1, f'最近慢处理: {iso_ms(item.get("epoch", 0)*1000)} '
                                  f'{item.get("kind")} {item.get("elapsed_ms")}ms '
                                  f'主要阶段={item.get("stage")} {item.get("stage_ms")}ms')
+            writer = ws.get('feedback_writer') or {}
+            if writer.get('enabled'):
+                lines.insert(-1, f'反馈写盘: 后台待写={writer.get("pending", 0)} '
+                             f'最近写盘={writer.get("last_write_ms", 0):.3f}ms '
+                             f'失败={writer.get("failures", 0)} 当前错误={writer.get("error") or "无"}')
             lines.insert(-1, f'depth WS: endpoint={ws.get("depth_endpoint", "-")} proxy={ws.get("proxy", "-")}')
             for source in ('tick', 'depth'):
                 for group, error in list((ws.get(source+'_errors') or {}).items())[:3]:

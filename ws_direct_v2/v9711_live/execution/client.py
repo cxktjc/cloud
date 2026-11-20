@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import copy
+from contextlib import contextmanager
 import threading
 import json
 import logging
@@ -70,6 +71,8 @@ class OwnershipLedger:
         self.state.setdefault('signal_session_id', None)
         self.state.setdefault('last_signal_revision', None)
         self._saved_intents = self._saved_state = None
+        self._save_depth = 0
+        self._save_pending = False
 
     def unknown_since(self, key: str, *, now: float) -> float:
         existing = _finite(self.state['unknown_since_epoch'].get(key))
@@ -90,6 +93,23 @@ class OwnershipLedger:
         return dict(value) if isinstance(value, Mapping) else dict(default)
 
     def save(self) -> None:
+        if self._save_depth:
+            self._save_pending = True
+            return
+        self.flush()
+
+    @contextmanager
+    def batch_saves(self):
+        """Coalesce owner mutations; senders must flush before dispatch."""
+        self._save_depth += 1
+        try:
+            yield
+        finally:
+            self._save_depth -= 1
+            if not self._save_depth and self._save_pending:
+                self.flush()
+
+    def flush(self) -> None:
         # A successful save is still durable before dispatch. Unchanged files
         # need no new fsync; cache each document ONLY after its replace succeeds
         # so an interrupted second write is retried on the next owner cycle.
@@ -102,6 +122,11 @@ class OwnershipLedger:
                     'schema_version': 1, 'component': 'execution',
                     'updated_at_epoch': time.time(), name: value})
                 setattr(self, attr, encoded)
+        self._save_pending = False
+
+    def flush_pending(self) -> None:
+        if self._save_pending:
+            self.flush()
 
     def client_id(self, symbol: str, bar_open_ms: int, kind: str) -> str:
         generation = self.state.get('sizing_generations', {}).get(f'{symbol.upper()}:{int(bar_open_ms)}', 0) if kind == 'entry' else 0

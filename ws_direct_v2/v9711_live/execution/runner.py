@@ -362,7 +362,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             LOG.info('cancel requested symbol=%s order=%s reason=%s', symbol, oid or cid, reason)
         self._run_network(exact_entry_cancel_key(symbol, cid, oid),
             lambda: self.client.cancel(symbol=symbol, order_id=oid, client_order_id=cid),
-            complete, priority=0, entry_cancel=True)
+            complete, priority=30, entry_cancel=True)
         return True
 
     @staticmethod
@@ -527,6 +527,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     else 'same signal plan suppressed until changed/new bar')
 
     def _place_order(self, row: Mapping[str, Any]) -> None:
+        with self.ledger.batch_saves():
+            return self._place_order_recorded(row)
+
+    def _place_order_recorded(self, row: Mapping[str, Any]) -> None:
         if hasattr(self, '_entry_sizing_row'):
             row = self._entry_sizing_row(row)
         symbol = str(row.get('symbol') or '').upper()
@@ -619,6 +623,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self.ledger.register(symbol=symbol, client_order_id=client_id,
                              kind='entry', limit_price=price, qty=qty,
                              exit_due_epoch=self._finite(row.get('exit_due_epoch')))
+        # One grouped durability barrier contains sequence, exact intent, new
+        # slot and any replacement/cancel reservations. Nothing is sent first.
+        self.ledger.flush()
         self.session_entries.timings.mark(client_id, 'registered')
         LOG.info('entry registered symbol=%s id=%s 满足=%s tick=%s depth_bid0=%s gap_ceiling=%s',
                  symbol, client_id, self.tracked[symbol].get('entry_qualified_by', 'unknown'),
@@ -821,6 +828,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                      'Executor-owned exact-identity state. Aggregate account '
                      'positions are never adopted as v9711 positions.'),
         }
+        self._write_feedback_payload(payload)
+
+    def _write_feedback_payload(self, payload):
         atomic_write_json(cfg.EXECUTION_FEEDBACK_FILE, payload)
 
     def _stream_health(self) -> dict[str, Any]:
@@ -1001,10 +1011,15 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             pending_rotation=self.ledger.state.get('pending_rotation'))
         self._prepare_rotation(plan)
         cancel_reasons = {a.symbol: a.reason for a in plan.actions if a.action == 'cancel'}
+        # Release active admission capacity in memory before dispatching new
+        # entries, but retain every old exact identity. Cancel I/O comes later.
         for symbol in plan.cancel:
             row = self.tracked.get(symbol)
             if row is not None:
-                self._request_cancel(symbol, row, cancel_reasons[symbol])
+                if not row.get('cancel_requested'):
+                    row['cancel_requested_epoch'] = time.time()
+                row.update(cancel_requested=True, cancel_reason=cancel_reasons[symbol])
+                self.ledger.save()
         for action in plan.actions:
             if action.action == 'defer' and plan.rotation_action == 'reserve':
                 self.stats['rotation_defer'] += 1
@@ -1027,6 +1042,14 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     raw['entry_gap_ceiling'] = min(cfg.CANCEL_GAP, self._finite(origin.get('victim_gap'))
                         - GapPolicy().minimum_improvement(int(self._finite(origin.get('original_order_count')))))
                 self._place_order(raw)
+        # The new entries have been registered and dispatched. The existing
+        # paced cancel lane retains its 1.5s interval and exact-ID recovery.
+        if plan.cancel:
+            self.ledger.flush()
+        for symbol in plan.cancel:
+            row = self.tracked.get(symbol)
+            if row is not None:
+                self._request_cancel(symbol, row, cancel_reasons[symbol])
         self._consume_rotation(plan)
         filtered_entries.update(self._submit_skip_reasons)
         blockers = []
@@ -1148,13 +1171,9 @@ def main() -> int:
     if args.enable_live and args.no_dry_run and cfg.PAPER_MODE:
         parser.error('v2 live must not use --paper')
     cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    console_log = logging.StreamHandler()
-    console_log.addFilter(MarketConsoleFilter())
-    logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-        handlers=[console_log,
-                  logging.FileHandler(cfg.TRADE_LOG_FILE, encoding='utf-8')])
+    from .async_logs import AsyncTradeLogs
+    log_writer = AsyncTradeLogs(cfg.TRADE_LOG_FILE,
+        getattr(logging, str(args.log_level).upper(), logging.INFO), MarketConsoleFilter())
     enabled = bool(args.enable_live)
     dry_run = not bool(args.no_dry_run)
     if enabled and dry_run:
@@ -1183,6 +1202,8 @@ def main() -> int:
     except RuntimeError as exc:
         LOG.error('WS-direct startup/runtime failed; check state/price locks and configuration: %s', exc)
         return 1
+    finally:
+        log_writer.close()
 
 
 if __name__ == '__main__':

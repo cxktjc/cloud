@@ -397,6 +397,8 @@ class NetworkTradeMixin:
         if entry_request is not None and self._entry_plan_buffer is not None:
             self._entry_plan_buffer.append((key, work, done, dict(entry_request)))
             return
+        if key[0] != 'cancel':
+            self.ledger.flush_pending()  # entry/close identities precede every actual dispatch
         self._publish_entry_gate()
         if self._network_io is None:
             try:
