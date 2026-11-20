@@ -227,6 +227,96 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._active_price_symbols = selected
         return working
 
+    def _best_unowned_gap(self, excluded):
+        """Peek a fresh challenger, keeping owned ranks for later retirement.
+
+        A low-priced incumbent cannot replace another incumbent. Including it
+        in this bound forces the full planner on every unrelated quote.
+        """
+        restore = []
+        try:
+            while self._rank_heap:
+                item = self._rank_heap[0]
+                gap, symbol, version = item
+                if self._eligible.get(symbol) != item:
+                    heapq.heappop(self._rank_heap)
+                    continue
+                if symbol in excluded:
+                    restore.append(heapq.heappop(self._rank_heap))
+                    continue
+                effective = self.market.entry_prices([symbol]).get(symbol)
+                if effective is None:
+                    heapq.heappop(self._rank_heap)
+                    self._eligible.pop(symbol, None)
+                    continue
+                current = (effective-float(self._templates[symbol]['limit_price']))/float(self._templates[symbol]['limit_price'])
+                if current != gap:
+                    heapq.heappop(self._rank_heap)
+                    self._update_rank(symbol, effective)
+                    continue
+                return gap
+            return float('inf')
+        finally:
+            for item in restore:
+                heapq.heappush(self._rank_heap, item)
+
+    def _no_entry_action(self, tick, targets, now):
+        """Conservative no-action check for every ordinary order count.
+
+        State/file changes, completions and owned/target quote changes bypass
+        this method. Time-based reconciliation still runs in maintenance.
+        """
+        ordinary = {s: r for s, r in self.tracked.items()
+                    if not r.get('signal_follow') and not r.get('cancel_requested')}
+        pending = self.ledger.state.get('pending_rotation')
+        if pending:
+            victim = str(pending.get('victim') or '')
+            old = self.tracked.get(victim)
+            if (now*1000 >= self._finite(pending.get('expires_at_ms'))
+                    or pending.get('victim_filled') or victim in self.positions
+                    or (old and (not old.get('cancel_requested')
+                        or self._finite(old.get('accounted_entry_qty')) > 0
+                        or str(old.get('client_order_id') or '') != str(pending.get('victim_client_order_id') or '')))
+                    or (old is None and not pending.get('victim_terminal'))):
+                return False  # preserve all exact-state transitions/unknown reservations
+        if len(ordinary) > cfg.MAX_PENDING_ORDERS:
+            return False
+        quote = self.market.entry_quote(tick.symbol)['selected']
+        self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
+        # Full positions still need one full pass to mark resting ordinary
+        # entries for cancellation. Once marked, unrelated ticks cannot admit.
+        if len(self.positions) >= cfg.SLOTS and not self._in_final_pre_exit_bar(now=now):
+            return not ordinary and not pending
+        weight = cfg.SLOT_WEIGHTS[min(len(self.positions), 2)]
+        if any(s in self.positions or r.get('sizing_weight') != weight
+               or not int(r.get('order_bar_open_ms') or 0) <= now*1000 < int(r.get('order_bar_open_ms') or 0)+cfg.BAR_MS
+               for s, r in ordinary.items()):
+            return False
+        prices = self.market.entry_prices(ordinary)
+        gaps = [(prices[s]-float(r['limit_price']))/float(r['limit_price'])
+                for s, r in ordinary.items() if s in prices and float(r.get('limit_price') or 0) > 0]
+        if len(gaps) != len(ordinary) or (gaps and not at_most(max(gaps), cfg.CANCEL_GAP)):
+            return False
+        excluded = set(self.tracked) | set(self.positions) | set(targets)
+        if pending:
+            excluded.add(str(pending.get('victim') or ''))
+        best = self._best_unowned_gap(excluded)
+        policy, count = GapPolicy(), len(ordinary)
+        if pending:
+            # A rejected replacement may leave a durable reservation while
+            # quotes rebound. Retain its original gate without running the
+            # entire planner on every nonqualifying event.
+            if count >= cfg.MAX_PENDING_ORDERS:
+                return True
+            if policy.replacement_allowed(self._finite(pending.get('victim_gap'), float('nan')), best,
+                    ceiling=cfg.CANCEL_GAP, count=int(self._finite(pending.get('original_order_count')))):
+                return False
+            return not at_most(best, policy.admission_gap(count))
+        if count < cfg.MAX_PENDING_ORDERS and at_most(best, policy.admission_gap(count)):
+            return False
+        return not (gaps and policy.replacement_allowed(max(gaps), best,
+                    ceiling=cfg.CANCEL_GAP, count=count))
+
     def on_tick(self, tick):
         now = time.time()
         previous_revision = self._template_file_revision
@@ -249,34 +339,13 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
                 self._skipped_far_events += 1
                 return False
-        # Empty books cannot admit a quote outside the first tier; full books
-        # cannot rotate without the required improvement. A conservative heap
-        # bound avoids a full plan but never drops a crossing or incumbent event.
-        ordinary = {s: r for s, r in self.tracked.items()
-                    if not r.get('signal_follow') and not r.get('cancel_requested')}
+        # Check genuine unowned challengers at partial/full order counts and
+        # while position capacity is closed, not just uniform empty/full books.
         if (status == 'valid' and previous_revision == self._template_file_revision and not completed
-                and len(ordinary) in (0, cfg.MAX_PENDING_ORDERS)
                 and tick.symbol not in self.tracked and tick.symbol not in self.positions and tick.symbol not in targets
-                and len(self.positions) < cfg.SLOTS and not self.ledger.state.get('pending_rotation')
-                and all(not r.get('cancel_requested') and
-                        int(r.get('order_bar_open_ms') or 0) <= now*1000 < int(r.get('order_bar_open_ms') or 0)+cfg.BAR_MS
-                        for r in ordinary.values())):
-            quote = self.market.entry_quote(tick.symbol)['selected']
-            self._update_rank(tick.symbol, quote if quote is not None else float('inf'))
-            while self._rank_heap and self._eligible.get(self._rank_heap[0][1]) != self._rank_heap[0]:
-                heapq.heappop(self._rank_heap)
-            best = self._rank_heap[0][0] if self._rank_heap else float('inf')
-            if not ordinary and not at_most(best, GapPolicy().admission_gap(0)):
-                self._skipped_noncompetitive_events += 1
-                return False
-            prices = self.market.entry_prices(ordinary)
-            gaps = [(prices[s]-float(r['limit_price']))/float(r['limit_price'])
-                    for s, r in ordinary.items() if s in prices and float(r.get('limit_price') or 0) > 0]
-            if ordinary and len(gaps) == len(ordinary) and at_most(max(gaps), cfg.CANCEL_GAP):
-                if not GapPolicy().replacement_allowed(max(gaps), best,
-                        ceiling=cfg.CANCEL_GAP, count=len(ordinary)):
-                    self._skipped_noncompetitive_events += 1
-                    return False
+                and self._no_entry_action(tick, targets, now)):
+            self._skipped_noncompetitive_events += 1
+            return False
         # A far quote changed no signal/order/position state. Rebuilding the
         # immutable worker gate for it cannot change admission; workers still
         # check live market health, quote distance, TTL and capacity at send.

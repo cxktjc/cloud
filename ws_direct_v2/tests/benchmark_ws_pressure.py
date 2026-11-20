@@ -15,7 +15,8 @@ from tests import test_book_ticker_v2 as fixtures
 from v9711_live import config as cfg
 
 
-def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, near_symbols=8, near_gap=.01):
+def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, near_symbols=8, near_gap=.01,
+        scenario='steady'):
     case = fixtures.DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     # Keep the fixture's stable bar clock without Mock call recording on each
@@ -45,8 +46,13 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
                 feed.group_connected(group)
         while not market.events.empty():
             market.events.get_nowait()
+        bases = {s: 1+near_gap if i < near_symbols else 1.03 for i, s in enumerate(case.symbols)}
+        if scenario == 'partial_book':
+            bases = {s: 1.01 if i < 3 else 1.02 for i, s in enumerate(case.symbols)}
+        if scenario == 'full_positions':
+            case.held(3)
         for index, symbol in enumerate(case.symbols):
-            price = str(1+near_gap) if index < near_symbols else '1.03'
+            price = str(bases[symbol])
             market.update(symbol, price, int(case.now*1000))
             market.decide(market.events.get_nowait(), lambda event: None)
             market.update_book(symbol, price, '2', int(case.now*1000), index+1)
@@ -56,6 +62,22 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
             reference_bar_open_ms=case.bar-cfg.BAR_MS, exit_due_epoch=case.now+900) for s in case.symbols]
         case.publish()
         case.trade.step(now=case.now)
+        if scenario == 'owned_spread':
+            symbol = sorted(case.trade.tracked)[0]
+            bases[symbol] = .99
+            market.update(symbol, '.99', int(case.now*1000))
+            market.decide(market.events.get_nowait(), case.trade.on_tick)
+            market.update_book(symbol, '.99', '2', int(case.now*1000), symbols+1)
+            market.decide(market.events.get_nowait(), case.trade.on_tick)
+        # Initial ACK wakes can precede the setup quotes. Consume every setup
+        # quote before taking the counters, rather than count it in the run.
+        while not market.events.empty():
+            event = market.events.get_nowait()
+            if event is None:
+                case.trade._drain_network()
+            else:
+                market.decide(event, case.trade.on_tick)
+            market.events.task_done()
         initial = dict(market.counts)
         initial_book = dict(market.book.counts)
         frames = int(rate*seconds)
@@ -69,11 +91,11 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
                     if pattern in ('changing', 'changing_effective'):
                         # All sources change price on every revisit, including
                         # incumbent orders; no quantity-only dedupe benefit.
-                        base = 1+near_gap if index % symbols < near_symbols else 1.03
+                        base = bases[symbol]
                         revisit = index//symbols % 2
                         price = base+(revisit*.0002-.0001 if pattern == 'changing_effective' else revisit*.0001)
                     else:
-                        price = 1+near_gap if index % symbols < near_symbols else 1.03+(index % 2)*.001
+                        price = bases[symbol]
                     try:
                         if index % 5 == 0:
                             market.update(symbol, str(price), int(case.now*1000))
@@ -125,7 +147,8 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
         maintenance_ms.sort()
         decision_ms.sort()
         percentile = lambda p: round(decision_ms[int((len(decision_ms)-1)*p)], 3) if decision_ms else None
-        return dict(symbols=symbols, near_symbols=near_symbols, near_gap=near_gap, pattern=pattern, nonblocking_io=nonblocking,
+        return dict(symbols=symbols, near_symbols=near_symbols, near_gap=near_gap, scenario=scenario,
+            positions=len(case.trade.positions), pattern=pattern, nonblocking_io=nonblocking,
             target_frames=frames, target_rate=rate,
             elapsed_seconds=round(time.perf_counter()-started, 3), counters=counters,
             queue_peak=result.get('queue_peak'), p95_receive_to_decision_ms=percentile(.95),
@@ -154,11 +177,13 @@ if __name__ == '__main__':
     parser.add_argument('--near-gap', type=float, default=.01,
                         help='Near price gap; .02 exercises an empty book outside the admission tier')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--scenario', choices=('steady', 'full_positions', 'partial_book', 'owned_spread'),
+                        default='steady')
     args = parser.parse_args()
     if args.rate <= 0 or args.seconds <= 0 or not 0 <= args.near_symbols <= 800 or not 0 <= args.near_gap <= .021:
         parser.error('positive rate/seconds, near-symbols in 0..800 and near-gap in 0..0.021 required')
     result = run(args.rate, args.seconds, pattern=args.pattern, nonblocking=args.nonblocking,
-                 near_symbols=args.near_symbols, near_gap=args.near_gap)
+                 near_symbols=args.near_symbols, near_gap=args.near_gap, scenario=args.scenario)
     text = json.dumps(result, indent=2)
     print(text)
     if args.output:

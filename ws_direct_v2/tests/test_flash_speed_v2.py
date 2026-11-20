@@ -221,6 +221,138 @@ class FlashOwnerTests(unittest.TestCase):
         self.event('N8USDT', 1.0185)
         self.assertIn('N8USDT', self.trade.tracked)
 
+    def test_owned_low_rank_is_not_a_challenger_but_real_replacement_still_sends(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        self.event('N0USDT', .99)
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('owned rank is not a challenger')):
+            self.event('N8USDT', 1.0101)
+        self.assertIn('N0USDT', self.trade._eligible)
+        self.assertTrue(any(item[1] == 'N0USDT' for item in self.trade._rank_heap))
+        self.event('N8USDT', 1.0078)
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.assertEqual(len(self.submits), 9)
+
+    def seed_partial_book(self, count):
+        self.plans(9)
+        for index in range(count, 9):
+            self.trade.market.update(f'N{index}USDT', '1.02', int(self.now*1000))
+            self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        self.event('N0USDT', 1.01)
+        self.assertEqual(self.trade._ordinary_pending_count(), count)
+
+    def test_three_pending_skips_noncompetitive_but_first_tier_equality_sends(self):
+        self.seed_partial_book(3)
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('outside first tier')):
+            self.event('N8USDT', 1.0201)
+        self.event('N8USDT', 1.0185)
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.assertEqual(self.trade._ordinary_pending_count(), 4)
+
+    def test_six_pending_skips_noncompetitive_but_second_tier_equality_sends(self):
+        self.seed_partial_book(6)
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('outside second tier')):
+            self.event('N8USDT', 1.0201)
+        self.event('N8USDT', 1.0165)
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.assertEqual(self.trade._ordinary_pending_count(), 7)
+
+    def test_three_positions_skip_unrelated_quotes_but_final_exit_bar_reopens(self):
+        self.plans(9)
+        self.held(3)
+        self.event('N0USDT', 1.01)
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('capacity closed')):
+            self.event('N8USDT', .99)
+        self.assertFalse(self.trade.tracked)
+        self.trade.positions['H0']['exit_due_epoch'] = self.now+cfg.BAR_MS/1000
+        self.event('N8USDT', .99)
+        self.assertIn('N8USDT', self.trade.tracked)
+
+    def test_three_positions_still_cancel_existing_ordinary_before_skipping(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        self.held(3)
+        self.event('N8USDT', 1.0101)
+        self.assertEqual(len(self.cancels), 8)
+        self.assertFalse(self.trade.tracked)
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('already canceled')):
+            self.event('N8USDT', .99)
+
+    def test_three_positions_do_not_skip_target_follow_entry(self):
+        self.plans(9)
+        self.held(3)
+        self.event('N0USDT', 1.01)
+        self.targets = [self.target('AUSDT')]
+        self.publish()
+        self.event('N8USDT', 1.01)
+        self.assertTrue(self.trade.tracked['AUSDT']['signal_follow'])
+        sent = len(self.submits)
+        self.event('AUSDT', 1.2)
+        self.assertEqual(len(self.submits), sent)
+
+    def seed_waiting_rotation(self):
+        self.seed_partial_book(3)
+        old = self.trade.tracked['N2USDT']
+        old.update(cancel_requested=True, cancel_reason='replaced_by_closer')
+        self.trade.ledger.state['pending_rotation'] = dict(victim='N2USDT',
+            victim_client_order_id=old['client_order_id'], victim_order_id=old['order_id'],
+            victim_gap=.02, challenger='N8USDT', original_order_count=5,
+            victim_terminal=False, victim_filled=False, order_bar_open_ms=self.bar,
+            expires_at_ms=self.bar+cfg.BAR_MS)
+
+    def test_waiting_rotation_skips_rebound_but_preserves_original_five_order_gate(self):
+        self.seed_waiting_rotation()
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('nonqualifying rebound')):
+            self.event('N8USDT', 1.0201)
+        self.assertTrue(self.trade.ledger.state['pending_rotation'])
+        self.event('N8USDT', 1.0178)
+        self.assertIn('N8USDT', self.trade.tracked)
+        self.assertAlmostEqual(self.trade.tracked['N8USDT']['entry_gap_ceiling'], .0178)
+
+    def test_waiting_rotation_identity_change_still_runs_full_plan(self):
+        self.seed_waiting_rotation()
+        self.trade.ledger.state['pending_rotation']['victim_client_order_id'] = 'different-exact-id'
+        with patch.object(self.trade, '_execute_entries', wraps=self.trade._execute_entries) as execute:
+            self.event('N8USDT', 1.0201)
+            execute.assert_called_once()
+        self.assertIsNone(self.trade.ledger.state['pending_rotation'])
+
+    def test_no_action_shortcut_never_hides_full_planner_actions_at_boundaries(self):
+        self.plans(9)
+        self.trade.desired_snapshot(now=self.now)
+        skips = full = 0
+        for count in range(9):
+            for old_gap in (.01, .0185, .021, .021001):
+                for new_gap in (-.02, .0078, .0165, .016501, .0178, .0185, .018501, .021, .021001):
+                    with self.subTest(count=count, old_gap=old_gap, new_gap=new_gap):
+                        desired, tracked = [], {}
+                        for index in range(9):
+                            symbol = f'N{index}USDT'
+                            gap = new_gap if index == 8 else (old_gap if index < count else .03)
+                            if index == 0 and count > 1:
+                                gap = -.02  # low owned rank must never act as a challenger
+                            item = dict(row(symbol, gap), order_bar_open_ms=self.bar,
+                                reference_bar_open_ms=self.bar-cfg.BAR_MS, exit_due_epoch=self.now+900,
+                                sizing_weight=cfg.SLOT_WEIGHTS[0])
+                            desired.append(item)
+                            if index < count:
+                                tracked[symbol] = dict(item)
+                            self.trade.market.update(symbol, str(1+gap), int(self.now*1000))
+                            self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+                            self.trade._update_rank(symbol, 1+gap)
+                        self.trade.tracked.clear()
+                        self.trade.tracked.update(tracked)
+                        tick = type('Quote', (), {'symbol': 'N8USDT'})()
+                        if self.trade._no_entry_action(tick, {}, self.now):
+                            skips += 1
+                            plan = select_physical_orders(desired, tracked, now=self.now)
+                            self.assertFalse(plan.place)
+                            self.assertFalse(plan.cancel)
+                        else:
+                            full += 1
+        self.assertGreater(skips, 0)
+        self.assertGreater(full, 0)
+
     def test_send_guard_sees_received_rebound_without_advancing_owner(self):
         market = self.trade.market
         self.event('N0USDT', .99)
