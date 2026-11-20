@@ -85,6 +85,9 @@ trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bo
   序号与注册合并保存，发送前仍确认关键账本，防止重启重复下单。普通撤单仍保留回包后 1.5s 间隔。
   反馈 JSON/日志写盘移到后台；行情已排队时先给有限处理机会，再执行周期维护。
   439 项回归、明确的先后顺序及重启/写盘阻塞验证见 `VALIDATION_ENTRY_FIRST.md`。
+- depth 异常断线提供独立只读对照：`python -B -u -m collectors.ws_connection_probe --group 2 --seconds 20`。
+  同时比较单币/整组 bookTicker、同组 aggTrade 与公开 SUBSCRIBE，输出底层异常链、连接 IP 和循环延迟。
+  现场证据、判读限制和服务器命令见 `VALIDATION_WS_DISCONNECT_DIAGNOSTICS.md`；此工具不改变 trade 行为。
 - 本地队列溢出时立即撤销受影响来源分组的旧代次、禁用其旧报价，并显式计数。
   保持 WS 读取以排空网络缓冲；队列降至低水位后，仅由新报价经 owner 确认恢复。
   溢出恢复期间丢弃的事件计入 `overload_discarded`，不拿遗漏期间的报价补做交易。
