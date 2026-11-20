@@ -451,7 +451,9 @@ class ExchangeClient(BatchEntryMixin):
                     'clientOrderId': client_order_id, 'orderId': f'sim-{int(time.time()*1000)}',
                     'status': 'NEW', 'price': price_text, 'origQty': qty_text,
                     'executedQty': '0'}
+        send_quote = {}
         def check_bar() -> None:
+            nonlocal send_quote
             market_guard = getattr(self, 'market_guard', None)
             if callable(market_guard) and not market_guard(symbol.upper()):
                 raise EntryQuoteUnavailable('internal WS quotes unavailable before send')
@@ -459,17 +461,19 @@ class ExchangeClient(BatchEntryMixin):
                                             int(order_bar_open_ms or 0), now=time.time())
             if self.network_io is not None:
                 following = self.network_io.check_entry(symbol, client_order_id, int(order_bar_open_ms or 0))
-            quote_guard = getattr(self, 'entry_quote_guard', None)
-            if callable(quote_guard) and not quote_guard(symbol.upper(), client_order_id, limit_price):
-                raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send')
+            detail = self._checked_entry_quote(symbol.upper(), client_order_id, limit_price)
             if not following and order_bar_open_ms is not None and not (
                     order_bar_open_ms > 0
                     and order_bar_open_ms <= time.time() * 1000 < order_bar_open_ms + cfg.BAR_MS):
                 raise ConfirmedSubmitRejection('entry order bar expired/not active before send')
-        return self._broker_call(
+            if detail != send_quote:
+                self._log_entry_quote(symbol.upper(), client_order_id, detail)
+            send_quote = detail
+        result = self._broker_call(
             'place_order', symbol.upper(), 'BUY', qty_text,
             price=price_text, position_side='LONG',
             client_order_id=client_order_id, before_send=check_bar)
+        return dict(result, _entry_send_quote=send_quote) if send_quote and isinstance(result, Mapping) else result
 
     def cancel(self, *, symbol: str, order_id: Any = None,
                client_order_id: str = '') -> dict[str, Any]:

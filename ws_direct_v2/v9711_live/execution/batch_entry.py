@@ -7,14 +7,37 @@ transport uncertainty never triggers a blind whole-batch or single retry.
 from __future__ import annotations
 
 import os
+import logging
 import time
 from typing import Any, Mapping
 
 from .submit_errors import ConfirmedSubmitRejection, EntryQuoteUnavailable, require_submit_ack
 from .signal_follow import follow_send_allowed
 
+LOG = logging.getLogger('v9711_live_trade.entry_quotes')
+
 
 class BatchEntryMixin:
+    def _checked_entry_quote(self, symbol, cid, limit):
+        capture = getattr(self, 'entry_quote_snapshot', None)
+        if callable(capture):
+            detail = capture(symbol, cid, limit)
+            if detail['entry_qualified_by'] == 'none':
+                raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send')
+            return detail
+        guard = getattr(self, 'entry_quote_guard', None)
+        if callable(guard) and not guard(symbol, cid, limit):
+            raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send')
+        return {}
+
+    @staticmethod
+    def _log_entry_quote(symbol, cid, detail):
+        if detail:
+            LOG.info('entry pre-send symbol=%s id=%s 满足=%s tick=%s depth_bid0=%s '
+                     'tick_gap=%s depth_gap=%s gap_ceiling=%s', symbol, cid,
+                     detail['entry_qualified_by'], detail['entry_tick'], detail['entry_bid0'],
+                     detail['entry_tick_gap'], detail['entry_depth_gap'], detail['entry_gap_ceiling'])
+
     def _post_batch_orders(self, orders: list[dict[str, Any]]) -> Any:
         # Runtime-only import of the existing reusable primitive, NOT either
         # live launcher. Its function supports LIMIT, GTC and explicit prices.
@@ -24,7 +47,7 @@ class BatchEntryMixin:
             raise ConfirmedSubmitRejection('batch credentials unavailable; request never sent')
         return rest_place_order_batch(key, secret, orders, recv_window=5000, request_timeout=5)
 
-    def _entry_send_check(self, row: Mapping[str, Any]) -> None:
+    def _entry_send_check(self, row: Mapping[str, Any]) -> dict:
         symbol, cid = str(row['symbol']).upper(), str(row['client_order_id'])
         bar = int(row['order_bar_open_ms'])
         market_guard = getattr(self, 'market_guard', None)
@@ -33,14 +56,13 @@ class BatchEntryMixin:
         following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, cid, bar, now=time.time())
         if self.network_io is not None:
             following = self.network_io.check_entry(symbol, cid, bar)
-        quote_guard = getattr(self, 'entry_quote_guard', None)
-        if callable(quote_guard) and not quote_guard(symbol, cid, float(row['limit_price'])):
-            raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before batch send')
+        detail = self._checked_entry_quote(symbol, cid, float(row['limit_price']))
         from .. import config as cfg
         if not following and not bar <= time.time() * 1000 < bar + cfg.BAR_MS:
             raise ConfirmedSubmitRejection('entry order bar expired/not active before batch send')
         if time.monotonic() < self._broker_rate_limit_until_mono:
             raise ConnectionError('trade broker rate limit cooldown; no batch request sent')
+        return detail
 
     def place_limit_batch(self, requests: list[dict[str, Any]]) -> dict[str, tuple[Any, BaseException | None]]:
         if not 1 <= len(requests) <= 5:
@@ -68,9 +90,10 @@ class BatchEntryMixin:
         # Refilter immediately before sending; canceled/expired members do not
         # poison the valid subset, and a remaining singleton is NOT a batch.
         current=[]
+        quotes={}
         for row,wire in sendable:
             try:
-                self._entry_send_check(row)
+                quotes[str(row['client_order_id'])] = self._entry_send_check(row)
                 current.append((row,wire))
             except Exception as exc:
                 outcome[str(row['client_order_id'])]=(None,exc)
@@ -85,6 +108,8 @@ class BatchEntryMixin:
             except Exception as exc:
                 outcome[cid]=(None,exc)
             return outcome
+        for row,wire in current:
+            self._log_entry_quote(wire['symbol'], wire['newClientOrderId'], quotes[wire['newClientOrderId']])
         if self.dry_run or not self.enabled:
             replies=[dict(_simulated=True,symbol=w['symbol'],clientOrderId=w['newClientOrderId'],
                 orderId='simbatch-'+w['newClientOrderId'],status='NEW',executedQty='0',avgPrice='0',
@@ -116,6 +141,8 @@ class BatchEntryMixin:
                     raise RuntimeError('batch member identity/result missing; exact fate unknown')
                 self._record_rate_limit(result)
                 result=require_submit_ack(result,symbol=wire['symbol'],client_order_id=cid)
+                if quotes[cid]:
+                    result=dict(result, _entry_send_quote=quotes[cid])
                 outcome[cid]=(result,None)
             except Exception as exc:
                 outcome[cid]=(None,exc)

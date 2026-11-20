@@ -34,14 +34,19 @@ DEPLOY_ROOT = Path(os.environ.get("V9711_DEPLOY_ROOT", str(Path(__file__).resolv
 DEFAULT_SYMBOLS = DEPLOY_ROOT / "config" / "symbols.txt"
 DEFAULT_OUTPUT = DEPLOY_ROOT / "var" / "binance_ticker_price" / "latest.json"
 WS_BASE = "wss://fstream.binance.com/market/stream"
-DEFAULT_WS_BASES = (WS_BASE, "wss://fstream.binance.com/public/stream", "wss://fstream.binance.com/stream")
+BOOK_WS_BASE = "wss://fstream.binance.com/public/stream"
+DEFAULT_WS_BASES = (WS_BASE, BOOK_WS_BASE, "wss://fstream.binance.com/stream")
 FIRST_DATA_TIMEOUT = 15.0
 MAX_SILENCE_SECONDS = 30.0
 
 
-def endpoint_candidates(base: str) -> tuple[str, ...]:
+def endpoint_candidates(base: str, stream_kind='aggTrade') -> tuple[str, ...]:
     """Try alternatives only for Binance production paths, not custom hosts."""
     if base in DEFAULT_WS_BASES:
+        if stream_kind == 'bookTicker':
+            # Book quotes belong to /public; /market can handshake but never
+            # deliver this stream. Do not cycle through tick-only endpoints.
+            return (BOOK_WS_BASE,)
         return (base,) + tuple(value for value in DEFAULT_WS_BASES if value != base)
     return (base,)
 
@@ -212,7 +217,7 @@ async def consume_group(
     stop: asyncio.Event, group_index: int, stream_kind='aggTrade',
 ) -> None:
     retry = 1.0
-    endpoints = endpoint_candidates(base)
+    endpoints = endpoint_candidates(base, stream_kind)
     endpoint_index = 0
     allowed = set(group)
     while not stop.is_set():
@@ -221,19 +226,23 @@ async def consume_group(
         received = False
         try:
             url = stream_url(group, selected_base, stream_kind)
-            LOG.info("ticker group=%s connecting symbols=%s endpoint=%s", group_index, len(group), selected_base)
+            LOG.info("market stream=%s group=%s connecting symbols=%s endpoint=%s proxy=disabled/direct",
+                     stream_kind, group_index, len(group), selected_base)
             async with websockets.connect(
                 url, ping_interval=ping_interval, ping_timeout=ping_timeout,
                 open_timeout=15, close_timeout=3, max_queue=4096, compression=None,
                 **binance_network.websocket_connect_kwargs(),
             ) as socket:
                 state.group_connected(group_index)
-                LOG.info("ticker group=%s handshake complete; waiting for first valid %s endpoint=%s",
+                LOG.info("market group=%s handshake complete; waiting for first valid %s endpoint=%s proxy=disabled/direct",
                          group_index, stream_kind, selected_base)
                 connected_at = time.monotonic()
                 last_data_at = connected_at
                 valid_count = 0
                 raw_count = 0
+                rejected = {}
+                def reject(reason):
+                    rejected[reason] = rejected.get(reason, 0) + 1
                 while not stop.is_set():
                     now_mono = time.monotonic()
                     if now_mono - connected_at >= reconnect_before:
@@ -243,13 +252,13 @@ async def consume_group(
                                 if received else connected_at + FIRST_DATA_TIMEOUT)
                     remaining = deadline - now_mono
                     if remaining <= 0:
-                        raise TimeoutError(f"no valid {stream_kind}; received_messages={raw_count} valid={valid_count}")
+                        raise TimeoutError(f"no valid {stream_kind}; received_messages={raw_count} valid={valid_count} rejected={rejected}")
                     try:
                         raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
                     except asyncio.TimeoutError as exc:
                         raise TimeoutError(
                             f"no valid {stream_kind}; endpoint={selected_base} received_messages={raw_count} "
-                            f"valid={valid_count} waiting_for={'next_data' if received else 'first_data'}") from exc
+                            f"valid={valid_count} rejected={rejected} waiting_for={'next_data' if received else 'first_data'}") from exc
                     if hasattr(state, '_last_wire_ns'):
                         state._last_wire_ns = time.monotonic_ns()
                     raw_count += 1
@@ -261,17 +270,29 @@ async def consume_group(
                         raise ValueError(f"subscription error code={message.get('code')} msg={str(message.get('msg'))[:200]}")
                     if not isinstance(data, dict) or data.get("e") != stream_kind:
                         if raw_count == 1:
-                            LOG.warning("ticker group=%s unexpected first message keys=%s", group_index, list(message)[:8])
+                            LOG.warning("market stream=%s group=%s unexpected first message keys=%s",
+                                        stream_kind, group_index, list(message)[:8])
+                        reject('unexpected_event')
                         continue
                     symbol = str(data.get("s", "")).upper()
                     if data.get('st', 1) != 1:
+                        reject('non_um_symbol_type')
                         continue
-                    stamp = int(data.get("T", data.get("E", 0)))
-                    if symbol not in allowed or not -5 <= time.time() - stamp / 1000 <= 60:
+                    try:
+                        stamp = int(data.get("T", data.get("E", 0)))
+                    except (ValueError, TypeError, OverflowError):
+                        reject('invalid_timestamp')
+                        continue
+                    if symbol not in allowed:
+                        reject('unexpected_symbol')
+                        continue
+                    if not -5 <= time.time() - stamp / 1000 <= live_cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS:
+                        reject('stale_or_future_timestamp')
                         continue
                     accepted = (state.update_book(symbol, data.get('b'), data.get('B'), stamp, data.get('u'))
                                 if stream_kind == 'bookTicker' else state.update(symbol, str(data.get('p', '')), stamp))
                     if not accepted:
+                        reject('invalid_or_duplicate_quote')
                         continue
                     state.group_received(group_index)
                     last_data_at = time.monotonic()
@@ -279,14 +300,15 @@ async def consume_group(
                     if not received:
                         received = True
                         retry = 1.0
-                        LOG.info("ticker group=%s DATA READY endpoint=%s first_symbol=%s latency=%.3fs",
-                                 group_index, selected_base, symbol, last_data_at - started)
+                        LOG.info("market stream=%s group=%s DATA READY endpoint=%s first_symbol=%s latency=%.3fs",
+                                 stream_kind, group_index, selected_base, symbol, last_data_at - started)
         except asyncio.CancelledError:
             state.group_failed(group_index, "collector stopped")
             raise
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"[:700]
-            LOG.warning("ticker group=%s disconnected retry=%.1fs error=%s", group_index, retry, detail)
+            LOG.warning("market stream=%s group=%s disconnected endpoint=%s proxy=disabled/direct retry=%.1fs error=%s",
+                        stream_kind, group_index, selected_base, retry, detail)
             state.group_failed(group_index, detail)
             if not received:
                 endpoint_index += 1

@@ -42,6 +42,11 @@ def compact_positions(rows: Any, limit: int) -> str:
         mark = row.get('mark_price')
         pnl = row.get('unrealized_pnl')
         label = '[补挂]' if row.get('signal_follow') else ''
+        if 'client_order_id' in row:
+            sent = row.get('entry_send_quote') or {}
+            stage = '发送' if sent else '登记'
+            qualified = (sent or row).get('entry_qualified_by', 'unknown')
+            label += f'[{stage}满足={qualified}]'
         parts.append(f'{symbol}{label} qty={qty} mark={mark} pnl={pnl}')
         if len(parts) >= limit:
             break
@@ -171,6 +176,10 @@ class TradeTerminalView:
                          '(decision/dispatch, not exchange ACK; mirror runs after decision)')
             lines.insert(-1, f'tick/bid0 OR准入: tick有效={ws.get("fresh_symbols", 0)} '
                          f'bid0有效={ws.get("bid0_symbols", 0)} 任一路有效={ws.get("entry_symbols", 0)}；估值仍用tick。')
+            lines.insert(-1, f'depth WS: endpoint={ws.get("depth_endpoint", "-")} proxy={ws.get("proxy", "-")}')
+            for source in ('tick', 'depth'):
+                for group, error in list((ws.get(source+'_errors') or {}).items())[:3]:
+                    lines.insert(-1, f'  {source} group={group} error={error}')
         for symbol, quote in list(diagnostics.get('entry_quotes', {}).items())[:3]:
             def shown(key):
                 value = quote.get(key+'_gap')

@@ -374,6 +374,12 @@ class DualMarket(DirectMarket):
                       book_received=self.book.counts['received'], book_decided=self.book.counts['decided'],
                       book_rejected_backlog=self.book.counts['rejected_backlog'],
                       book_overflow=self.book.counts['overflow'])
+        with self._lock:
+            result['tick_errors'] = dict(self.errors)
+        with self.book._lock:
+            result['depth_errors'] = dict(self.book.errors)
+        result['proxy'] = 'disabled/direct'
+        result['depth_endpoint'] = ticker_ws.BOOK_WS_BASE
         return result
 
     async def _receive(self):
@@ -381,7 +387,7 @@ class DualMarket(DirectMarket):
         self._async_stop = asyncio.Event()
         tasks = []
         for feed, stream, base in ((self, 'aggTrade', ticker_ws.WS_BASE),
-                                  (self.book, 'bookTicker', 'wss://fstream.binance.com/public/stream')):
+                                  (self.book, 'bookTicker', ticker_ws.BOOK_WS_BASE)):
             for index, group in enumerate(self.groups, 1):
                 tasks.append(asyncio.create_task(ticker_ws.consume_group(group, feed,
                     base=base, stream_kind=stream, ping_interval=30, ping_timeout=20, read_timeout=30,

@@ -49,6 +49,7 @@ from .session_entries import SessionEntryStats
 from .nonblocking_io import NetworkTradeMixin
 from .submit_errors import require_submit_ack, submit_error_is_ambiguous, EntryQuoteUnavailable
 from .order_identity import matches_order_identity
+from .entry_quotes import QUOTE_FIELDS
 from .stream import StreamUnavailable
 from .terminal import TradeTerminalView
 from .forced_close import ForcedCloseMixin
@@ -589,7 +590,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'gap': self._finite(row.get('gap'), 0.0),
             'placed_at_epoch': submit_now, 'last_status': 'SUBMITTING',
             'entry_identity_version': 2,
-            **{k: row[k] for k in ('entry_quote_source', 'entry_tick', 'entry_bid0') if k in row},
+            **{k: row[k] for k in QUOTE_FIELDS if k in row},
             'entry_gap_ceiling': row.get('entry_gap_ceiling', GapPolicy().admission_gap(self._ordinary_pending_count())),
             'fate_unknown': True,
         }
@@ -602,6 +603,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self.ledger.register(symbol=symbol, client_order_id=client_id,
                              kind='entry', limit_price=price, qty=qty,
                              exit_due_epoch=self._finite(row.get('exit_due_epoch')))
+        LOG.info('entry registered symbol=%s id=%s 满足=%s tick=%s depth_bid0=%s gap_ceiling=%s',
+                 symbol, client_id, self.tracked[symbol].get('entry_qualified_by', 'unknown'),
+                 row.get('entry_tick'), row.get('entry_bid0'), row.get('entry_gap_ceiling'))
         if self._entry_recovery_count(row):
             self.stats['entry_retries'] += 1
         source_row = dict(row)
@@ -639,6 +643,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 self.ledger.save()
                 return
             order_id = str(place_result.get('orderId') or '')
+            send_quote = place_result.get('_entry_send_quote')
+            if isinstance(send_quote, Mapping) and send_quote.get('entry_qualified_by'):
+                current['entry_send_quote'] = {k: send_quote[k] for k in QUOTE_FIELDS if k in send_quote}
             current.update(order_id=order_id, fate_unknown=False)
             if self._finite(place_result.get('executedQty')) >= self._finite(current.get('confirmed_filled_qty')):
                 current['last_status'] = str(place_result.get('status') or 'NEW').upper()
@@ -657,9 +664,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     if str(place_result.get('status') or '').upper() in TERMINAL:
                         self._retire_order(symbol, self.tracked[symbol], 'entry_response_terminal')
             LOG.info('place exact order symbol=%s signal_price=%.10g order_price=%.10g '
-                     'signal_notional=%.8g order_notional=%.8g qty=%s id=%s/%s',
+                     'signal_notional=%.8g order_notional=%.8g qty=%s id=%s/%s 满足=%s',
                      symbol, price, sizing_details['submitted_limit_price'],
-                     notional, sizing_details['submitted_notional'], qty_text, client_id, order_id)
+                     notional, sizing_details['submitted_notional'], qty_text, client_id, order_id,
+                     (current.get('entry_send_quote') or current).get('entry_qualified_by', 'unknown'))
             self.ledger.save()
         self._run_network(('entry', symbol, client_id), send, complete, priority=10,
             entry_request=None if following else dict(symbol=symbol, client_order_id=client_id, limit_price=price,
@@ -739,7 +747,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 'status': row.get('last_status', 'NEW'),
                 'signal_follow': bool(row.get('signal_follow')),
                 'signal_follow_position_id': row.get('signal_follow_position_id'),
-                **{k: row[k] for k in ('entry_quote_source', 'entry_tick', 'entry_bid0') if k in row},
+                **{k: row[k] for k in (*QUOTE_FIELDS, 'entry_send_quote') if k in row},
             }
         payload = {
             'schema_version': 1,

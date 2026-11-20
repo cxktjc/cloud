@@ -12,6 +12,8 @@ from .metadata_sync import MetadataSync
 from .position_identity import CAPITAL_MODE
 from .sizing import CountSizingMixin
 from .signal_follow import SignalFollowMixin
+from .entry_quotes import qualify_quote
+from ..entry_policy import GapPolicy
 from collectors.ticker_ws import load_symbols
 
 LOG = logging.getLogger('v9711.ws_direct')
@@ -43,6 +45,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.market_guard = self._market_send_allowed
         self.client.entry_quote_guard = self._entry_quote_send_allowed
+        self.client.entry_quote_snapshot = self._entry_quote_send_snapshot
         self._refresh_precision_readiness()
 
     def _refresh_precision_readiness(self):
@@ -57,15 +60,13 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return account_ready and self.market.order_allowed(symbol)
 
     def _entry_quote_send_allowed(self, symbol, cid, limit):
-        from ..entry_policy import at_most
+        return self._entry_quote_send_snapshot(symbol, cid, limit)['entry_qualified_by'] != 'none'
+
+    def _entry_quote_send_snapshot(self, symbol, cid, limit):
         gate = self.client.entry_gate  # immutable owner snapshot; no worker ledger access
-        price = self.market.entry_quote(symbol)['selected']
-        if price is None or limit <= 0:
-            return False
-        if cid in gate.get('follow_entries', {}):
-            return True
         ceiling = gate.get('entry_gap_limits', {}).get(cid)
-        return ceiling is not None and at_most((price-limit)/limit, ceiling)
+        return qualify_quote(self.market.entry_quote(symbol), limit, ceiling,
+                             following=cid in gate.get('follow_entries', {}))
 
     def step(self, *, now=None):
         stamp = time.time() if now is None else now
@@ -110,8 +111,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def _place_order(self, row):
         quote = self.market.entry_quote(str(row.get('symbol') or '').upper())
-        return super()._place_order(dict(row, entry_quote_source=quote['source'],
-            entry_tick=quote['tick'], entry_bid0=quote['bid0']))
+        ceiling = row.get('entry_gap_ceiling', GapPolicy().admission_gap(self._ordinary_pending_count()))
+        detail = qualify_quote(quote, self._finite(row.get('limit_price')), ceiling,
+                               following=bool(row.get('signal_follow')))
+        return super()._place_order(dict(row, **detail))
 
     def desired_snapshot(self, *, now):
         payload, status = super().desired_snapshot(now=now)

@@ -1,6 +1,7 @@
 """Offline tick/bid0 OR admission, independent feed health and exact sends."""
 import asyncio
 import json
+import os
 import random
 import tempfile
 import time
@@ -16,6 +17,8 @@ from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.logic import select_physical_orders
 from v9711_live.execution.submit_errors import EntryQuoteUnavailable
 from v9711_live.execution.ws_market import DualMarket
+from v9711_live.execution.entry_quotes import qualify_quote
+from v9711_live.execution.terminal import compact_positions
 
 
 class DualMarketTests(unittest.TestCase):
@@ -139,6 +142,76 @@ class DualAdmissionTests(unittest.TestCase):
         self.tick(1.01)
         self.assertEqual(len(self.submits), 1)
         self.assertEqual(self.trade.tracked['N0USDT']['entry_quote_source'], 'tick')
+
+    def test_tick_depth_all_labels_use_actual_admission_and_rotation_ceiling(self):
+        cases = [
+            (1.0185, 1.019, .0185, 'tick'),
+            (1.019, 1.0185, .0185, 'depth'),
+            (1.0185, 1.018, .0185, 'all'),
+            (1.0165, 1.017, .0165, 'tick'),
+            (1.018, 1.0188, .0188, 'all'),  # replacement above fill threshold
+            (1.017, 1.017, .0165, 'none'),
+            (None, 1.0185, .0185, 'depth'),
+            (1.0185, None, .0185, 'tick'),
+            (None, None, .0185, 'none'),
+        ]
+        for tick, bid, ceiling, expected in cases:
+            with self.subTest(tick=tick, bid=bid, ceiling=ceiling):
+                detail = qualify_quote(dict(tick=tick, bid0=bid, source='bid0'), 1., ceiling)
+                self.assertEqual(detail['entry_qualified_by'], expected)
+
+    def test_send_quote_after_reconnect_overrides_intent_display_and_persists(self):
+        self.plans()
+        client = self.trade.client
+        client.enabled, client.dry_run = True, False
+        self.trade._account_deadline = self.now+100
+        def dispatch(*args, before_send=None, **kw):
+            before_send()  # first check: tick only
+            self.trade.market.update_book('N0USDT', '1.012', '2', int(self.now*1000), 1)
+            self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+            before_send()  # final socket check: both
+            return dict(symbol='N0USDT', clientOrderId=kw['client_order_id'], orderId='wire', status='NEW')
+        client._broker_call = Mock(side_effect=dispatch)
+        client.place_limit_for_bar = lambda **req: ExchangeClient.place_limit_for_bar(client, **req)
+        with self.assertLogs('v9711_live_trade.entry_quotes', level='INFO') as logs:
+            self.tick(1.01)
+        row = self.trade.tracked['N0USDT']
+        self.assertEqual(row['entry_qualified_by'], 'tick')
+        self.assertEqual(row['entry_send_quote']['entry_qualified_by'], 'all')
+        self.assertIn('发送满足=all', compact_positions(self.trade.tracked, 12))
+        self.assertIn('满足=tick', '\n'.join(logs.output))
+        self.assertIn('满足=all', '\n'.join(logs.output))
+        saved = json.loads(cfg.EXECUTION_LEDGER_FILE.read_text())
+        self.assertEqual(saved['state']['tracked_orders']['N0USDT']['entry_send_quote']['entry_qualified_by'], 'all')
+
+    def test_batch_send_retains_each_members_own_qualification(self):
+        self.plans(2)
+        self.trade.market.update('N1USDT', '1.03', int(self.now*1000))
+        self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        self.trade.market.update_book('N1USDT', '1.01', '2', int(self.now*1000), 1)
+        self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        self.tick(1.01)
+        requests = [dict(symbol=s, client_order_id=row['client_order_id'],
+            order_bar_open_ms=self.bar, limit_price=1., notional=5.) for s,row in self.trade.tracked.items()]
+        self.trade.client.enabled, self.trade.client.dry_run = True, False
+        self.trade._account_deadline = self.now+100
+        def post(wires):
+            return [dict(symbol=w['symbol'], clientOrderId=w['newClientOrderId'], orderId=str(i), status='NEW')
+                    for i,w in enumerate(wires, 1)]
+        self.trade.client._post_batch_orders = Mock(side_effect=post)
+        replies = self.trade.client.place_limit_batch(requests)
+        labels = {s: replies[row['client_order_id']][0]['_entry_send_quote']['entry_qualified_by']
+                  for s,row in self.trade.tracked.items()}
+        self.assertEqual(labels, {'N0USDT': 'tick', 'N1USDT': 'depth'})
+        self.trade.client._post_batch_orders.assert_called_once()
+
+    def test_follow_and_legacy_orders_do_not_claim_ordinary_threshold_qualification(self):
+        self.event()
+        row = self.trade.tracked['AUSDT']
+        self.assertEqual(row['entry_qualified_by'], 'signal_follow')
+        self.assertIn('登记满足=signal_follow', compact_positions(self.trade.tracked, 12))
+        legacy = dict(symbol='OLDUSDT', client_order_id='old', quantity=1)
+        self.assertIn('登记满足=unknown', compact_positions([legacy], 12))
 
     def test_distance_cancel_needs_all_valid_quotes_to_be_outside(self):
         self.plans()
@@ -266,6 +339,14 @@ class DualAdmissionTests(unittest.TestCase):
 
 
 class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_book_retry_never_switches_to_market_endpoint(self):
+        self.assertEqual(ticker_ws.endpoint_candidates(ticker_ws.BOOK_WS_BASE, 'bookTicker'),
+                         (ticker_ws.BOOK_WS_BASE,))
+        self.assertEqual(ticker_ws.endpoint_candidates(ticker_ws.WS_BASE, 'bookTicker'),
+                         (ticker_ws.BOOK_WS_BASE,))
+        custom = 'wss://example.invalid/test'
+        self.assertEqual(ticker_ws.endpoint_candidates(custom, 'bookTicker'), (custom,))
+
     async def test_dual_receiver_uses_identical_groups_for_both_streams(self):
         with tempfile.TemporaryDirectory() as directory:
             market = DualMarket(['AUSDT', 'BUSDT', 'CUSDT'], Path(directory)/'prices.json', group_size=2)
@@ -296,8 +377,10 @@ class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args): pass
         def connect(url, **kw):
             urls.append(url)
+            self.assertIsNone(kw['proxy'])
             return Connection()
-        with patch.object(ticker_ws.websockets, 'connect', side_effect=connect):
+        with patch.object(ticker_ws.websockets, 'connect', side_effect=connect), patch.dict(os.environ,
+                {'HTTPS_PROXY': 'http://127.0.0.1:12334', 'ALL_PROXY': 'http://127.0.0.1:12334'}):
             await ticker_ws.consume_group(['XUSDT'], state,
                 base='wss://fstream.binance.com/public/stream', stream_kind='bookTicker',
                 ping_interval=30, ping_timeout=20, read_timeout=30, reconnect_before=3600,
@@ -305,3 +388,30 @@ class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parse_qs(urlparse(urls[0]).query)['streams'], ['xusdt@bookTicker'])
         self.assertEqual(state.update_book.call_args.args[:3], ('XUSDT', '1.01', '4'))
         self.assertEqual(state.update_book.call_args.args[-1], 7)
+
+    async def test_timeout_reports_stream_endpoint_direct_mode_and_rejected_timestamps(self):
+        stop, state = asyncio.Event(), Mock()
+        class Socket:
+            async def recv(self):
+                if not getattr(self, 'sent', False):
+                    self.sent = True
+                    return json.dumps(dict(e='bookTicker', s='XUSDT', b='1', B='4', u=7,
+                                           T=int((time.time()-3600)*1000)))
+                raise asyncio.TimeoutError()
+        class Connection:
+            async def __aenter__(self): return Socket()
+            async def __aexit__(self, *args): pass
+        async def backoff(seconds):
+            stop.set()
+        with patch.object(ticker_ws.websockets, 'connect', return_value=Connection()), \
+                patch.object(ticker_ws.asyncio, 'sleep', side_effect=backoff), \
+                self.assertLogs('v9711.ticker_ws', level='WARNING') as logs:
+            await ticker_ws.consume_group(['XUSDT'], state, base=ticker_ws.BOOK_WS_BASE,
+                stream_kind='bookTicker', ping_interval=30, ping_timeout=20, read_timeout=30,
+                reconnect_before=3600, stop=stop, group_index=1)
+        text = '\n'.join(logs.output)
+        self.assertIn('stream=bookTicker', text)
+        self.assertIn('proxy=disabled/direct', text)
+        self.assertIn("'stale_or_future_timestamp': 1", text)
+        self.assertIn('/public/stream', text)
+        state.update_book.assert_not_called()

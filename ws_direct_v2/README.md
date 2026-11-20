@@ -23,7 +23,17 @@ trade 同时订阅相同 `config/symbols.txt` 币池的 `aggTrade` 与逐币 `bo
   signal、QV、96 根历史 warmup、入场限价及平仓逻辑不变，无需增加历史数据。
 - 补挂只使用双路行情的就绪状态，不套普通距离门槛，保留原价格/数量和独立 2 单名额。
   普通 8 单、实际持仓约束、补挂 6 仓停止、精确订单身份及撤单回包后 1.5 秒间隔继续生效。
-- 面板显示两路有效币数、tick/bid0 距离和决策来源，订单/反馈保存准入时两路价格及来源。
+- 每笔普通新挂单记录 `满足=tick/depth/all`，分别表示只有 tick、只有买一价、两路都满足这笔单的门槛。
+  `all` 按两路分别与门槛比较，不是按哪路价格更低判断；替换单使用其实际替换优势门槛。
+  账本/反馈保存登记时的 `entry_qualified_by`、两路价格、距离和门槛；发送成功回包后另存
+  `entry_send_quote`，面板优先显示 `[发送满足=all]` 等发送前复核结果，未收到回包时显示 `[登记满足=...]`。
+  登记日志、实际发送前日志和挂单成功日志均带 `满足=...` 与精确 client ID，便于查 UNKNOWN 订单。
+  补挂标注 `signal_follow`（不套普通距离门槛），更新前旧订单标注 `unknown`，不事后猜测其准入来源。
+- cloud 的两路行情均使用 `proxy=None` 显式关闭环境/系统代理发现，HTTP 同样禁用代理，不走 12334。
+  bookTicker 固定重试官方 `/public/stream`，不会再轮换去 aggTrade 的 `/market/stream`。
+  连接和断线日志区分 `stream=aggTrade/bookTicker`，记录端点和 `proxy=disabled/direct`；
+  无有效报价超时时附收包数、有效数及时间戳过期、品种类型不符等过滤计数。
+  面板保留两路有效币数、各自分组错误、depth 端点及直连状态，可区分没收包和收包后被过滤。
 
 仍从本目录使用原 `v9711_live.execution.runner` 启动 trade；进程内部启动两路订阅，不需要额外行情进程。
 接口依据：[Binance USDⓈ-M bookTicker 文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#individual-symbol-book-ticker-streams)。
