@@ -103,6 +103,20 @@ def run(rate=5000, seconds=3, symbols=800, pattern='mixed', nonblocking=False, n
             store.db.commit()
             store.export()
             case.trade.client.query_exact_order = ExchangeClient.query_exact_order.__get__(case.trade.client)
+        if scenario == 'blocked_candidates':
+            for symbol in case.symbols:
+                if symbol in case.trade.tracked:
+                    continue
+                case.trade.ledger.state['reopen_until_epoch'][symbol] = case.now+60
+                bases[symbol] = .99
+                market.update(symbol, '.99', int(case.now*1000))
+                market.decide(market.events.get_nowait(), lambda event: None)
+                market.update_book(symbol, '.99', '2', int(case.now*1000), 2*symbols+1)
+                market.decide(market.events.get_nowait(), lambda event: None)
+                case.trade._update_rank(symbol, .99)
+        if scenario == 'unready_signal':
+            case.payload['signal_ready'] = False
+            cfg.DESIRED_FILE.write_text(json.dumps(case.payload))
         unavailable = set()
         if scenario == 'quote_outage':
             # A resting order loses both quote sources while other groups
@@ -219,7 +233,8 @@ if __name__ == '__main__':
     parser.add_argument('--hot-symbols', type=int, help='Concentrate measured events on the first N symbols')
     parser.add_argument('--account-history', type=int, default=0,
                         help='Use real account SQLite queries with N unrelated historical orders/fills')
-    parser.add_argument('--scenario', choices=('steady', 'full_positions', 'partial_book', 'owned_spread', 'quote_outage'),
+    parser.add_argument('--scenario', choices=('steady', 'full_positions', 'partial_book', 'owned_spread', 'quote_outage',
+                                              'blocked_candidates', 'unready_signal'),
                         default='steady')
     args = parser.parse_args()
     if (args.rate <= 0 or args.seconds <= 0 or not 0 <= args.near_symbols <= 800 or not 0 <= args.near_gap <= .021

@@ -125,6 +125,74 @@ class HotOwnedQuotesTests(unittest.TestCase):
     refresh_quotes = fixtures.FlashOwnerTests.refresh_quotes
     publish, held = fixtures.FlashOwnerTests.publish, fixtures.FlashOwnerTests.held
 
+    def test_definitively_blocked_best_candidate_does_not_repeat_planner(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        candidate = self.trade._entry_sizing_row(self.templates[8])
+        self.trade.ledger.state['entry_submit_rejections']['blocked'] = dict(symbol='N8USDT',
+            plan_signature=self.trade._entry_plan_signature(candidate), retryable=False)
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('blocked candidate replanned')):
+            for price in (.99, .9899, .99):
+                self.event('N8USDT', price)
+                self.event('N0USDT', 1.0101)
+        self.assertNotIn('N8USDT', self.trade._eligible)
+        self.trade.ledger.state['entry_submit_rejections'].clear()
+        self.event('N8USDT', .99)
+        self.assertIn('N8USDT', self.trade.tracked)
+
+    def test_reopen_cooldown_candidate_reactivates_without_changing_signal(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        self.trade.ledger.state['reopen_until_epoch']['N8USDT'] = self.now+1
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('cooldown candidate replanned')):
+            self.event('N8USDT', .99)
+            self.event('N0USDT', 1.0101)
+        self.now += 1
+        self.event('N8USDT', .99)
+        self.assertIn('N8USDT', self.trade.tracked)
+
+    def test_block_cache_rechecks_record_mutation_and_sizing_plan(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        candidate = self.trade._entry_sizing_row(self.templates[8])
+        record = dict(symbol='N8USDT', plan_signature=self.trade._entry_plan_signature(candidate), retryable=False)
+        self.trade.ledger.state['entry_submit_rejections']['blocked'] = record
+        self.assertTrue(self.trade._entry_submission_blocked(candidate))
+        record['retryable'] = True
+        self.assertFalse(self.trade._entry_submission_blocked(candidate))
+        record['retryable'] = False
+        self.assertTrue(self.trade._entry_submission_blocked(candidate))
+        self.assertFalse(self.trade._entry_submission_blocked(dict(candidate, notional=candidate['notional']+1)))
+
+    def test_known_rebound_is_skipped_before_any_identity_or_disk_write(self):
+        self.plans(1)
+        market = self.trade.market
+        market.update('N0USDT', '1.01', int(self.now*1000))
+        first = market.events.get_nowait()
+        market.update('N0USDT', '1.04', int(self.now*1000))
+        with patch.object(self.trade.ledger, 'reserve_entry_client_id', side_effect=AssertionError('unqualified intent')):
+            market.decide(first, self.trade.on_tick)
+        self.assertFalse(self.submits)
+        self.assertFalse(self.trade.tracked)
+        self.assertEqual(self.trade._submit_skip_reasons['N0USDT'], 'latest_quote_not_qualified_before_registration')
+        market.decide(market.events.get_nowait(), self.trade.on_tick)
+        self.event('N0USDT', 1.01)
+        self.assertIn('N0USDT', self.trade.tracked)
+
+    def test_unready_signal_commits_quotes_without_planning_new_entries(self):
+        self.plans(1)
+        self.trade.desired_snapshot(now=self.now)
+        self.payload['signal_ready'] = False
+        cfg.DESIRED_FILE.write_text(json.dumps(self.payload))
+        with patch.object(self.trade, '_execute_entries', side_effect=AssertionError('unready signal replanned')):
+            self.event('N0USDT', 1.01)
+            self.event('N0USDT', 1.0101)
+        self.assertFalse(self.trade.client.entry_gate['ready'])
+        self.assertEqual(self.trade.market.committed['N0USDT'].price, '1.0101')
+        self.publish()
+        self.event('N0USDT', 1.01)
+        self.assertIn('N0USDT', self.trade.tracked)
+
     def test_missing_owned_quote_does_not_replan_every_other_quote(self):
         self.plans(9)
         self.event('N0USDT', 1.01)

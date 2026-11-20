@@ -157,7 +157,8 @@ class SessionEntryStats:
                 or (symbol, entry['entry_bar_open_ms']) in self._filled_bars)
 
     def _detail(self, entry):
-        result = dict(entry, first_order_timing=self.timings.first_for(entry))
+        result = dict(entry, first_order_timing=self.timings.first_for(entry),
+                      order_attempts=self.timings.attempts_for(entry))
         current = self._current_trade_positions.get(entry['symbol'])
         if current:
             # Context only: a same-symbol position must never fabricate a

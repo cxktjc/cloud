@@ -159,6 +159,33 @@ class EntryLatencyTests(unittest.TestCase):
             order_bar_open_ms=self.bar-cfg.BAR_MS, entry_timing='unknown_within_3m_confirmed_after_close')}, {})
         self.assertEqual(self.observe_signal()['same_symbol_trade']['first_order_timing'], {})
 
+    def test_outcome_explains_cancelled_order_without_fabricating_fill(self):
+        self.register()
+        self.timing.mark('first', 'send', transport='WS')
+        first_send = self.timing.first_for(self.entry)['send_epoch_ms']
+        self.timing.outcome('first', status='CANCELED', executed_qty=0, cancel_reason='replaced_by_closer')
+        entry = self.observe_signal()
+        self.assertEqual(entry['order_attempts']['sent'], 1)
+        self.assertEqual(entry['order_attempts']['latest']['cancel_reason'], 'replaced_by_closer')
+        self.assertEqual(entry['first_order_timing']['send_epoch_ms'], first_send)
+        self.assertEqual(self.stats.snapshot()['trade_filled_entries'], 0)
+        comparison = compute_comparison(actual_positions={}, open_orders={}, signal_portfolio={},
+            target_positions=[self.target], price_map={}, realized_balance=15)
+        output = TradeTerminalView()._format(dict(comparison=comparison, clock_utc='test',
+            session_entry_stats=self.stats.snapshot()))
+        self.assertIn('最近状态=CANCELED', output)
+        self.assertIn('撤销/终结原因=被更近候选替换', output)
+
+    def test_audit_revision_changes_only_when_outcome_changes_and_never_rewinds_fill(self):
+        self.register()
+        self.timing.outcome('first', status='PARTIALLY_FILLED', executed_qty=1)
+        revision = self.timing.revision
+        self.timing.outcome('first', status='PARTIALLY_FILLED', executed_qty=1)
+        self.assertEqual(self.timing.revision, revision)
+        self.timing.outcome('first', status='NEW', executed_qty=0)
+        self.assertEqual(self.timing.order('first')['status'], 'PARTIALLY_FILLED')
+        self.assertEqual(self.timing.order('first')['executed_qty'], 1)
+
 
 class WireProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_wire_hooks_run_after_connect_and_guard_and_before_socket_send(self):
@@ -299,6 +326,18 @@ class BatchLatencyTests(unittest.TestCase):
     ordinary_plan = fixtures.DualAdmissionTests.ordinary_plan
     plans = fixtures.DualAdmissionTests.plans
     tick = fixtures.DualAdmissionTests.tick
+
+    def test_exact_cancel_is_retained_in_entry_lifecycle_after_retirement(self):
+        self.plans()
+        self.tick(1.01)
+        row = self.trade.tracked['N0USDT']
+        cid = row['client_order_id']
+        self.trade._request_cancel('N0USDT', row, 'order_bar_expired')
+        audit = self.trade.session_entries.timings.order(cid)
+        self.assertEqual(audit['status'], 'CANCELED')
+        self.assertEqual(audit['cancel_reason'], 'order_bar_expired')
+        self.assertEqual(audit['retired_reason'], 'order_bar_expired')
+        self.assertFalse(self.trade.positions)
 
     def test_exact_fill_preserves_recorded_times_after_entry_order_is_retired(self):
         self.plans()

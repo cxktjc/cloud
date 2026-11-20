@@ -49,12 +49,14 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._quote_versions = {}
         self._active_price_symbols = None
         self._cycle_price_maps = None
+        self._quote_signal_gate = None
+        self._submit_skip_reasons = {}
         self._skipped_far_events = 0
         self._skipped_noncompetitive_events = 0
         self._owner_work = OwnerWork()
         self._feedback_writer = None
         self._maintenance_mark = None
-        self._runtime_source = dict(build='20261120-quote-outage-v5', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261120-admission-v6', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -112,7 +114,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             self._maintenance_checkpoint('account_health')
             self._refresh_precision_readiness()
             self._maintenance_checkpoint('metadata')
-            return super().step(now=now)
+            # Reconciliation may update many exact records. Coalesce routine
+            # saves; _run_network still flushes entry/close identities before
+            # dispatch, including when maintenance schedules an urgent close.
+            with self.ledger.batch_saves():
+                return super().step(now=now)
         finally:
             self._maintenance_checkpoint('remaining')
             self._owner_work.finish('maintenance', started, self._maintenance_segments)
@@ -177,10 +183,18 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return result
 
     def _place_order(self, row):
-        context = dict(decision_epoch_ms=time.time()*1000, _decision_ns=time.monotonic_ns())
-        quote = self.market.entry_quote(str(row.get('symbol') or '').upper())
-        context.update(self.market.entry_timing(str(row.get('symbol') or '').upper(), quote.get('source')))
+        symbol = str(row.get('symbol') or '').upper()
         ceiling = row.get('entry_gap_ceiling', GapPolicy().admission_gap(self._ordinary_pending_count()))
+        live = qualify_quote(self.market.send_quote(symbol), self._finite(row.get('limit_price')), ceiling,
+                             following=bool(row.get('signal_follow')))
+        if live['entry_qualified_by'] == 'none':
+            # The worker repeats this check at send. Avoid reserving an ID,
+            # fsync and a network job for a rebound already received locally.
+            self._submit_skip_reasons[symbol] = 'latest_quote_not_qualified_before_registration'
+            return
+        context = dict(decision_epoch_ms=time.time()*1000, _decision_ns=time.monotonic_ns())
+        quote = self.market.entry_quote(symbol)
+        context.update(self.market.entry_timing(symbol, quote.get('source')))
         detail = qualify_quote(quote, self._finite(row.get('limit_price')), ceiling,
                                following=bool(row.get('signal_follow')))
         return super()._place_order(dict(row, **detail, _entry_timing_context=context))
@@ -234,13 +248,20 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         limit = self._finite((row or {}).get('limit_price'))
         gap = (price-limit)/limit if limit > 0 else float('inf')
         self._eligible.pop(symbol, None)
-        if row and gap <= cfg.CANCEL_GAP:
+        if row and gap <= cfg.CANCEL_GAP and not self._unowned_rank_blocked(symbol, time.time()):
             item = (gap, symbol, version)
             self._eligible[symbol] = item
             heapq.heappush(self._rank_heap, item)
         if len(self._rank_heap) > max(64, 4*len(self._eligible)):
             self._rank_heap = list(self._eligible.values())
             heapq.heapify(self._rank_heap)
+
+    def _unowned_rank_blocked(self, symbol, now):
+        if symbol in self.tracked or symbol in self.positions:
+            return False
+        row = self._templates.get(symbol)
+        return bool(row and (now < self._finite(self.ledger.state['reopen_until_epoch'].get(symbol))
+                            or self._entry_submission_blocked(self._entry_sizing_row(row))))
 
     def _fast_snapshot(self, snapshot, tick, now):
         effective = self.market.entry_prices([tick.symbol]).get(tick.symbol, float('inf'))
@@ -293,6 +314,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                     continue
                 if symbol in excluded:
                     restore.append(heapq.heappop(self._rank_heap))
+                    continue
+                if self._unowned_rank_blocked(symbol, time.time()):
+                    heapq.heappop(self._rank_heap)
+                    self._eligible.pop(symbol, None)
                     continue
                 effective = self.market.entry_prices([symbol]).get(symbol)
                 if effective is None:
@@ -406,6 +431,18 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._io_signal = snapshot, status
         completed = self._drain_network()
         self._quote_checkpoint('callbacks')
+        signal_gate = (status, bool(snapshot.get('signal_ready')))
+        if signal_gate != self._quote_signal_gate:
+            self._quote_signal_gate = signal_gate
+            if status != 'valid' or not signal_gate[1]:
+                self._publish_entry_gate()
+        if ((status != 'valid' or not signal_gate[1]) and not completed
+                and tick.symbol not in self.tracked):
+            # No new entry can be admitted. Keep committing every quote for
+            # signal/valuation; reconcile resting orders on their own quotes
+            # and periodic maintenance, not on every unrelated market event.
+            self._quote_route = 'signal_not_ready'
+            return False
         previous_ids = {row.get('client_order_id') for row in self.tracked.values()}
         targets = self._target_positions(snapshot)
         # A new far quote cannot enter the shortlist, change any incumbent's

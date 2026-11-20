@@ -224,6 +224,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             avg = self._finite(order.get('avgPrice'))
             row['last_status'] = status
             row['confirmed_filled_qty'] = qty
+            self.session_entries.timings.outcome(str(row.get('client_order_id') or ''),
+                order_id=str(order.get('orderId') or ''), status=status, executed_qty=qty)
             if qty > 0.0:
                 if not self._register_fill(symbol, row, order, qty, avg):
                     continue
@@ -295,6 +297,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         return True
 
     def _retire_order(self, symbol: str, row: Mapping[str, Any], reason: str) -> None:
+        self.session_entries.timings.outcome(str(row.get('client_order_id') or ''), retired_reason=reason)
         self._note_rotation_terminal(symbol, row, reason)
         getattr(self, '_cancel_attempts', {}).pop((symbol, str(row.get('client_order_id') or '')), None)
         self.tracked.pop(symbol, None)
@@ -310,6 +313,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             self.stats['foreign_ignored'] += 1
             LOG.warning('refusing to cancel unregistered exact order symbol=%s reason=%s', symbol, reason)
             return False
+        self.session_entries.timings.outcome(cid, cancel_reason=reason)
         if row.get('fate_unknown') and oid in (None, '', 0, '0'):
             # No acknowledged ID exists to cancel yet. The single throttled
             # reconciler resolves this UID; do not bypass its cooldown with a
@@ -355,6 +359,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             if filled_qty + 1e-12 < self._finite(current.get('accounted_entry_qty')):
                 LOG.warning('older cancel snapshot retained; wait for exact latest fill symbol=%s', symbol)
                 return
+            self.session_entries.timings.outcome(cid, order_id=str(oid or ''),
+                status=str(result.get('status') or '').upper(), executed_qty=filled_qty)
             if filled_qty > 0 and not self._register_fill(
                     symbol, current, result, filled_qty, self._finite(result.get('avgPrice'))):
                 self.ledger.save()
@@ -485,10 +491,22 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     or self._finite(recovery.get('confirmed_absences')) > cfg.ENTRY_RECOVERY_MAX_RETRIES)
         # Guard the signal plan, not a physical send ID. New IDs must not reset
         # rotation suppression, definitive rejection, or bounded absence retry.
-        for name in ('rotated_out_plans', 'entry_submit_rejections'):
-            if any(not record.get('retryable') and record.get('symbol') == symbol and record.get('plan_signature') == signature
-                   for record in self.ledger.state.get(name, {}).values()):
+        cache = getattr(self, '_entry_block_cache', None)
+        if cache is None:
+            cache = self._entry_block_cache = {}
+        previous = cache.get(symbol)
+        if previous:
+            name, key, record = previous
+            if (self.ledger.state.get(name, {}).get(key) is record
+                    and not record.get('retryable') and record.get('symbol') == symbol
+                    and record.get('plan_signature') == signature):
                 return True
+            cache.pop(symbol, None)
+        for name in ('rotated_out_plans', 'entry_submit_rejections'):
+            for key, record in self.ledger.state.get(name, {}).items():
+                if not record.get('retryable') and record.get('symbol') == symbol and record.get('plan_signature') == signature:
+                    cache[symbol] = (name, key, record)
+                    return True
         if self._entry_recovery_count(row) > cfg.ENTRY_RECOVERY_MAX_RETRIES:
             return True
         return False
@@ -505,6 +523,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
 
     def _reject_entry_submission(self, row: Mapping[str, Any], cid: str,
                                  exc: BaseException) -> None:
+        self.session_entries.timings.outcome(cid, status='SUBMIT_REJECTED',
+            submit_error=str(exc)[:300], retryable=isinstance(exc, EntryQuoteUnavailable))
         symbol = str(row.get('symbol') or '').upper()
         current = self.tracked.get(symbol)
         if current and str(current.get('client_order_id') or '') == cid:
@@ -668,17 +688,22 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     return
                 LOG.warning('place uncertain symbol=%s err=%s; exact identity retained', symbol, exc)
                 current.update(last_status='UNKNOWN', submit_failed_at_epoch=time.time())
+                self.session_entries.timings.outcome(client_id, status='UNKNOWN', submit_error=str(exc)[:300])
                 self.ledger.save()
                 return
             order_id = str(place_result.get('orderId') or '')
             self.session_entries.timings.mark(client_id, 'owner_ack')
-            current['entry_timing'] = self.session_entries.timings.order(client_id)
             send_quote = place_result.get('_entry_send_quote')
             if isinstance(send_quote, Mapping) and send_quote.get('entry_qualified_by'):
                 current['entry_send_quote'] = {k: send_quote[k] for k in QUOTE_FIELDS if k in send_quote}
             current.update(order_id=order_id, fate_unknown=False)
             if self._finite(place_result.get('executedQty')) >= self._finite(current.get('confirmed_filled_qty')):
                 current['last_status'] = str(place_result.get('status') or 'NEW').upper()
+            self.session_entries.timings.outcome(client_id, order_id=order_id,
+                status=str(current.get('last_status') or 'NEW').upper(),
+                executed_qty=max(self._finite(place_result.get('executedQty')),
+                                 self._finite(current.get('confirmed_filled_qty'))))
+            current['entry_timing'] = self.session_entries.timings.order(client_id)
             self.ledger.register(symbol=symbol, client_order_id=client_id,
                                  order_id=order_id, kind='entry',
                                  limit_price=price, qty=qty,
@@ -888,9 +913,11 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self._drain_network()
         checkpoint('signal_callbacks')
         self.reconcile_orders(now=now)
+        checkpoint('orders_exact')
         self._reconcile_forced_exits(now=now)
+        checkpoint('forced_exits')
         self._cleanup_forced_close_orders(now=now)
-        checkpoint('orders_forced')
+        checkpoint('forced_cleanup')
         self._publish_entry_gate()
         for symbol in list(self.positions):
             self._reconcile_position_close(symbol, now=now)

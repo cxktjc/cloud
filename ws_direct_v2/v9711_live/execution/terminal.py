@@ -207,7 +207,8 @@ class TradeTerminalView:
             lines.insert(-1, f'Internal WS: healthy={ws.get("healthy")} queue={ws.get("queue")} '
                          f'prices={ws.get("fresh_symbols", 0)}/{ws.get("subscribed", 0)} decided={ws.get("decided")} stale={ws.get("rejected_backlog")} '
                          f'overflow={ws.get("overflow")} p95_us={ws.get("receive_to_decision_us_p95")} '
-                         '(decision/dispatch, not exchange ACK; mirror runs after decision)')
+                         '(decision/dispatch, not exchange ACK; mirror runs after decision) '
+                         f'build={(ws.get("runtime") or {}).get("build", "-")}')
             lines.insert(-1, f'tick/bid0 OR准入: tick有效={ws.get("fresh_symbols", 0)} '
                          f'bid0有效={ws.get("bid0_symbols", 0)} 任一路有效={ws.get("entry_symbols", 0)}；估值仍用tick。')
             lines.insert(-1, f'行情负载: 接收={ws.get("receive_per_second", 0):.0f}/s '
@@ -215,7 +216,8 @@ class TradeTerminalView:
                          f'决策={ws.get("decide_per_second", 0):.0f}/s 积压={ws.get("queue", 0)} '
                          f'峰值={ws.get("queue_peak", 0)} 买一未变={ws.get("unchanged", 0)} '
                          f'远价快速处理={ws.get("skipped_far_events", 0)} '
-                         f'过载丢弃={ws.get("overload_discarded", 0)}')
+                         f'过载丢弃={ws.get("overload_discarded", 0)} '
+                         f'当前丢弃={ws.get("discarded_per_second", 0):.0f}/s')
             work = ws.get('owner_work') or {}
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
@@ -305,6 +307,20 @@ class TradeTerminalView:
                         block.extend(entry_timing_lines(timing))
                     else:
                         block.append('      该笔signal尚无匹配的下单时间记录；不使用其他入场bar的记录代填。')
+                    attempts = row.get('order_attempts') or {}
+                    latest = attempts.get('latest') or {}
+                    if latest:
+                        reasons = {'order_bar_expired': '入场bar结束', 'entry_gap_too_far': '距离超过撤单门槛',
+                                   'replaced_by_closer': '被更近候选替换', 'position_capacity_full': '持仓容量已满',
+                                   'position_capacity_full_cancel_all': '持仓容量已满',
+                                   'signal_follow_ended': 'signal持仓结束'}
+                        reason = latest.get('cancel_reason') or latest.get('retired_reason') or ''
+                        block.append(f'      委托跟踪：已登记={attempts.get("registered", 0)} 实际发送={attempts.get("sent", 0)} '
+                                     f'最近状态={latest.get("status") or "待确认"} '
+                                     f'累计成交量={latest.get("executed_qty", "未确认")} '
+                                     f'撤销/终结原因={reasons.get(reason, reason) or "尚未记录"}')
+                        if latest.get('submit_error'):
+                            block.append(f'      最近提交异常：{latest["submit_error"]}')
                     current = row.get('same_symbol_trade')
                     if current:
                         reason = ('入场bar不同' if current.get('mismatch_reason') == 'different_entry_bar'

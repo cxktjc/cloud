@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from v9711_live import config as cfg
 from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.nonblocking_io import NetworkIO
-from v9711_live.execution.submit_errors import ConfirmedSubmitRejection
+from v9711_live.execution.submit_errors import ConfirmedSubmitRejection, EntryQuoteUnavailable
 from v9711_live.execution.ws_direct import DirectTrade
 
 
@@ -255,6 +255,17 @@ class SignalFollowTests(unittest.TestCase):
         self.event()
         self.assertNotEqual(self.trade.tracked['AUSDT']['client_order_id'], first)
 
+    def test_follow_quote_rejection_retries_next_fresh_quote_without_ten_second_wait(self):
+        self.submit_error = EntryQuoteUnavailable('internal WS quotes unavailable before send')
+        self.event()
+        first = self.submits[-1]['client_order_id']
+        self.assertNotIn('AUSDT', self.trade.tracked)
+        self.submit_error = None
+        self.event()
+        self.assertEqual(len(self.submits), 2)
+        self.assertNotEqual(self.trade.tracked['AUSDT']['client_order_id'], first)
+        self.assertTrue(self.trade.tracked['AUSDT']['signal_follow'])
+
     def test_signal_read_gap_preserves_existing_follow_without_new_admission(self):
         self.event()
         cid = self.trade.tracked['AUSDT']['client_order_id']
@@ -313,6 +324,8 @@ class SignalFollowTests(unittest.TestCase):
         self.publish()
         original = dict(symbol='AUSDT', limit_price=1., notional=5., order_bar_open_ms=self.bar,
                         reference_bar_open_ms=self.bar-cfg.BAR_MS, exit_due_epoch=self.now+900)
+        self.trade.market.update('AUSDT', '1.01', int(self.now*1000))
+        self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
         self.trade._place_order(original)
         cid = self.trade.tracked['AUSDT']['client_order_id']
         self.bar += cfg.BAR_MS

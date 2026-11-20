@@ -7,6 +7,7 @@ import time
 from typing import Mapping
 
 from .. import config as cfg
+from .submit_errors import EntryQuoteUnavailable
 
 FOLLOW_ORDER_CAP = cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS
 FOLLOW_POSITION_CAP = cfg.SIGNAL_FOLLOW_POSITION_STOP
@@ -116,7 +117,13 @@ class SignalFollowMixin:
         if current and current.get('signal_follow'):
             self._advance_signal_follow(current)
             identity = str(current.get('signal_follow_position_id') or current.get('position_id'))
-            self.ledger.state.setdefault('signal_follow_retry_after', {})[identity] = time.time() + 10.0
+            retry_after = self.ledger.state.setdefault('signal_follow_retry_after', {})
+            if isinstance(exc, EntryQuoteUnavailable):
+                # Known not sent: the next fresh quote can restore a follow
+                # immediately. Keep the advanced identity, never reuse its ID.
+                retry_after.pop(identity, None)
+            else:
+                retry_after[identity] = time.time() + 10.0
         return super()._reject_entry_submission(row, cid, exc)
 
     def _follow_gate_entries(self, snapshot, *, now):

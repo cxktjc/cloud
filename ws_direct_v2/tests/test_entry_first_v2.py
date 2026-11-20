@@ -45,6 +45,18 @@ class EntryFirstTests(unittest.TestCase):
     refresh_quotes = fixtures.FlashOwnerTests.refresh_quotes
     publish, held = fixtures.FlashOwnerTests.publish, fixtures.FlashOwnerTests.held
 
+    def test_maintenance_coalesces_multiple_fill_saves(self):
+        self.plans(3)
+        self.event('N0USDT', 1.01)
+        for row in self.trade.tracked.values():
+            self.orders[row['client_order_id']].update(status='FILLED', executedQty=row['qty'], avgPrice='1')
+        with patch.object(client_module, 'atomic_write_json', wraps=client_module.atomic_write_json) as write:
+            self.trade.step(now=self.now)
+        self.assertEqual(len(self.trade.positions), 3)
+        self.assertEqual(write.call_count, 2)
+        restored = OwnershipLedger(self.trade.ledger.path, self.trade.ledger.state_path)
+        self.assertEqual(len(restored.state['owned_positions']), 3)
+
     def test_full_book_sends_after_one_grouped_barrier_before_cancel_calls(self):
         self.plans(8)
         self.event('N0USDT', 1.01)

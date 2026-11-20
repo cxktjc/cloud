@@ -35,6 +35,21 @@ class EntryTimings:
                 row['transport'] = transport
             self.revision += 1
 
+    def outcome(self, cid, **fields):
+        """Owner-only diagnostics after ACK/reconciliation; never fill evidence."""
+        with self._lock:
+            row = self._rows.get(cid)
+            if row is None:
+                return
+            if 'executed_qty' in fields:
+                if float(fields['executed_qty'] or 0) < float(row.get('executed_qty') or 0):
+                    fields.pop('status', None)  # A delayed ACK must not rewind newer fill evidence.
+                fields['executed_qty'] = max(float(row.get('executed_qty') or 0), float(fields['executed_qty'] or 0))
+            if all(row.get(key) == value for key, value in fields.items()):
+                return
+            row.update(fields, outcome_updated_epoch_ms=time.time()*1000)
+            self.revision += 1
+
     @staticmethod
     def _public(row):
         result = {k: v for k, v in row.items() if not k.startswith('_')}
@@ -56,14 +71,23 @@ class EntryTimings:
 
     def first_for(self, entry):
         with self._lock:
-            key = (entry['symbol'], entry['entry_bar_open_ms'], entry['signal_session_id'])
-            matches = [self._rows[cid] for cid in self._plans.get(key, ())
-                if (not self._rows[cid]['position_id'] or not entry['position_id']
-                     or self._rows[cid]['position_id'] == entry['position_id'])]
+            matches = self._matches(entry)
             sent = [row for row in matches if '_send_ns' in row]
             if sent:
                 return self._public(min(sent, key=lambda row: row['_send_ns']))
             return self._public(matches[0]) if matches else {}
+
+    def _matches(self, entry):
+        key = (entry['symbol'], entry['entry_bar_open_ms'], entry['signal_session_id'])
+        return [self._rows[cid] for cid in self._plans.get(key, ())
+                if (not self._rows[cid]['position_id'] or not entry['position_id']
+                    or self._rows[cid]['position_id'] == entry['position_id'])]
+
+    def attempts_for(self, entry):
+        with self._lock:
+            matches = self._matches(entry)
+            return dict(registered=len(matches), sent=sum('_send_ns' in row for row in matches),
+                        latest=self._public(matches[-1]) if matches else {})
 
 
 class EntrySendProbe:
