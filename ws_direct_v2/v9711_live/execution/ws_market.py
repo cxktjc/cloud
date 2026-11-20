@@ -309,17 +309,43 @@ class DirectMarket:
                         note='includes decision+durable intent+dispatch, not exchange ACK; rolling samples')
 
     async def _receive(self):
+        await self._receive_feeds(((self, 'aggTrade', ticker_ws.WS_BASE),))
+
+    async def _startup_pause(self):
+        await asyncio.sleep(1.0)
+
+    async def _launch_receivers(self, feeds, tasks):
+        specs = [(feed, stream, base, index, group)
+                 for feed, stream, base in feeds for index, group in enumerate(feed.groups, 1)]
+        for offset, (feed, stream, base, index, group) in enumerate(specs):
+            if self._async_stop.is_set():
+                break
+            startup_done = asyncio.Event()
+            tasks.append(asyncio.create_task(ticker_ws.consume_group(group, feed,
+                base=base, stream_kind=stream, ping_interval=30, ping_timeout=20, read_timeout=30,
+                reconnect_before=23*3600, stop=self._async_stop, group_index=index,
+                subscribe=True, startup_done=startup_done)))
+            await startup_done.wait()
+            if offset+1 < len(specs) and not self._async_stop.is_set():
+                await self._startup_pause()
+
+    async def _receive_feeds(self, feeds):
         self._loop = asyncio.get_running_loop()
         self._async_stop = asyncio.Event()
-        tasks = [asyncio.create_task(ticker_ws.consume_group(group, self,
-                 base=ticker_ws.WS_BASE, ping_interval=30, ping_timeout=20, read_timeout=30,
-                 reconnect_before=23*3600, stop=self._async_stop, group_index=index, subscribe=True))
-                 for index,group in enumerate(self.groups, 1)]
+        tasks = []
         if self._closing.is_set():
             self._async_stop.set()
+        startup = asyncio.create_task(self._launch_receivers(feeds, tasks))
+        stopping = asyncio.create_task(self._async_stop.wait())
         try:
-            await self._async_stop.wait()
+            completed, _ = await asyncio.wait((startup, stopping), return_when=asyncio.FIRST_COMPLETED)
+            if startup in completed:
+                await startup  # Propagate unexpected launch errors; fail closed.
+            await stopping
         finally:
+            startup.cancel()
+            stopping.cancel()
+            await asyncio.gather(startup, stopping, return_exceptions=True)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -543,20 +569,5 @@ class DualMarket(DirectMarket):
         return result
 
     async def _receive(self):
-        self._loop = asyncio.get_running_loop()
-        self._async_stop = asyncio.Event()
-        tasks = []
-        for feed, stream, base in ((self, 'aggTrade', ticker_ws.WS_BASE),
-                                  (self.book, 'bookTicker', ticker_ws.BOOK_WS_BASE)):
-            for index, group in enumerate(self.groups, 1):
-                tasks.append(asyncio.create_task(ticker_ws.consume_group(group, feed,
-                    base=base, stream_kind=stream, ping_interval=30, ping_timeout=20, read_timeout=30,
-                    reconnect_before=23*3600, stop=self._async_stop, group_index=index, subscribe=True)))
-        if self._closing.is_set():
-            self._async_stop.set()
-        try:
-            await self._async_stop.wait()
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._receive_feeds(((self.book, 'bookTicker', ticker_ws.BOOK_WS_BASE),
+                                   (self, 'aggTrade', ticker_ws.WS_BASE)))

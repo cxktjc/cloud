@@ -216,6 +216,7 @@ async def consume_group(
     group: list[str], state: SnapshotState, *, base: str, ping_interval: float,
     ping_timeout: float, read_timeout: float, reconnect_before: float,
     stop: asyncio.Event, group_index: int, stream_kind='aggTrade', subscribe=False,
+    startup_done: asyncio.Event | None = None,
 ) -> None:
     retry = 1.0
     endpoints = endpoint_candidates(base, stream_kind)
@@ -247,6 +248,8 @@ async def consume_group(
                         timeout=FIRST_DATA_TIMEOUT)
                     LOG.info("market stream=%s group=%s SUBSCRIBE sent symbols=%d id=%s endpoint=%s",
                              stream_kind, group_index, len(group), group_index, selected_base)
+                if startup_done is not None:
+                    startup_done.set()  # Handshake + subscription send; not market-data readiness.
                 valid_count = 0
                 raw_count = 0
                 rejected = {}
@@ -350,6 +353,8 @@ async def consume_group(
                         "lifetime=%.3fs messages=%d valid=%d retry=%.1fs error=%s",
                         stream_kind, group_index, selected_base, lifetime, raw_count, valid_count, retry, detail)
             state.group_failed(group_index, detail)
+            if startup_done is not None:
+                startup_done.set()  # A failed first attempt must not starve later groups.
             if not received:
                 endpoint_index += 1
             await asyncio.sleep(retry)

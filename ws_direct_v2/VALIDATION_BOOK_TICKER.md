@@ -50,3 +50,15 @@
 - 服务器是否仍会异常断线需更新后观察；本地测试不证明此前故障根因已消除。
 
 订阅协议依据：[Binance USDⓈ-M Live Subscribing/Unsubscribing](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Live-Subscribing-Unsubscribing-to-streams)。
+
+## 启动串行连接、depth 优先（2026-11-20）
+
+- 首次启动先依次连接全部 bookTicker 组，再依次连接 aggTrade 组。每组完成握手和
+  SUBSCRIBE 发送后等待 1s，才发起下一组；已有组继续接收，状态线程不等待这些间隔。
+- 首轮失败会记录原错误并释放启动等待，间隔 1s 后继续其他组，失败组按原策略独立重连。
+  启动完成信号与行情就绪分离，订阅确认仍不授权使用行情；后续重连不走该首次启动队列。
+- 停止时取消启动等待/间隔及所有已发起的 receiver，不在停止后继续启动新连接。
+- 相关回归命令：`& D:\program\python.exe -B -m unittest tests.test_book_ticker_v2.BookReceiverTests tests.test_book_ticker_v2.SubscribeReceiverTests tests.test_ticker_readiness tests.test_ws_pressure_v2.ReceiverRecoveryTests tests.test_ws_direct -q`。
+  **59 项通过**。包括 647 币双路 14 组顺序、13 次间隔、真实 1s 间隔、订阅发送未完成时
+  保持等待、首轮握手失败继续、启动握手/间隔中停止，以及原有超时/重连/解析回归。
+  测试使用临时状态及本地回环 WS，未发送真实订单或修改生产状态。

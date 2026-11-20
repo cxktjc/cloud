@@ -12,6 +12,9 @@ trade 两路均按每连接最多 100 个币对分组，继续订阅完整币池
 每组连接不带 `?streams=` 的原端点后，发送一次 `SUBSCRIBE`，`params` 包含本组全部
 `symbol@aggTrade` 或 `symbol@bookTicker`，每次重连重新发送。日志显示 `subscription=SUBSCRIBE`、
 `SUBSCRIBE sent` 和 `SUBSCRIBE acknowledged`；确认回包不代替首笔有效行情，不刷新行情时效。
+启动时先按组号逐个连接全部 depth，再逐个连接 tick；前组握手并发送订阅后等 1 秒再启动后组。
+首轮连接失败也会记录错误并等待 1 秒后继续后组，该组独立按原规则重试；不把失败当作行情就绪。
+该间隔只用于首次启动，已建立连接继续接收，不阻塞交易状态线程；启动中停止也会取消待启动组。
 更新后重启 trade 生效，signal 无需重启；独立 ticker collector 保留原 URL 订阅行为。
 
 - 普通单判断价取有效 tick/bid0 的较小值：`gap=(判断价-原入场限价)/原入场限价`。

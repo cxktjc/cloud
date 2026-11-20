@@ -487,10 +487,48 @@ class DualAdmissionTests(unittest.TestCase):
 
 
 class SubscribeReceiverTests(unittest.IsolatedAsyncioTestCase):
-    async def consume(self, state, stop, *, base=ticker_ws.BOOK_WS_BASE, stream='bookTicker', symbols=None):
+    async def consume(self, state, stop, *, base=ticker_ws.BOOK_WS_BASE, stream='bookTicker', symbols=None,
+                      startup_done=None):
         await ticker_ws.consume_group(symbols or ['XUSDT'], state, base=base, stream_kind=stream,
             ping_interval=30, ping_timeout=20, read_timeout=30, reconnect_before=3600,
-            stop=stop, group_index=3, subscribe=True)
+            stop=stop, group_index=3, subscribe=True, startup_done=startup_done)
+
+    async def test_startup_waits_until_subscription_send_finishes(self):
+        stop, state = asyncio.Event(), Mock()
+        sending, release, startup_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        class Socket:
+            async def send(self, raw):
+                sending.set()
+                await release.wait()
+            async def recv(self):
+                stop.set()
+                return json.dumps(dict(e='bookTicker', s='XUSDT', b='1.01', B='4', u=7,
+                                       T=int(time.time()*1000)))
+        class Connection:
+            async def __aenter__(self): return Socket()
+            async def __aexit__(self, *args): pass
+        with patch.object(ticker_ws.websockets, 'connect', return_value=Connection()):
+            task = asyncio.create_task(self.consume(state, stop, startup_done=startup_done))
+            try:
+                await asyncio.wait_for(sending.wait(), 1)
+                self.assertFalse(startup_done.is_set())
+                state.group_received.assert_not_called()
+                release.set()
+                await asyncio.wait_for(task, 1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(startup_done.is_set())
+
+    async def test_failed_handshake_releases_startup_but_does_not_mark_ready(self):
+        stop, state, startup_done = asyncio.Event(), Mock(), asyncio.Event()
+        async def backoff(seconds): stop.set()
+        with patch.object(ticker_ws.websockets, 'connect', side_effect=OSError('handshake failed')), \
+                patch.object(ticker_ws.asyncio, 'sleep', side_effect=backoff):
+            await self.consume(state, stop, startup_done=startup_done)
+        self.assertTrue(startup_done.is_set())
+        state.group_received.assert_not_called()
+        state.group_failed.assert_called_once()
 
     async def test_real_socket_sends_subscription_and_parses_both_event_formats(self):
         for stream in ('aggTrade', 'bookTicker'):
@@ -599,17 +637,81 @@ class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
             async def consume(group, state, **kw):
                 self.assertIs(kw['subscribe'], True)
                 calls.append((kw['stream_kind'], tuple(group), kw['base']))
+                kw['startup_done'].set()
                 if len(calls) == 14:
                     kw['stop'].set()
                 await kw['stop'].wait()
-            with patch.object(ticker_ws, 'consume_group', side_effect=consume):
+            with patch.object(ticker_ws, 'consume_group', side_effect=consume), \
+                    patch.object(market, '_startup_pause', new_callable=AsyncMock) as pause:
                 await market._receive()
+            self.assertEqual(pause.await_count, 13)
+            self.assertEqual([s for s,g,b in calls], ['bookTicker']*7+['aggTrade']*7)
             self.assertEqual([g for s,g,b in calls if s == 'aggTrade'],
                              [g for s,g,b in calls if s == 'bookTicker'])
             for stream in ('aggTrade', 'bookTicker'):
                 self.assertEqual([symbol for kind, group, base in calls if kind == stream
                                   for symbol in group], symbols)
             self.assertTrue(all('/public/' in b for s,g,b in calls if s == 'bookTicker'))
+
+    async def test_next_connection_waits_one_second_after_previous_subscription(self):
+        with tempfile.TemporaryDirectory() as directory:
+            market = DualMarket(['XUSDT'], Path(directory)/'prices.json')
+            started, release = asyncio.Event(), asyncio.Event()
+            calls, sent = [], []
+            async def consume(group, state, **kw):
+                calls.append((kw['stream_kind'], time.monotonic()))
+                if len(calls) == 1:
+                    started.set()
+                    await release.wait()  # Handshake/subscription still pending.
+                sent.append(time.monotonic())
+                kw['startup_done'].set()
+                if len(calls) == 2:
+                    kw['stop'].set()
+                await kw['stop'].wait()
+            with patch.object(ticker_ws, 'consume_group', side_effect=consume):
+                task = asyncio.create_task(market._receive())
+                try:
+                    await asyncio.wait_for(started.wait(), 1)
+                    self.assertEqual(len(calls), 1)
+                    release.set()
+                    await asyncio.wait_for(task, 3)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual([s for s,t in calls], ['bookTicker', 'aggTrade'])
+            self.assertGreaterEqual(calls[1][1]-sent[0], .99)
+
+    async def test_stop_during_handshake_or_gap_does_not_start_later_groups(self):
+        for during_pause in (False, True):
+            with self.subTest(during_pause=during_pause), tempfile.TemporaryDirectory() as directory:
+                market = DualMarket(['XUSDT'], Path(directory)/'prices.json')
+                waiting, blocked = asyncio.Event(), asyncio.Event()
+                calls, cancelled = [], []
+                async def consume(group, state, **kw):
+                    calls.append(kw['stream_kind'])
+                    try:
+                        if during_pause:
+                            kw['startup_done'].set()
+                        else:
+                            waiting.set()
+                        await blocked.wait()
+                    finally:
+                        cancelled.append(kw['stream_kind'])
+                async def pause():
+                    waiting.set()
+                    await blocked.wait()
+                with patch.object(ticker_ws, 'consume_group', side_effect=consume), \
+                        patch.object(market, '_startup_pause', side_effect=pause):
+                    task = asyncio.create_task(market._receive())
+                    try:
+                        await asyncio.wait_for(waiting.wait(), 1)
+                        market._async_stop.set()
+                        await asyncio.wait_for(task, 1)
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertEqual(calls, ['bookTicker'])
+                self.assertEqual(cancelled, ['bookTicker'])
 
     async def test_real_parser_subscribes_same_symbols_and_reads_best_bid(self):
         stop = asyncio.Event()
