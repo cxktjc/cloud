@@ -50,7 +50,11 @@ async def probe(name, symbols, base, stream, seconds, *, subscribe=False):
                 if remaining <= 0:
                     break
                 try:
-                    raw = await asyncio.wait_for(socket.recv(), remaining)
+                    if hasattr(asyncio, 'timeout'):
+                        async with asyncio.timeout(remaining):
+                            raw = await socket.recv()
+                    else:
+                        raw = await asyncio.wait_for(socket.recv(), remaining)
                 except asyncio.TimeoutError:
                     break
                 count += 1
