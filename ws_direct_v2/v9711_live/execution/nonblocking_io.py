@@ -111,7 +111,9 @@ class NetworkIO(EntryCancelPacing):
             for alias in aliases:
                 self._aliases[alias] = key
             heapq.heappush(self._heap, (priority, next(self._sequence), key))
-            self._condition.notify_all()
+            # One new job needs one idle worker. Waking all 19 on every entry
+            # creates avoidable GIL/condition contention during a burst.
+            self._condition.notify(1)
         return True
 
     def poll(self, key: tuple, work: Callable[[], Any], *, priority: int = 20) -> Any:
@@ -406,9 +408,32 @@ class NetworkTradeMixin:
         if entry_request is not None and self._entry_plan_buffer is not None:
             self._entry_plan_buffer.append((key, work, done, dict(entry_request)))
             return
-        if key[0] != 'cancel':
-            self.ledger.flush_pending()  # entry/close identities precede every actual dispatch
+        barrier = self.ledger.flush_pending() if key[0] != 'cancel' else None
         self._publish_entry_gate()
+        if barrier is not None:
+            original_work = work
+            identities = aliases or (key,)
+            required = frozenset((item[1], item[2]) for item in identities if item[0] in {'entry', 'close'})
+            timings = self.session_entries.timings
+            def work():
+                for item in identities:
+                    if item[0] == 'entry':
+                        timings.mark(item[2], 'worker')
+                try:
+                    receipt = barrier.result()
+                except Exception:
+                    receipt = None
+                # Raise outside the handler: the existing conservative error
+                # classifier treats a chained OSError as possibly sent. Here
+                # original_work has provably never been called.
+                if receipt is None:
+                    raise ConfirmedSubmitRejection('durable registration failed; request never sent')
+                if not required <= receipt.reservations:
+                    raise ConfirmedSubmitRejection('durable reservation superseded; request never sent')
+                for item in identities:
+                    if item[0] == 'entry':
+                        timings.mark(item[2], 'durable')
+                return original_work()  # Live gate/quote checks still run after the disk wait.
         if self._network_io is None:
             try:
                 result = work()

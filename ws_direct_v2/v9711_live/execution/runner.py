@@ -648,7 +648,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                              exit_due_epoch=self._finite(row.get('exit_due_epoch')))
         # One grouped durability barrier contains sequence, exact intent, new
         # slot and any replacement/cancel reservations. Nothing is sent first.
-        self.ledger.flush()
+        self.ledger.flush_for_dispatch()
         self.session_entries.timings.mark(client_id, 'registered')
         LOG.info('entry registered symbol=%s id=%s 满足=%s tick=%s depth_bid0=%s gap_ceiling=%s',
                  symbol, client_id, self.tracked[symbol].get('entry_qualified_by', 'unknown'),
@@ -1094,7 +1094,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         # The new entries have been registered and dispatched. The existing
         # paced cancel lane retains its 1.5s interval and exact-ID recovery.
         if plan.cancel:
-            self.ledger.flush()
+            self.ledger.flush_for_dispatch()
         for symbol in plan.cancel:
             row = self.tracked.get(symbol)
             if row is not None:

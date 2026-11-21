@@ -73,6 +73,9 @@ class OwnershipLedger:
         self._saved_intents = self._saved_state = None
         self._save_depth = 0
         self._save_pending = False
+        self._background = None
+        self._background_closed = False
+        self._last_barrier = None
 
     def unknown_since(self, key: str, *, now: float) -> float:
         existing = _finite(self.state['unknown_since_epoch'].get(key))
@@ -96,7 +99,7 @@ class OwnershipLedger:
         if self._save_depth:
             self._save_pending = True
             return
-        self.flush()
+        self.flush_for_dispatch()
 
     @contextmanager
     def batch_saves(self):
@@ -107,9 +110,12 @@ class OwnershipLedger:
         finally:
             self._save_depth -= 1
             if not self._save_depth and self._save_pending:
-                self.flush()
+                self.flush_for_dispatch()
 
     def flush(self) -> None:
+        if self._background is not None:
+            self.flush_for_dispatch().result()
+            return
         # A successful save is still durable before dispatch. Unchanged files
         # need no new fsync; cache each document ONLY after its replace succeeds
         # so an interrupted second write is retried on the next owner cycle.
@@ -124,9 +130,43 @@ class OwnershipLedger:
                 setattr(self, attr, encoded)
         self._save_pending = False
 
-    def flush_pending(self) -> None:
+    def flush_pending(self):
         if self._save_pending:
+            return self.flush_for_dispatch()
+        return self._last_barrier
+
+    def enable_background(self):
+        if self._background is None:
+            from .durable_writer import DurableWriter
+            self._background = DurableWriter(self.path, self.state_path,
+                saved=(self._saved_intents, self._saved_state))
+
+    def flush_for_dispatch(self):
+        if self._background is None:
             self.flush()
+            return None
+        from .durable_writer import Snapshot
+        reservations = set()
+        for name, field, kind in (('tracked_orders', 'client_order_id', 'entry'),
+                                  ('owned_positions', 'close_client_order_id', 'close')):
+            for symbol, row in self.state.get(name, {}).items():
+                cid = str(row.get(field) or '')
+                intent = self.intents.get('c:'+cid) or {}
+                if cid and intent.get('symbol') == symbol and intent.get('kind') == kind and intent.get('client_order_id') == cid:
+                    reservations.add((symbol, cid))
+        encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+        self._last_barrier = self._background.submit(Snapshot(
+            encode(self.intents), encode(self.state), frozenset(reservations)))
+        self._save_pending = False
+        return self._last_barrier
+
+    def close_background(self):
+        if self._background is not None and not self._background_closed:
+            try:
+                self.flush()
+            finally:
+                self._background.close()
+                self._background_closed = True
 
     def client_id(self, symbol: str, bar_open_ms: int, kind: str) -> str:
         generation = self.state.get('sizing_generations', {}).get(f'{symbol.upper()}:{int(bar_open_ms)}', 0) if kind == 'entry' else 0

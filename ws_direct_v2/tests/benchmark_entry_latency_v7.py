@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import queue
 import threading
 import time
@@ -56,7 +57,7 @@ def restrict_cpus(count):
 
 
 def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=False,
-        pressure_rate=0, interval=1., changing=False):
+        pressure_rate=0, interval=1., changing=False, disk_delay_ms=0):
     case = DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     read_started, release_read = threading.Event(), threading.Event()
@@ -76,6 +77,23 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             s: dict(tick='.0001', step='1', min_qty='1', min_notional='5') for s in case.symbols}}))
         case.make_trade()
         trade, market = case.trade, case.trade.market
+        if disk_delay_ms:
+            from v9711_live.execution import client as client_module
+            original_json = client_module.atomic_write_json
+            def slow_json(*args, **kwargs):
+                threading.Event().wait(disk_delay_ms/1000)
+                return original_json(*args, **kwargs)
+            case.stack.enter_context(patch.object(client_module, 'atomic_write_json', side_effect=slow_json))
+            try:
+                from v9711_live.execution import durable_writer as durable_module
+            except ImportError:
+                pass  # Same benchmark can run against the archived synchronous baseline.
+            else:
+                original_text = durable_module.atomic_write_text
+                def slow_text(*args, **kwargs):
+                    threading.Event().wait(disk_delay_ms/1000)
+                    return original_text(*args, **kwargs)
+                case.stack.enter_context(patch.object(durable_module, 'atomic_write_text', side_effect=slow_text))
         for feed in (market, market.book):
             for group in feed.generation:
                 feed.group_connected(group)
@@ -195,7 +213,12 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             started = time.perf_counter()
             duration = 2. if burst else samples*interval+1.
             background = case.symbols[samples:]
+            # Build server-side payloads before measuring. The client should
+            # pay JSON decoding cost, not the exchange's per-frame encoding.
+            wires = {(symbol, change): json.dumps(dict(s=symbol, p=str(1.03+.0001*change),
+                E=int(case.now*1000))) for symbol in background for change in (0, 1)}
             opportunities = []
+            started = time.perf_counter()
             def produce_pressure():
                 index, triggered = 0, 0
                 rebounded = set()
@@ -222,14 +245,13 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                             symbol = background[index % len(background)]
                             # 5/32 tick + 27/32 stable bid frames gives 15.625%
                             # effective events after initial book population.
-                            price = 1.03 + (.0001*(index//len(background) % 2) if changing else 0)
-                            wire = json.dumps(dict(s=symbol, p=str(price), E=int(case.now*1000), u=index+1))
-                            message = json.loads(wire)  # Include JSON decoding under the GIL.
+                            change = index//len(background) % 2 if changing else 0
+                            message = json.loads(wires[symbol, change])  # Decode on the client under the GIL.
                             try:
                                 if index % 32 < 5:
                                     market.update(message['s'], message['p'], message['E'])
                                 else:
-                                    market.update_book(message['s'], message['p'], '2', message['E'], message['u']+1)
+                                    market.update_book(message['s'], message['p'], '2', message['E'], index+2)
                             except BufferError:
                                 pass  # Explicit production overflow counters remain visible.
                             index += 1
@@ -279,8 +301,11 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 io_at_end=trade._network_io.health(),
                 maintenance_cycles=cycles, errors=pressure_errors,
                 decoded_json=True, state_bytes=cfg.EXECUTION_LEDGER_FILE.stat().st_size,
+                disk_delay_ms_per_changed_file=disk_delay_ms,
+                gil_switch_ms=sys.getswitchinterval()*1000,
+                durability_writer=trade.ledger._background.health() if getattr(trade.ledger, '_background', None) else None,
                 stages={name: None for name in ('queue_wait', 'dequeued_to_decision', 'decision_to_registered',
-                                               'registered_to_worker', 'worker_to_send')})
+                                               'registered_to_worker', 'worker_to_durable', 'durable_to_send', 'worker_to_send')})
             # Timing rows survive retirement, use their exact CIDs for all sends.
             pressure['stages'] = {name: summary([row['latencies_ms'][name]
                 for row in (trade.session_entries.timings.order(cid) for cid in case.orders)
@@ -380,6 +405,7 @@ if __name__ == '__main__':
     parser.add_argument('--interval', type=float, default=1.)
     parser.add_argument('--changing', action='store_true')
     parser.add_argument('--cpus', type=int, help='Restrict this process to N available logical CPUs')
+    parser.add_argument('--disk-delay-ms', type=float, default=0., help='Offline added latency per changed durable file')
     args = parser.parse_args()
     if not 1 <= args.samples <= 800 or args.history < 0:
         parser.error('samples in 1..800 and nonnegative history required')
@@ -389,9 +415,11 @@ if __name__ == '__main__':
         parser.error('pressure requires positive rate, samples <= 8, interval >= .2 and no blocked account')
     if args.cpus is not None and not 1 <= args.cpus <= 19:
         parser.error('cpus must be in 1..19')
+    if not 0 <= args.disk_delay_ms <= 1000:
+        parser.error('disk-delay-ms must be in 0..1000')
     affinity = restrict_cpus(args.cpus) if args.cpus else None
     result = run(args.samples, args.history, args.blocked_account, args.signed_socket, args.burst,
-                 args.pressure_rate, args.interval, args.changing)
+                 args.pressure_rate, args.interval, args.changing, args.disk_delay_ms)
     result['cpu_affinity'] = affinity
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -4,6 +4,7 @@ import heapq
 import hashlib
 import logging
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -34,7 +35,7 @@ def check_inputs():
                 bars=str(cfg.STATUS_FILE.resolve()), account=str(cfg.ACCOUNT_STREAM_DIR.resolve()),
                 symbols=str(cfg.SYMBOLS_FILE.resolve()), filters=str(cfg.EXCHANGE_INFO_CACHE_FILE.resolve()),
                 decision_input='internal WS memory only; never latest.json',
-                order='receive -> decision/durable registration/dispatch -> mirror commit -> asynchronous file')
+                order='receive -> owner reservation/snapshot/dispatch -> mirror; worker waits durable receipt before send')
 
 
 class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
@@ -68,7 +69,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._background_terminal = None
         self._servicing_quotes = False
         self._maintenance_mark = None
-        self._runtime_source = dict(build='20261121-entry-pressure-v8', source=str(Path(__file__).resolve()),
+        self._previous_switch_interval = None
+        self._live_switch_interval = None
+        self._runtime_source = dict(build='20261121-entry-durable-v9', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -78,7 +81,20 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._refresh_precision_readiness()
 
     def enable_nonblocking_io(self):
+        interval = None
+        if self.client.enabled and not self.client.dry_run and self._previous_switch_interval is None:
+            interval = cfg.env_float('V9711_LIVE_GIL_SWITCH_SECONDS', .001)
+            if not .0005 <= interval <= .005:
+                raise ValueError('V9711_LIVE_GIL_SWITCH_SECONDS must be in [0.0005, 0.005]')
         super().enable_nonblocking_io()
+        if self.client.enabled and not self.client.dry_run:
+            self.ledger.enable_background()
+            if self._previous_switch_interval is None:
+                # CPython's default 5ms GIL interval can be paid repeatedly
+                # between the quote owner, disk writer and socket loop.
+                self._previous_switch_interval = sys.getswitchinterval()
+                self._live_switch_interval = interval
+                sys.setswitchinterval(interval)
         self._network_io.callback_limit = 8
         self._network_io.callback_budget_seconds = .001
         if self._feedback_writer is None:
@@ -95,13 +111,18 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         try:
             super().shutdown_io()
         finally:
-            if self._feedback_writer is not None:
-                self._feedback_writer.close()
-            if self._account_reader is not None:
-                self._account_reader.close()
-                self.client.stream = self._account_reader.source
-            if self._background_terminal is not None:
-                self._background_terminal.close()
+            try:
+                self.ledger.close_background()
+            finally:
+                if self._feedback_writer is not None:
+                    self._feedback_writer.close()
+                if self._account_reader is not None:
+                    self._account_reader.close()
+                    self.client.stream = self._account_reader.source
+                if self._background_terminal is not None:
+                    self._background_terminal.close()
+                if self._previous_switch_interval is not None and sys.getswitchinterval() == self._live_switch_interval:
+                    sys.setswitchinterval(self._previous_switch_interval)
 
     def _write_feedback_payload(self, payload):
         if self._feedback_writer is None:
@@ -547,6 +568,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._entry_diagnostics['ws_direct']['owner_work'] = self._owner_work.snapshot()
         self._entry_diagnostics['ws_direct']['runtime'] = self._runtime_source
         self._entry_diagnostics['ws_direct']['entry_latency'] = self.session_entries.timings.summary()
+        if self.ledger._background is not None:
+            self._entry_diagnostics['ws_direct']['durability_writer'] = self.ledger._background.health()
+            self._entry_diagnostics['ws_direct']['durability_writer']['gil_switch_ms'] = sys.getswitchinterval()*1000
         if self._account_reader is not None:
             self._entry_diagnostics['ws_direct']['account_reader'] = self._account_reader.diagnostics()
         self._entry_diagnostics['ws_direct']['feedback_writer'] = (

@@ -60,6 +60,8 @@ class EntryTimings:
                  ('quote_to_send', 'received', 'send'),
                  ('decision_to_registered', 'decision', 'registered'),
                  ('registered_to_worker', 'registered', 'worker'),
+                 ('worker_to_durable', 'worker', 'durable'),
+                 ('durable_to_send', 'durable', 'send'),
                  ('worker_to_send', 'worker', 'send'),
                  ('send_to_response', 'send', 'response'),
                  ('response_to_owner', 'response', 'owner_ack'))
@@ -94,7 +96,7 @@ class EntryTimings:
                         latest=self._public(matches[-1]) if matches else {})
 
     def summary(self):
-        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'send')
+        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'durable', 'send')
         keys = tuple('_'+name+'_ns' for name in fields)
         with self._lock:
             # Copy only bounded timestamp fields, then sort outside the lock.
@@ -118,6 +120,8 @@ class EntryTimings:
             ('dequeued_to_decision', 'dequeued', 'decision'),
             ('decision_to_registered', 'decision', 'registered'),
             ('registered_to_worker', 'registered', 'worker'),
+            ('worker_to_durable', 'worker', 'durable'),
+            ('durable_to_send', 'durable', 'send'),
             ('worker_to_send', 'worker', 'send'))}
         return result
 

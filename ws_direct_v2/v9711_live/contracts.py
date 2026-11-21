@@ -39,6 +39,10 @@ def parse_epoch(value: Any) -> float:
 
 
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
+
+
+def atomic_write_text(path: Path, encoded: str) -> None:
     """Readers see either the previous or the next complete document.
 
     Windows may transiently deny replacing a JSON file that a reader, editor,
@@ -52,7 +56,7 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             # Encode once in memory and issue one buffered write. json.dump's
             # Python chunk iterator is expensive for a long execution ledger.
             # The flush/fsync/atomic-replace durability boundary is unchanged.
-            handle.write(json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
         for attempt in range(8):

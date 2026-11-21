@@ -125,6 +125,18 @@ class EntryLatencyTests(unittest.TestCase):
         self.timing.mark('first', 'send')  # Duplicate hook cannot overwrite first send.
         self.assertEqual(self.timing.first_for(self.entry), first)
 
+    def test_background_disk_wait_remains_visible_in_send_latency(self):
+        self.register()
+        for stage, ms in (('registered', 1), ('worker', 2), ('durable', 31), ('send', 3)):
+            self.advance(ms)
+            self.timing.mark('first', stage)
+        result = self.timing.summary()
+        self.assertEqual(result['p95_ms'], 37)
+        self.assertEqual(result['stages']['decision_to_registered']['p95_ms'], 1)
+        self.assertEqual(result['stages']['registered_to_worker']['p95_ms'], 2)
+        self.assertEqual(result['stages']['worker_to_durable']['p95_ms'], 31)
+        self.assertEqual(result['stages']['durable_to_send']['p95_ms'], 3)
+
     def test_other_session_bar_or_exact_position_cannot_supply_times(self):
         self.register('other-session', session='old')
         self.register('other-bar', bar=self.bar-cfg.BAR_MS)

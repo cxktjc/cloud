@@ -48,12 +48,15 @@ def entry_timing_lines(timing):
             f'通道={timing.get("transport", "未记录")} '
             f'行情时间={iso_ms(timing.get("exchange_time_ms"))}')
     labels = (('quote_to_decision', '收行情→判断'), ('decision_to_registered', '判断→登记'),
-              ('registered_to_worker', '登记→线程'), ('worker_to_send', '线程→发送'),
+              ('registered_to_worker', '登记→线程'), ('worker_to_durable', '等待落盘'),
+              ('durable_to_send', '落盘后→发送'), ('worker_to_send', '线程→发送'),
               ('send_to_response', '发送→回包'), ('response_to_owner', '回包→主线程确认'))
     delays = timing.get('latencies_ms') or {}
-    details = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in labels if key in delays)
+    details = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in labels if key in delays
+                      and (key != 'worker_to_send' or 'durable_to_send' not in delays))
     stages = (f'      该单登记={iso_ms(timing.get("registered_epoch_ms"))} '
-              f'回包={iso_ms(timing.get("response_epoch_ms"))} '
+              +(f'落盘完成={iso_ms(timing["durable_epoch_ms"])} ' if timing.get('durable_epoch_ms') else '')
+              +f'回包={iso_ms(timing.get("response_epoch_ms"))} '
               f'主线程确认={iso_ms(timing.get("owner_ack_epoch_ms"))}')
     extra = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
         ('queue_wait', '触发行情→出队'), ('dequeued_to_decision', '出队→选中'),
@@ -239,8 +242,8 @@ class TradeTerminalView:
                 if stages:
                     parts = [f'{label}={(stages.get(key) or {}).get("p95_ms")}' for key, label in (
                         ('queue_wait', '排队'), ('dequeued_to_decision', '选单'),
-                        ('decision_to_registered', '登记持久化'), ('registered_to_worker', 'worker调度'),
-                        ('worker_to_send', '发送前'))]
+                        ('decision_to_registered', '登记快照'), ('registered_to_worker', 'worker调度'),
+                        ('worker_to_durable', '等待落盘'), ('durable_to_send', '落盘后发送'))]
                     lines.insert(-1, '已发送订单分段P95(ms): '+ ' '.join(parts)+'；各段分位数不可相加')
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
@@ -254,6 +257,12 @@ class TradeTerminalView:
                                  f'{item.get("kind")} {item.get("elapsed_ms")}ms '
                                  f'主要阶段={item.get("stage")} {item.get("stage_ms")}ms')
             writer = ws.get('feedback_writer') or {}
+            durability = ws.get('durability_writer') or {}
+            if durability.get('enabled'):
+                lines.insert(-1, f'订单账本后台写盘: 写入中={int(durability.get("writing", False))} '
+                             f'待写={durability.get("pending", 0)} 合并={durability.get("coalesced", 0)} '
+                             f'最近={durability.get("last_write_ms", 0):.3f}ms '
+                             f'失败={durability.get("failures", 0)} 错误={durability.get("error") or "无"}；落盘成功后才发单')
             if writer.get('enabled'):
                 lines.insert(-1, f'反馈写盘: 后台待写={writer.get("pending", 0)} '
                              f'最近写盘={writer.get("last_write_ms", 0):.3f}ms '
