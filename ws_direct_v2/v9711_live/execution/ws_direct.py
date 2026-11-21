@@ -68,7 +68,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._background_terminal = None
         self._servicing_quotes = False
         self._maintenance_mark = None
-        self._runtime_source = dict(build='20261121-entry-latency-v7', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261121-entry-pressure-v8', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())

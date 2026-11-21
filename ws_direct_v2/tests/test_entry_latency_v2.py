@@ -87,6 +87,32 @@ class EntryLatencyTests(unittest.TestCase):
         after = self.stats.snapshot()['recent_unfilled_entries'][0]['first_order_timing']
         self.assertIn('send_epoch_ms', after)
 
+    def test_stage_summary_counts_sent_orders_and_keeps_missing_trigger_absent(self):
+        self.timing.register('THEUSDT', 'first', dict(order_bar_open_ms=self.bar,
+            _entry_timing_context=dict(_received_ns=self.nano, _event_received_ns=self.nano,
+                _dequeued_ns=self.nano+100_000_000, _decision_ns=self.nano+102_000_000)))
+        for stage, ms in (('registered', 112), ('worker', 3), ('send', 5)):
+            self.advance(ms)
+            self.timing.mark('first', stage)
+        self.register('maintenance')  # No triggering event for a maintenance entry.
+        self.advance(2)
+        self.timing.mark('maintenance', 'registered')
+        self.advance(2)
+        self.timing.mark('maintenance', 'worker')
+        self.advance(2)
+        self.timing.mark('maintenance', 'send')
+        self.register('unsent')
+        self.advance(5000)
+        self.timing.mark('unsent', 'registered')  # Must not inflate sent-order latency.
+        stages = self.timing.summary()['stages']
+        self.assertEqual(stages['queue_wait']['samples'], 1)
+        self.assertEqual(stages['queue_wait']['p95_ms'], 100)
+        self.assertEqual(stages['dequeued_to_decision']['p95_ms'], 2)
+        self.assertEqual(stages['decision_to_registered']['max_ms'], 10)
+        self.assertEqual(stages['registered_to_worker']['max_ms'], 3)
+        self.assertEqual(stages['worker_to_send']['max_ms'], 5)
+        self.assertEqual(stages['worker_to_send']['samples'], 2)
+
     def test_retry_and_follow_do_not_replace_the_first_actual_send(self):
         self.register('rejected')  # Local pre-send rejection must not become first send.
         self.advance(5)

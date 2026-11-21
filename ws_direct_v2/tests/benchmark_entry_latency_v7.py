@@ -6,6 +6,7 @@ Run from the version under test, with this script's absolute path if needed.
 import argparse
 import asyncio
 import json
+import os
 import queue
 import threading
 import time
@@ -21,19 +22,55 @@ from v9711_live.execution.stream import Health
 
 def summary(values):
     values = sorted(values)
+    if not values:
+        return dict(samples=0, within_10ms=0, p50_ms=None, p95_ms=None, p99_ms=None, max_ms=None)
     return dict(samples=len(values), within_10ms=sum(v <= 10 for v in values),
         p50_ms=round(values[int((len(values)-1)*.5)], 3),
         p95_ms=round(values[int((len(values)-1)*.95)], 3),
         p99_ms=round(values[int((len(values)-1)*.99)], 3), max_ms=round(max(values), 3))
 
 
-def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=False):
+def restrict_cpus(count):
+    """Only this disposable benchmark process; never change system settings."""
+    if hasattr(os, 'sched_getaffinity'):
+        available = sorted(os.sched_getaffinity(0))
+        chosen = available[:count]
+        os.sched_setaffinity(0, chosen)
+        return chosen
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        api = ctypes.WinDLL('kernel32', use_last_error=True)
+        api.GetCurrentProcess.restype = wintypes.HANDLE
+        api.GetProcessAffinityMask.argtypes = (wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t))
+        api.SetProcessAffinityMask.argtypes = (wintypes.HANDLE, ctypes.c_size_t)
+        process = api.GetCurrentProcess()
+        mask, system = ctypes.c_size_t(), ctypes.c_size_t()
+        if not api.GetProcessAffinityMask(process, ctypes.byref(mask), ctypes.byref(system)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        chosen = [i for i in range(mask.value.bit_length()) if mask.value & (1 << i)][:count]
+        if not api.SetProcessAffinityMask(process, sum(1 << i for i in chosen)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return chosen
+    raise RuntimeError('CPU affinity unsupported on this platform')
+
+
+def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=False,
+        pressure_rate=0, interval=1., changing=False):
     case = DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     read_started, release_read = threading.Event(), threading.Event()
     producer = None
+    pressure_stop = threading.Event()
+    pressure_errors = []
     try:
         case.symbols = [f'N{i}USDT' for i in range(800)]
+        # Avoid per-frame Mock call recording in the pressure producer.
+        case.stack.enter_context(patch('time.time', lambda: case.now))
+        if pressure_rate:
+            # Python 3.10 Windows monotonic_ns can tick in ~16ms units. All
+            # event and stage clocks use the same high-resolution source here.
+            case.stack.enter_context(patch('time.monotonic_ns', time.perf_counter_ns))
         cfg.SYMBOLS_FILE.write_text('\n'.join(case.symbols))
         cfg.EXCHANGE_INFO_CACHE_FILE.write_text(json.dumps({'symbols': {
             s: dict(tick='.0001', step='1', min_qty='1', min_notional='5') for s in case.symbols}}))
@@ -47,6 +84,9 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
         for symbol in case.symbols:
             market.update(symbol, '1.03', int(case.now*1000))
             market.decide(market.events.get_nowait(), lambda event: None)
+            if pressure_rate:
+                market.update_book(symbol, '1.03', '2', int(case.now*1000), 1)
+                market.decide(market.events.get_nowait(), lambda event: None)
         case.targets = []
         case.templates = [dict(symbol=s, limit_price=1., notional=5., order_bar_open_ms=case.bar,
             reference_bar_open_ms=case.bar-cfg.BAR_MS, exit_due_epoch=case.now+900) for s in case.symbols]
@@ -56,6 +96,10 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             trade.ledger.intents['c:historical-'+str(i)] = dict(symbol='OLDUSDT', kind='entry',
                 client_order_id='historical-'+str(i), order_id=str(i), limit_price=1., qty=5.,
                 exit_due_epoch=case.now-1800, registered_at_epoch=case.now-3600)
+        if pressure_rate:
+            # User reported ~54KB state and <1KB intents. Do not benchmark an
+            # empty ledger then attribute live delays to huge history files.
+            trade.ledger.state['_offline_padding'] = 'x'*54000
         trade.ledger.flush()
         sends, received = [], {}
         def fake_socket(method, symbol, side, qty, *, client_order_id, before_send, **kwargs):
@@ -117,9 +161,17 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
         if trade._network_io.health()['transport_warmup']['failed']:
             raise AssertionError('offline worker prewarm failed')
         trade._account_deadline = case.now+3600
+        maintenance = time.perf_counter()+.25
+        cycles = 0
         def pump_until(count):
+            nonlocal maintenance, cycles
             deadline = time.perf_counter()+3
             while len(sends) < count and time.perf_counter() < deadline:
+                if pressure_rate and time.perf_counter() >= maintenance:
+                    trade._service_pending_quotes()
+                    trade.step(now=case.now)
+                    cycles += 1
+                    maintenance = time.perf_counter()+.25
                 try:
                     event = market.events.get(timeout=.002)
                 except queue.Empty:
@@ -134,7 +186,107 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             while trade._network_io.health()['running'] or trade._network_io.health()['queued']:
                 threading.Event().wait(.001)
             trade._drain_network()
-        if blocked:
+        pressure = None
+        if pressure_rate:
+            # Open-loop background load AND independently scheduled entries.
+            # Trigger symbols are reserved so background frames cannot erase a
+            # crossing before its explicitly scheduled one-second rebound.
+            initial = market.metrics()
+            started = time.perf_counter()
+            duration = 2. if burst else samples*interval+1.
+            background = case.symbols[samples:]
+            opportunities = []
+            def produce_pressure():
+                index, triggered = 0, 0
+                rebounded = set()
+                try:
+                    while not pressure_stop.is_set():
+                        elapsed = time.perf_counter()-started
+                        if elapsed >= duration:
+                            break
+                        due = min(samples, samples if burst and elapsed >= .5 else
+                                  max(0, int((elapsed-.5)/interval)+1) if elapsed >= .5 else 0)
+                        while triggered < due:
+                            symbol = case.symbols[triggered]
+                            received[symbol] = time.perf_counter_ns()
+                            opportunities.append(dict(symbol=symbol, received_ns=received[symbol]))
+                            market.update(symbol, '.99', int(case.now*1000))
+                            triggered += 1
+                        for item in opportunities:
+                            symbol = item['symbol']
+                            if symbol not in rebounded and time.perf_counter_ns()-item['received_ns'] >= 1_000_000_000:
+                                market.update(symbol, '1.03', int(case.now*1000))
+                                rebounded.add(symbol)
+                        target = int(elapsed*pressure_rate)
+                        while index < target:
+                            symbol = background[index % len(background)]
+                            # 5/32 tick + 27/32 stable bid frames gives 15.625%
+                            # effective events after initial book population.
+                            price = 1.03 + (.0001*(index//len(background) % 2) if changing else 0)
+                            wire = json.dumps(dict(s=symbol, p=str(price), E=int(case.now*1000), u=index+1))
+                            message = json.loads(wire)  # Include JSON decoding under the GIL.
+                            try:
+                                if index % 32 < 5:
+                                    market.update(message['s'], message['p'], message['E'])
+                                else:
+                                    market.update_book(message['s'], message['p'], '2', message['E'], message['u']+1)
+                            except BufferError:
+                                pass  # Explicit production overflow counters remain visible.
+                            index += 1
+                        pressure_stop.wait(.001)
+                except BaseException as exc:
+                    pressure_errors.append(repr(exc))
+                finally:
+                    pressure_stop.set()
+            producer = threading.Thread(target=produce_pressure, daemon=True)
+            producer.start()
+            while not pressure_stop.is_set() or not market.events.empty():
+                if time.perf_counter() >= maintenance:
+                    trade._service_pending_quotes()
+                    trade.step(now=case.now)
+                    cycles += 1
+                    maintenance = time.perf_counter()+.25
+                try:
+                    event = market.events.get(timeout=.005)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    if trade._drain_network():
+                        maintenance = 0
+                    trade._publish_entry_gate()
+                else:
+                    market.decide(event, trade.on_tick)
+                market.events.task_done()
+            producer.join(2)
+            # No artificial owner retirement: the eight slots fill normally;
+            # rebounds use the real paced cancel path and fake cancel ACKs.
+            end = time.perf_counter()+1
+            while time.perf_counter() < end and (trade._network_io.health()['running'] or trade._network_io.health()['queued']):
+                trade._drain_network()
+                threading.Event().wait(.001)
+            trade._drain_network()
+            final = market.metrics()
+            keys = ('received', 'enqueued', 'decided', 'overflow', 'overload_discarded', 'rejected_backlog')
+            pressure = dict(target_raw_rate=pressure_rate, target_effective_rate=(pressure_rate if changing else pressure_rate*5/32),
+                seconds=duration, actual_seconds=round(time.perf_counter()-started, 3),
+                achieved_raw_rate=round((final.get('received', 0)-initial.get('received', 0))/duration, 1),
+                achieved_effective_rate=round((final.get('enqueued', 0)-initial.get('enqueued', 0))/duration, 1),
+                counters={k: final.get(k, 0)-initial.get(k, 0) for k in keys},
+                queue_peak=final.get('queue_peak'), final_queue=market.events.qsize(),
+                opportunities=len(opportunities), sent_symbols=len({s['symbol'] for s in sends}),
+                unsent_symbols=[item['symbol'] for item in opportunities if item['symbol'] not in {s['symbol'] for s in sends}],
+                duplicate_symbols=len(sends)-len({s['symbol'] for s in sends}),
+                io_at_end=trade._network_io.health(),
+                maintenance_cycles=cycles, errors=pressure_errors,
+                decoded_json=True, state_bytes=cfg.EXECUTION_LEDGER_FILE.stat().st_size,
+                stages={name: None for name in ('queue_wait', 'dequeued_to_decision', 'decision_to_registered',
+                                               'registered_to_worker', 'worker_to_send')})
+            # Timing rows survive retirement, use their exact CIDs for all sends.
+            pressure['stages'] = {name: summary([row['latencies_ms'][name]
+                for row in (trade.session_entries.timings.order(cid) for cid in case.orders)
+                if name in row.get('latencies_ms', {})]) for name in pressure['stages']}
+            values = [s['ms'] for s in sends]
+        elif blocked:
             # One resting exact order is queried while another symbol crosses.
             received['N0USDT'] = time.perf_counter_ns()
             market.update('N0USDT', '1.01', int(case.now*1000))
@@ -205,8 +357,10 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                           if signed_socket else '800 templates; real temporary durable files; guarded FAKE socket, no signing/network/ACK RTT'),
             scenario='100ms_blocked_account' if blocked else 'burst_entries' if burst else 'sequential_entries', history_intents=history,
             latency=summary(values), sends=sends,
-            account_worker=trade._account_reader is not None if hasattr(trade, '_account_reader') else False)
+            account_worker=trade._account_reader is not None if hasattr(trade, '_account_reader') else False,
+            pressure=pressure)
     finally:
+        pressure_stop.set()
         release_read.set()
         if producer:
             producer.join(3)
@@ -222,13 +376,30 @@ if __name__ == '__main__':
     parser.add_argument('--signed-socket', action='store_true')
     parser.add_argument('--burst', action='store_true')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--pressure-rate', type=int, default=0)
+    parser.add_argument('--interval', type=float, default=1.)
+    parser.add_argument('--changing', action='store_true')
+    parser.add_argument('--cpus', type=int, help='Restrict this process to N available logical CPUs')
     args = parser.parse_args()
     if not 1 <= args.samples <= 800 or args.history < 0:
         parser.error('samples in 1..800 and nonnegative history required')
     if args.burst and (args.samples > 8 or args.blocked_account):
         parser.error('burst requires samples <= 8 and no blocked-account')
-    result = run(args.samples, args.history, args.blocked_account, args.signed_socket, args.burst)
+    if args.pressure_rate and (args.pressure_rate < 1 or args.samples > 8 or args.blocked_account or args.interval < .2):
+        parser.error('pressure requires positive rate, samples <= 8, interval >= .2 and no blocked account')
+    if args.cpus is not None and not 1 <= args.cpus <= 19:
+        parser.error('cpus must be in 1..19')
+    affinity = restrict_cpus(args.cpus) if args.cpus else None
+    result = run(args.samples, args.history, args.blocked_account, args.signed_socket, args.burst,
+                 args.pressure_rate, args.interval, args.changing)
+    result['cpu_affinity'] = affinity
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')
     print(json.dumps(result['latency']))
+    if result['pressure']:
+        evidence = result['pressure']
+        raise SystemExit(int(bool(evidence['errors'] or evidence['unsent_symbols'] or evidence['duplicate_symbols']
+            or evidence['counters']['overflow'] or evidence['counters']['overload_discarded']
+            or evidence['counters']['rejected_backlog']
+            or evidence['achieved_raw_rate'] < .9*args.pressure_rate)))

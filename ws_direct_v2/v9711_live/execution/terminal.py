@@ -235,6 +235,13 @@ class TradeTerminalView:
                 lines.insert(-1, f'本机依据报价→发送(ms，最近最多512次登记): P50={latency.get("p50_ms")} '
                              f'P95={latency.get("p95_ms")} P99={latency.get("p99_ms")} '
                              f'最大={latency.get("max_ms")} ≤10ms={latency.get("within_10ms")}/{latency.get("samples")}')
+                stages = latency.get('stages') or {}
+                if stages:
+                    parts = [f'{label}={(stages.get(key) or {}).get("p95_ms")}' for key, label in (
+                        ('queue_wait', '排队'), ('dequeued_to_decision', '选单'),
+                        ('decision_to_registered', '登记持久化'), ('registered_to_worker', 'worker调度'),
+                        ('worker_to_send', '发送前'))]
+                    lines.insert(-1, '已发送订单分段P95(ms): '+ ' '.join(parts)+'；各段分位数不可相加')
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
                 lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '

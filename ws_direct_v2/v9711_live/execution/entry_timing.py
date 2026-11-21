@@ -94,19 +94,31 @@ class EntryTimings:
                         latest=self._public(matches[-1]) if matches else {})
 
     def summary(self):
+        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'send')
+        keys = tuple('_'+name+'_ns' for name in fields)
         with self._lock:
-            rows = [(r.get('_received_ns'), r.get('_event_received_ns'), r.get('_send_ns'))
+            # Copy only bounded timestamp fields, then sort outside the lock.
+            # Aggregation runs during feedback, never inside quote selection.
+            rows = [tuple(r.get(key) for key in keys)
                     for r in list(self._rows.values())[-512:]]
-        def summarize(start):
-            values = sorted((r[2]-r[start])/1e6 for r in rows
-                            if r[2] is not None and r[start] is not None and r[2] >= r[start])
+        def summarize(start, end='send'):
+            first, last = fields.index(start), fields.index(end)
+            values = sorted((r[last]-r[first])/1e6 for r in rows
+                            if r[-1] is not None and r[first] is not None
+                            and r[last] is not None and r[last] >= r[first])
             return dict(samples=len(values), within_10ms=sum(v <= 10 for v in values),
                 p50_ms=round(values[int((len(values)-1)*.5)], 3) if values else None,
                 p95_ms=round(values[int((len(values)-1)*.95)], 3) if values else None,
                 p99_ms=round(values[int((len(values)-1)*.99)], 3) if values else None,
                 max_ms=round(max(values), 3) if values else None)
-        result = summarize(0)
-        result['trigger'] = summarize(1)
+        result = summarize('received')
+        result['trigger'] = summarize('event_received')
+        result['stages'] = {name: summarize(start, end) for name, start, end in (
+            ('queue_wait', 'event_received', 'dequeued'),
+            ('dequeued_to_decision', 'dequeued', 'decision'),
+            ('decision_to_registered', 'decision', 'registered'),
+            ('registered_to_worker', 'registered', 'worker'),
+            ('worker_to_send', 'worker', 'send'))}
         return result
 
 
