@@ -232,6 +232,9 @@ class DirectMarket:
     def decide(self, tick, callback):
         if tick is None:
             return False
+        # Owner-only boundary, immediately after the caller takes the event.
+        # Keep lock validation/screening out of the queue-wait measurement.
+        self._dequeued_context = (tick, time.monotonic_ns(), time.time()*1000)
         with self._lock:
             if tick.generation != self.generation[tick.group]:
                 self.counts['rejected_old'] += 1

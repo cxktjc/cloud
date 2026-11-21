@@ -902,6 +902,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
 
     def _step(self, *, now: float | None = None) -> None:
         checkpoint = getattr(self, '_maintenance_checkpoint', lambda stage: None)
+        admission_turn = getattr(self, '_maintenance_admission_turn', lambda: None)
         self.cycles += 1
         self._submit_skip_reasons = {}
         now = time.time() if now is None else float(now)
@@ -914,27 +915,42 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         checkpoint('signal_callbacks')
         self.reconcile_orders(now=now)
         checkpoint('orders_exact')
+        admission_turn()
         self._reconcile_forced_exits(now=now)
         checkpoint('forced_exits')
         self._cleanup_forced_close_orders(now=now)
         checkpoint('forced_cleanup')
+        admission_turn()
         self._publish_entry_gate()
         for symbol in list(self.positions):
             self._reconcile_position_close(symbol, now=now)
         self._reconcile_forced_exits(now=now)
         self._reconcile_manual_flats(now=now)
+        # Admission turns can observe a new signal file. Never apply an older
+        # local snapshot over the newer worker gate/targets after resuming.
+        snapshot, status = self.desired_snapshot(now=now)
+        self._io_signal = snapshot, status
         self._apply_signal_targets(snapshot)
         self.session_entries.observe_signal(snapshot, status=status, now=now)
         checkpoint('positions_manual')
+        admission_turn()
+        snapshot, status = self.desired_snapshot(now=now)
+        self._io_signal = snapshot, status
         targets = self._target_positions(snapshot)
         self._over_capacity_reduction(now=now, target_positions=targets)
         self._timed_exits(now=now)
         final_exit_bar = self._in_final_pre_exit_bar(now=now)
         self._cancel_all_for_full_capacity(now=now)
         checkpoint('close_capacity')
+        admission_turn()
+        snapshot, status = self.desired_snapshot(now=now)
+        self._io_signal = snapshot, status
+        targets = self._target_positions(snapshot)
+        final_exit_bar = self._in_final_pre_exit_bar(now=now)
         desired_rows, live_desired, price_map, plan = self._execute_entries(
             snapshot, status, now=now, targets=targets, final_exit_bar=final_exit_bar)
         checkpoint('entry_plan')
+        admission_turn()
         for row in (*self.tracked.values(), *self.positions.values()):
             timing = self.session_entries.timings.order(str(row.get('client_order_id') or row.get('entry_client_order_id') or ''))
             if timing:
@@ -942,6 +958,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self.session_entries.observe_owned_state(self.positions, self.tracked)
         self.ledger.save()
         checkpoint('ledger')
+        admission_turn()
         stream_health = self._stream_health()
         comparison = self._comparison(
             snapshot=snapshot, price_map=price_map,
@@ -952,6 +969,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                                  for item in live_desired),
             positions=self.positions, open_orders=self.tracked)
         checkpoint('comparison')
+        admission_turn()
         self.write_feedback(now=now, price_map=price_map,
                             comparison=comparison, stream_health=stream_health)
         self._render_trade(comparison=comparison, orders=self.tracked,

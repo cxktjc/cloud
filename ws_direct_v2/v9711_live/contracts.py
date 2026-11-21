@@ -49,7 +49,10 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     fd, name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+            # Encode once in memory and issue one buffered write. json.dump's
+            # Python chunk iterator is expensive for a long execution ledger.
+            # The flush/fsync/atomic-replace durability boundary is unchanged.
+            handle.write(json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
             handle.flush()
             os.fsync(handle.fileno())
         for attempt in range(8):

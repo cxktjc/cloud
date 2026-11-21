@@ -4,6 +4,7 @@ import heapq
 import hashlib
 import logging
 import queue
+import threading
 import time
 from pathlib import Path
 from .. import config as cfg
@@ -16,6 +17,9 @@ from .signal_follow import SignalFollowMixin
 from .entry_quotes import qualify_quote
 from .owner_work import OwnerWork
 from .feedback_writer import FeedbackWriter
+from .background_account import BackgroundAccountView
+from .background_terminal import BackgroundTerminal
+from .stream import AccountStreamView
 from ..entry_policy import GapPolicy, at_most
 from collectors.ticker_ws import load_symbols
 
@@ -37,6 +41,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def _network_wake(self):
         self.market._wake()  # Worker only enqueues; the owner applies all results.
 
+    def _account_read_wake(self):
+        self._account_changed.set()
+        self.market._wake()
+
     def __init__(self, **kwargs):
         self.market = DualMarket(load_symbols(cfg.SYMBOLS_FILE), cfg.PRICE_FILE)
         self._fast_tick = False
@@ -55,8 +63,12 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._skipped_noncompetitive_events = 0
         self._owner_work = OwnerWork()
         self._feedback_writer = None
+        self._account_reader = None
+        self._account_changed = threading.Event()
+        self._background_terminal = None
+        self._servicing_quotes = False
         self._maintenance_mark = None
-        self._runtime_source = dict(build='20261120-admission-v6', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261121-entry-latency-v7', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -67,8 +79,17 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def enable_nonblocking_io(self):
         super().enable_nonblocking_io()
+        self._network_io.callback_limit = 8
+        self._network_io.callback_budget_seconds = .001
         if self._feedback_writer is None:
             self._feedback_writer = FeedbackWriter(cfg.EXECUTION_FEEDBACK_FILE)
+        if (self._account_reader is None and self.client.enabled and not self.client.dry_run
+                and type(self.client.stream) is AccountStreamView):
+            self._account_reader = BackgroundAccountView(self.client.stream, owner_wake=self._account_read_wake)
+            self.client.stream = self._account_reader
+        if self._background_terminal is None:
+            self._background_terminal = BackgroundTerminal(self.view)
+            self.view = self._background_terminal
 
     def shutdown_io(self):
         try:
@@ -76,6 +97,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         finally:
             if self._feedback_writer is not None:
                 self._feedback_writer.close()
+            if self._account_reader is not None:
+                self._account_reader.close()
+                self.client.stream = self._account_reader.source
+            if self._background_terminal is not None:
+                self._background_terminal.close()
 
     def _write_feedback_payload(self, payload):
         if self._feedback_writer is None:
@@ -129,6 +155,20 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             now = time.perf_counter_ns()
             self._maintenance_segments[stage] = (now-self._maintenance_mark)/1e6
             self._maintenance_mark = now
+
+    def _maintenance_admission_turn(self):
+        # Only called at explicit state-consistent phase boundaries. The same
+        # owner still reserves capacity; no worker can mutate tracked/positions.
+        if self._maintenance_mark is not None and not self._servicing_quotes:
+            self._servicing_quotes = True
+            started = time.perf_counter_ns()
+            try:
+                self._service_pending_quotes(limit=32, budget_seconds=.001)
+            finally:
+                elapsed = time.perf_counter_ns()-started
+                self._maintenance_segments['admission_turn'] = self._maintenance_segments.get('admission_turn', 0)+elapsed/1e6
+                self._maintenance_mark += elapsed
+                self._servicing_quotes = False
 
     def _render_trade(self, **kwargs):
         try:
@@ -195,6 +235,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         context = dict(decision_epoch_ms=time.time()*1000, _decision_ns=time.monotonic_ns())
         quote = self.market.entry_quote(symbol)
         context.update(self.market.entry_timing(symbol, quote.get('source')))
+        context.update(getattr(self, '_event_timing_context', {}) or {})
         detail = qualify_quote(quote, self._finite(row.get('limit_price')), ceiling,
                                following=bool(row.get('signal_follow')))
         return super()._place_order(dict(row, **detail, _entry_timing_context=context))
@@ -410,11 +451,19 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def on_tick(self, tick):
         started = self._quote_mark = time.perf_counter_ns()
+        feed = self.market.book if tick.source == 'bid0' else self.market
+        dequeued = getattr(feed, '_dequeued_context', None)
+        dequeued_ns, dequeued_ms = ((dequeued[1], dequeued[2]) if dequeued and dequeued[0] is tick
+                                   else (time.monotonic_ns(), time.time()*1000))
+        self._event_timing_context = dict(event_received_epoch_ms=tick.received_epoch_ms,
+            _event_received_ns=tick.received_ns, dequeued_epoch_ms=dequeued_ms,
+            _dequeued_ns=dequeued_ns, trigger_source=tick.source, trigger_symbol=tick.symbol)
         self._quote_segments, self._quote_route, self._quote_tail = {}, 'full', 'screening'
         try:
             with self.ledger.batch_saves():
                 return self._on_tick(tick)
         finally:
+            self._event_timing_context = None
             self._quote_checkpoint(self._quote_tail)
             self._owner_work.finish('quote', started, self._quote_segments, route=self._quote_route)
 
@@ -497,6 +546,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._entry_diagnostics['ws_direct']['skipped_noncompetitive_events'] = self._skipped_noncompetitive_events
         self._entry_diagnostics['ws_direct']['owner_work'] = self._owner_work.snapshot()
         self._entry_diagnostics['ws_direct']['runtime'] = self._runtime_source
+        self._entry_diagnostics['ws_direct']['entry_latency'] = self.session_entries.timings.summary()
+        if self._account_reader is not None:
+            self._entry_diagnostics['ws_direct']['account_reader'] = self._account_reader.diagnostics()
         self._entry_diagnostics['ws_direct']['feedback_writer'] = (
             self._feedback_writer.health() if self._feedback_writer is not None else {'enabled': False})
         try:
@@ -541,6 +593,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         try:
             self.market.start()
             while True:
+                if self._account_changed.is_set():
+                    self._account_changed.clear()
+                    self._last_forced_probe = self._last_manual_flat_probe = None
+                    next_maintenance = 0  # Apply changed exact evidence without a polling-cycle wait.
                 now_mono = time.monotonic()
                 if now_mono >= next_maintenance:
                     # Exact fill/forced exit/close timers remain bounded even

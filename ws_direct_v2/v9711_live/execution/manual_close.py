@@ -21,6 +21,7 @@ class ManualCloseMixin:
             for symbol, pos in self.positions.items())))
         if key == getattr(self, '_last_manual_flat_probe', None):
             return
+        pending = False
         for symbol, pos in list(self.positions.items()):
             if pos.get('side') != 'LONG':
                 continue
@@ -57,11 +58,13 @@ class ManualCloseMixin:
                 if not evidence and diagnostics.get('flat_candidate_ms', 0) > 0:
                     self._close_warning(symbol, 'manual-flat evidence pending: '+str(diagnostics), now=now)
             except StreamUnavailable as exc:
+                pending = True
                 self._close_warning(symbol, str(exc), now=now)
                 continue
             if evidence:
                 self._settle_manual_flat(symbol, evidence, now=now)
-        self._last_manual_flat_probe = key
+        if not pending:
+            self._last_manual_flat_probe = key
 
     def _settle_manual_flat(self, symbol, evidence, *, now):
         pos = self.positions.get(symbol)

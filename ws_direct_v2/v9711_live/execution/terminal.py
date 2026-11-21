@@ -55,7 +55,13 @@ def entry_timing_lines(timing):
     stages = (f'      该单登记={iso_ms(timing.get("registered_epoch_ms"))} '
               f'回包={iso_ms(timing.get("response_epoch_ms"))} '
               f'主线程确认={iso_ms(timing.get("owner_ack_epoch_ms"))}')
-    return [line]+([stages] if timing else [])+([f'      分段耗时: {details}'] if details else [])
+    extra = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
+        ('queue_wait', '触发行情→出队'), ('dequeued_to_decision', '出队→选中'),
+        ('trigger_to_send', '触发行情→发送'), ('quote_to_send', '依据报价→发送')) if key in delays)
+    trigger = (f'触发={timing["trigger_symbol"]}/{timing.get("trigger_source")} '
+               if timing.get('trigger_symbol') else '')
+    return [line]+([stages] if timing else [])+([f'      分段耗时: {details}'] if details else [])+(
+        [f'      入场链路: {trigger}{extra}'] if extra else [])
 
 
 def compact_positions(rows: Any, limit: int) -> str:
@@ -219,6 +225,16 @@ class TradeTerminalView:
                          f'过载丢弃={ws.get("overload_discarded", 0)} '
                          f'当前丢弃={ws.get("discarded_per_second", 0):.0f}/s')
             work = ws.get('owner_work') or {}
+            latency = ws.get('entry_latency') or {}
+            trigger_latency = latency.get('trigger') or {}
+            if trigger_latency.get('samples'):
+                lines.insert(-1, f'本机触发行情→发送(ms): P50={trigger_latency.get("p50_ms")} '
+                             f'P95={trigger_latency.get("p95_ms")} P99={trigger_latency.get("p99_ms")} '
+                             f'最大={trigger_latency.get("max_ms")} ≤10ms={trigger_latency.get("within_10ms")}/{trigger_latency.get("samples")}')
+            if latency.get('samples'):
+                lines.insert(-1, f'本机依据报价→发送(ms，最近最多512次登记): P50={latency.get("p50_ms")} '
+                             f'P95={latency.get("p95_ms")} P99={latency.get("p99_ms")} '
+                             f'最大={latency.get("max_ms")} ≤10ms={latency.get("within_10ms")}/{latency.get("samples")}')
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
                 lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '

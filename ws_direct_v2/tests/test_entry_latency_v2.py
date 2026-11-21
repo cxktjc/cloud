@@ -62,6 +62,21 @@ class EntryLatencyTests(unittest.TestCase):
         self.assertIn('.015+00:00', panel)
         self.assertEqual(self.stats.snapshot()['trade_filled_entries'], 0)  # ACK is not a fill.
 
+    def test_queue_wait_selection_and_send_are_separate_from_exchange_reply(self):
+        self.timing.register('THEUSDT', 'first', dict(order_bar_open_ms=self.bar,
+            _entry_timing_context=dict(_received_ns=self.nano, _event_received_ns=self.nano,
+                _dequeued_ns=self.nano+100_000_000, _decision_ns=self.nano+102_000_000)))
+        self.advance(105)
+        self.timing.mark('first', 'send')
+        self.advance(2000)
+        self.timing.mark('first', 'response')
+        timing = self.timing.order('first')
+        self.assertEqual(timing['latencies_ms']['queue_wait'], 100)
+        self.assertEqual(timing['latencies_ms']['dequeued_to_decision'], 2)
+        self.assertEqual(timing['latencies_ms']['trigger_to_send'], 105)
+        self.assertEqual(self.timing.summary()['p95_ms'], 105)
+        self.assertEqual(self.timing.summary()['within_10ms'], 0)
+
     def test_stats_cache_updates_after_worker_stage_without_new_signal(self):
         self.register()
         self.timing.mark('first', 'registered')

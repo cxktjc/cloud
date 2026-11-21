@@ -741,6 +741,36 @@ class ExchangeClient(BatchEntryMixin):
             # Queued is not submitted. Do NOT query a negative remote response
             # and free this identity before the original worker has sent it.
             return (payload, True) if payload else (None, False)
+        if state and state.get('absence_check_after_ns'):
+            # The read-only account worker must observe the database AFTER the
+            # final negative exchange reply. A cached None is never enough.
+            if payload and valid_evidence(payload):
+                state.pop('absence_check_after_ns', None)
+                state.pop('last_negative_epoch', None)
+                state['not_found'] = 0
+                return payload, True
+            if not self._can_confirm_unacknowledged_absence(ledger, symbol=symbol,
+                    client_order_id=client_order_id, order_id=order_id, now=now):
+                state.pop('absence_check_after_ns', None)
+                state['not_found'] = 0
+            else:
+                try:
+                    latest = self.stream.lookup_order_after(after_ns=state['absence_check_after_ns'],
+                        symbol=symbol, order_id=order_id, client_order_id=client_order_id)
+                except StreamUnavailable:
+                    return (payload, True) if payload else (None, False)
+                if latest:
+                    if not valid_evidence(latest):
+                        return None, False
+                    state['not_found'] = 0
+                    state.pop('last_negative_epoch', None)
+                    state.pop('absence_check_after_ns', None)
+                    return latest, True
+                self._order_queries.pop(key, None)
+                ledger.clear_unknown(key)
+                LOG.info('unacknowledged entry confirmed absent after fresh account barrier symbol=%s id=%s',
+                         symbol, client_order_id)
+                return {}, True
         # An old NEW/PARTIAL row is not proof that a MARKET close remains open.
         # Previously it cleared unknown_since forever and suppressed fallback.
         if state and state.get('confirmed_terminal'):
@@ -829,11 +859,19 @@ class ExchangeClient(BatchEntryMixin):
             if state['not_found'] >= ORDER_ABSENCE_CONFIRMATIONS and settled:
                 # A local ACK/fill may have arrived DURING the network query.
                 # Never retire the identity and retry before consuming that evidence.
+                if callable(getattr(type(self.stream), 'lookup_order_after', None)):
+                    state['absence_check_after_ns'] = time.perf_counter_ns()
+                    try:
+                        self.stream.lookup_order_after(after_ns=state['absence_check_after_ns'],
+                            symbol=symbol, order_id=order_id, client_order_id=client_order_id)
+                    except StreamUnavailable:
+                        pass  # Start the read immediately; resolve on a later owner turn.
+                    return (payload, True) if payload else (None, False)
                 try:
                     latest = self.stream.lookup_order(
                         symbol=symbol, order_id=order_id, client_order_id=client_order_id)
                 except StreamUnavailable:
-                    latest = None
+                    return (payload, True) if payload else (None, False)
                 if latest and valid_evidence(latest):
                     state['not_found'] = 0
                     state.pop('last_negative_epoch', None)

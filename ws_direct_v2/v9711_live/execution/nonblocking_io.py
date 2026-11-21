@@ -59,6 +59,8 @@ class NetworkIO(EntryCancelPacing):
         self._warm_pending = workers if worker_start is not None else 0
         self._warm_ready = self._warm_failed = 0
         self._completed_callbacks = threading.Event()
+        self.callback_limit = None
+        self.callback_budget_seconds = None
         self._valid_query_keys = None
         self._query_keys = set()  # Only the owner adds/retires exact query identities.
         self._owner = threading.get_ident()
@@ -134,7 +136,13 @@ class NetworkIO(EntryCancelPacing):
             self._completed_callbacks.clear()
             ready = [job for job in self._jobs.values() if job.state == 'done' and job.done]
         count = 0
+        started = time.perf_counter()
         for job in ready:
+            if count and ((self.callback_limit is not None and count >= self.callback_limit)
+                    or (self.callback_budget_seconds is not None
+                        and time.perf_counter()-started >= self.callback_budget_seconds)):
+                self._completed_callbacks.set()
+                break
             # Retain the completion if accounting/save throws; cumulative fill
             # application is idempotent and can be retried next iteration.
             try:
@@ -290,7 +298,8 @@ class NetworkIO(EntryCancelPacing):
             self._condition.notify_all()
         for thread in self._threads:
             thread.join()  # only shutdown waits for the bounded in-flight requests
-        self.drain()
+        while self.drain():
+            pass  # Shutdown drains every result, irrespective of the live turn budget.
 
 
 class NetworkTradeMixin:

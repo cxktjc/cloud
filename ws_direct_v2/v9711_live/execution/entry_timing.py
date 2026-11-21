@@ -54,6 +54,10 @@ class EntryTimings:
     def _public(row):
         result = {k: v for k, v in row.items() if not k.startswith('_')}
         edges = (('quote_to_decision', 'received', 'decision'),
+                 ('queue_wait', 'event_received', 'dequeued'),
+                 ('dequeued_to_decision', 'dequeued', 'decision'),
+                 ('trigger_to_send', 'event_received', 'send'),
+                 ('quote_to_send', 'received', 'send'),
                  ('decision_to_registered', 'decision', 'registered'),
                  ('registered_to_worker', 'registered', 'worker'),
                  ('worker_to_send', 'worker', 'send'),
@@ -88,6 +92,22 @@ class EntryTimings:
             matches = self._matches(entry)
             return dict(registered=len(matches), sent=sum('_send_ns' in row for row in matches),
                         latest=self._public(matches[-1]) if matches else {})
+
+    def summary(self):
+        with self._lock:
+            rows = [(r.get('_received_ns'), r.get('_event_received_ns'), r.get('_send_ns'))
+                    for r in list(self._rows.values())[-512:]]
+        def summarize(start):
+            values = sorted((r[2]-r[start])/1e6 for r in rows
+                            if r[2] is not None and r[start] is not None and r[2] >= r[start])
+            return dict(samples=len(values), within_10ms=sum(v <= 10 for v in values),
+                p50_ms=round(values[int((len(values)-1)*.5)], 3) if values else None,
+                p95_ms=round(values[int((len(values)-1)*.95)], 3) if values else None,
+                p99_ms=round(values[int((len(values)-1)*.99)], 3) if values else None,
+                max_ms=round(max(values), 3) if values else None)
+        result = summarize(0)
+        result['trigger'] = summarize(1)
+        return result
 
 
 class EntrySendProbe:

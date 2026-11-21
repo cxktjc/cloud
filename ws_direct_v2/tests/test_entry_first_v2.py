@@ -15,6 +15,7 @@ from v9711_live.execution.async_logs import AsyncTradeLogs
 from v9711_live.execution.client import OwnershipLedger
 from v9711_live.execution.feedback_writer import FeedbackWriter
 from v9711_live.execution.nonblocking_io import NetworkIO
+from v9711_live.execution.stream import Health, StreamUnavailable
 
 
 class BatchDurabilityTests(unittest.TestCase):
@@ -157,6 +158,64 @@ class EntryFirstTests(unittest.TestCase):
         self.trade.market.update('N0USDT', '1.031', int(self.now*1000))
         self.assertEqual(self.trade._service_pending_quotes(limit=1, budget_seconds=1), 1)
         self.assertFalse(self.trade.market.events.empty())
+
+    def test_new_quote_during_reconciliation_is_sent_before_remaining_maintenance(self):
+        self.plans(1)
+        trace = []
+        def reconcile(**kwargs):
+            self.trade.market.update('N0USDT', '.99', int(self.now*1000))
+        def remaining(**kwargs):
+            trace.append('remaining')
+            self.assertIn('N0USDT', self.trade.tracked)
+        def place(**kwargs):
+            trace.append('entry')
+            return self.place(**kwargs)
+        self.trade.client.place_limit_for_bar = Mock(side_effect=place)
+        with patch.object(self.trade, 'reconcile_orders', side_effect=reconcile), \
+                patch.object(self.trade, '_cleanup_forced_close_orders', side_effect=remaining):
+            self.trade.step(now=self.now)
+        self.assertEqual(trace[:2], ['entry', 'remaining'])
+
+    def test_admission_turn_new_signal_is_not_overwritten_by_old_maintenance_snapshot(self):
+        self.plans(1)
+        def reconcile(**kwargs):
+            self.payload['signal_ready'] = False
+            cfg.DESIRED_FILE.write_text(json.dumps(self.payload))
+            self.trade.market.update('N0USDT', '.99', int(self.now*1000))
+        with patch.object(self.trade, 'reconcile_orders', side_effect=reconcile):
+            self.trade.step(now=self.now)
+        self.assertFalse(self.trade.tracked)
+        self.assertFalse(self.trade.client.entry_gate['ready'])
+
+    def test_concurrent_tick_and_depth_ingress_share_one_entry_reservation(self):
+        self.plans(1)
+        ready = threading.Barrier(3)
+        def tick():
+            ready.wait()
+            self.trade.market.update('N0USDT', '.99', int(self.now*1000))
+        def depth():
+            ready.wait()
+            self.trade.market.update_book('N0USDT', '.99', '2', int(self.now*1000), 1)
+        threads = [threading.Thread(target=tick), threading.Thread(target=depth)]
+        for thread in threads:
+            thread.start()
+        ready.wait()
+        for thread in threads:
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+        self.trade._service_pending_quotes(limit=20, budget_seconds=1)
+        self.assertEqual(len(self.submits), 1)
+        self.assertEqual(len(self.trade.tracked), 1)
+
+    def test_pending_manual_evidence_retries_without_waiting_two_second_bucket(self):
+        self.held(1)
+        self.trade.positions['H0']['side'] = 'LONG'
+        self.trade.client.enabled, self.trade.client.dry_run = True, False
+        self.trade.client.stream.health = Mock(return_value=Health('default', 0, 7))
+        probe = self.trade.client.stream.manual_flat_evidence = Mock(side_effect=[StreamUnavailable('read pending'), None])
+        self.trade._reconcile_manual_flats(now=self.now)
+        self.trade._reconcile_manual_flats(now=self.now)
+        self.assertEqual(probe.call_count, 2)
 
 
 class BackgroundOutputTests(unittest.TestCase):
