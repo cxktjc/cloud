@@ -1,10 +1,10 @@
 """Single-writer latest feedback snapshots; never owns execution state."""
-import copy
+import json
 import logging
 import threading
 import time
 
-from ..contracts import atomic_write_json
+from ..contracts import atomic_write_text
 
 LOG = logging.getLogger('v9711_live_trade.feedback')
 
@@ -22,8 +22,10 @@ class FeedbackWriter:
         self._thread.start()
 
     def submit(self, payload):
-        # Detach nested timing/diagnostic rows while the owner still owns them.
-        snapshot = copy.deepcopy(payload)
+        # C JSON encoding detaches the complete message once. Python deepcopy
+        # walked every diagnostic row on the quote owner, then the writer
+        # encoded that same tree a second time. No mutable object crosses over.
+        snapshot = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
         with self._condition:
             if self._closing:
                 raise RuntimeError('feedback writer is closed')
@@ -48,7 +50,7 @@ class FeedbackWriter:
                 self._writing = True
             started, failed = time.perf_counter(), False
             try:
-                atomic_write_json(self.path, payload)
+                atomic_write_text(self.path, payload)
             except Exception as exc:
                 failed = True
                 with self._condition:

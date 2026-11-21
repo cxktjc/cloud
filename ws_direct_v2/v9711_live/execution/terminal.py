@@ -245,6 +245,10 @@ class TradeTerminalView:
                         ('decision_to_registered', '登记快照'), ('registered_to_worker', 'worker调度'),
                         ('worker_to_durable', '等待落盘'), ('durable_to_send', '落盘后发送'))]
                     lines.insert(-1, '已发送订单分段P95(ms): '+ ' '.join(parts)+'；各段分位数不可相加')
+                    if (stages.get('persisted_to_durable') or {}).get('samples'):
+                        lines.insert(-1, '落盘等待细分P95(ms): 登记→保存回执就绪='
+                                     f'{stages["registered_to_persisted"].get("p95_ms")} '
+                                     f'回执就绪→worker续发={stages["persisted_to_durable"].get("p95_ms")}')
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
                 lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '
@@ -262,6 +266,9 @@ class TradeTerminalView:
                 lines.insert(-1, f'订单账本后台写盘: 写入中={int(durability.get("writing", False))} '
                              f'待写={durability.get("pending", 0)} 合并={durability.get("coalesced", 0)} '
                              f'最近={durability.get("last_write_ms", 0):.3f}ms '
+                             f'快照排队={durability.get("queue_wait_ms", 0):.3f}ms '
+                             f'intents/state={(durability.get("file_write_ms") or {}).get("intents", 0):.3f}/'
+                             f'{(durability.get("file_write_ms") or {}).get("state", 0):.3f}ms '
                              f'失败={durability.get("failures", 0)} 错误={durability.get("error") or "无"}；落盘成功后才发单')
             if writer.get('enabled'):
                 lines.insert(-1, f'反馈写盘: 后台待写={writer.get("pending", 0)} '

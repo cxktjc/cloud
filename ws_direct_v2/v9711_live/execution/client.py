@@ -70,12 +70,44 @@ class OwnershipLedger:
         self.state.setdefault('unknown_since_epoch', {})
         self.state.setdefault('signal_session_id', None)
         self.state.setdefault('last_signal_revision', None)
+        self._recover_native_slot_intents()
         self._saved_intents = self._saved_state = None
         self._save_depth = 0
         self._save_pending = False
         self._background = None
         self._background_closed = False
         self._last_barrier = None
+
+    def _recover_native_slot_intents(self):
+        # A crash between the two atomic file replacements can leave a native
+        # occupied slot without its intent (including after a terminal forget).
+        # Recover ONLY its existing exact CID for reconciliation, never create
+        # a new order or infer ownership from an aggregate account position.
+        if self.state.get('strategy_version') != cfg.VERSION:
+            return
+        for section, field, kind in (('tracked_orders', 'client_order_id', 'entry'),
+                                     ('owned_positions', 'close_client_order_id', 'close')):
+            for symbol, row in self.state.get(section, {}).items():
+                if not isinstance(row, Mapping):
+                    continue
+                cid = str(row.get(field) or '')
+                if not cid.startswith(cfg.ORDER_CLIENT_PREFIX+'_') or 'c:'+cid in self.intents:
+                    continue
+                if row.get('symbol') not in (None, '', symbol):
+                    raise RuntimeError('conflicting native exact-order slot symbol; retained for inspection')
+                oid = _text(row.get('order_id') if kind == 'entry' else row.get('close_order_id'))
+                alias = self.intents.get(f'o:{symbol}:{oid}') if oid else None
+                if alias and (alias.get('client_order_id') != cid or alias.get('symbol') != symbol):
+                    raise RuntimeError('conflicting native exact-order slot/intent; retained for inspection')
+                self.intents['c:'+cid] = dict(symbol=symbol, client_order_id=cid, order_id=oid,
+                    kind=kind, limit_price=_finite(row.get('limit_price')), qty=_finite(
+                        row.get('qty') if kind == 'entry' else row.get('close_quantity')),
+                    exit_due_epoch=_finite(row.get('exit_due_epoch')),
+                    registered_at_epoch=_finite(row.get('placed_at_epoch') if kind == 'entry'
+                                                else row.get('close_requested_epoch')),
+                    recovered_from_native_slot=True)
+                if oid:
+                    self.intents[f'o:{symbol}:{oid}'] = self.intents['c:'+cid]
 
     def unknown_since(self, key: str, *, now: float) -> float:
         existing = _finite(self.state['unknown_since_epoch'].get(key))
@@ -364,12 +396,13 @@ class ExchangeClient(BatchEntryMixin):
                 self._record_rate_limit(exc)
                 raise
         broker = self._ready_broker()
-        if before_send is not None:
+        checked = getattr(type(broker), 'place_order_checked', None)
+        checked_entry = method == 'place_order' and callable(checked)
+        if before_send is not None and not checked_entry:
             before_send()  # A reconnect may have consumed the last seconds of a bar.
         try:
-            checked = getattr(type(broker), 'place_order_checked', None)
-            if method == 'place_order' and callable(checked):
-                # The guard runs again INSIDE the socket lock after reconnect;
+            if checked_entry:
+                # Validate once INSIDE the socket lock after reconnect;
                 # UNKNOWN responses never trigger an automatic REST resend.
                 return broker.place_order_checked(*args, before_send=before_send, **kwargs)
             # Legacy/injected BinanceWSBroker.place_order may resend MARKET SELL through REST
@@ -576,13 +609,12 @@ class ExchangeClient(BatchEntryMixin):
         send_quote = {}
         def check_bar() -> None:
             nonlocal send_quote
-            market_guard = getattr(self, 'market_guard', None)
-            if callable(market_guard) and not market_guard(symbol.upper()):
-                raise EntryQuoteUnavailable('internal WS quotes unavailable before send')
-            following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, client_order_id,
-                                            int(order_bar_open_ms or 0), now=time.time())
+            self._check_entry_market(symbol.upper())
             if self.network_io is not None:
                 following = self.network_io.check_entry(symbol, client_order_id, int(order_bar_open_ms or 0))
+            else:
+                following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, client_order_id,
+                                                int(order_bar_open_ms or 0), now=time.time())
             detail = self._checked_entry_quote(symbol.upper(), client_order_id, limit_price)
             if not following and order_bar_open_ms is not None and not (
                     order_bar_open_ms > 0

@@ -432,6 +432,8 @@ class NetworkTradeMixin:
                     raise ConfirmedSubmitRejection('durable reservation superseded; request never sent')
                 for item in identities:
                     if item[0] == 'entry':
+                        if receipt.completed_ns:
+                            timings.mark_at(item[2], 'persisted', receipt.completed_ns, receipt.completed_epoch_ms)
                         timings.mark(item[2], 'durable')
                 return original_work()  # Live gate/quote checks still run after the disk wait.
         if self._network_io is None:

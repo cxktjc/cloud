@@ -57,7 +57,7 @@ def restrict_cpus(count):
 
 
 def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=False,
-        pressure_rate=0, interval=1., changing=False, disk_delay_ms=0):
+        pressure_rate=0, interval=1., changing=False, disk_delay_ms=0, ingress_burst_ms=0):
     case = DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     read_started, release_read = threading.Event(), threading.Event()
@@ -240,7 +240,11 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                             if symbol not in rebounded and time.perf_counter_ns()-item['received_ns'] >= 1_000_000_000:
                                 market.update(symbol, '1.03', int(case.now*1000))
                                 rebounded.add(symbol)
-                        target = int(elapsed*pressure_rate)
+                        # Same mean rate, but whole network batches arrive at
+                        # once. Unlike smooth 1ms pacing, this exercises FIFO
+                        # head-of-line delay without coalescing any price.
+                        delivered = (int(elapsed/(ingress_burst_ms/1000))+1)*(ingress_burst_ms/1000) if ingress_burst_ms else elapsed
+                        target = int(min(delivered, duration)*pressure_rate)
                         while index < target:
                             symbol = background[index % len(background)]
                             # 5/32 tick + 27/32 stable bid frames gives 15.625%
@@ -302,10 +306,12 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 maintenance_cycles=cycles, errors=pressure_errors,
                 decoded_json=True, state_bytes=cfg.EXECUTION_LEDGER_FILE.stat().st_size,
                 disk_delay_ms_per_changed_file=disk_delay_ms,
+                ingress_burst_ms=ingress_burst_ms,
                 gil_switch_ms=sys.getswitchinterval()*1000,
                 durability_writer=trade.ledger._background.health() if getattr(trade.ledger, '_background', None) else None,
                 stages={name: None for name in ('queue_wait', 'dequeued_to_decision', 'decision_to_registered',
-                                               'registered_to_worker', 'worker_to_durable', 'durable_to_send', 'worker_to_send')})
+                                               'registered_to_worker', 'worker_to_durable', 'registered_to_persisted',
+                                               'persisted_to_durable', 'durable_to_send', 'worker_to_send')})
             # Timing rows survive retirement, use their exact CIDs for all sends.
             pressure['stages'] = {name: summary([row['latencies_ms'][name]
                 for row in (trade.session_entries.timings.order(cid) for cid in case.orders)
@@ -406,6 +412,7 @@ if __name__ == '__main__':
     parser.add_argument('--changing', action='store_true')
     parser.add_argument('--cpus', type=int, help='Restrict this process to N available logical CPUs')
     parser.add_argument('--disk-delay-ms', type=float, default=0., help='Offline added latency per changed durable file')
+    parser.add_argument('--ingress-burst-ms', type=float, default=0., help='Deliver background frames in periodic batches, keeping the mean rate')
     args = parser.parse_args()
     if not 1 <= args.samples <= 800 or args.history < 0:
         parser.error('samples in 1..800 and nonnegative history required')
@@ -417,9 +424,11 @@ if __name__ == '__main__':
         parser.error('cpus must be in 1..19')
     if not 0 <= args.disk_delay_ms <= 1000:
         parser.error('disk-delay-ms must be in 0..1000')
+    if not 0 <= args.ingress_burst_ms <= 1000:
+        parser.error('ingress-burst-ms must be in 0..1000')
     affinity = restrict_cpus(args.cpus) if args.cpus else None
     result = run(args.samples, args.history, args.blocked_account, args.signed_socket, args.burst,
-                 args.pressure_rate, args.interval, args.changing, args.disk_delay_ms)
+                 args.pressure_rate, args.interval, args.changing, args.disk_delay_ms, args.ingress_burst_ms)
     result['cpu_affinity'] = affinity
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -69,13 +69,16 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._background_terminal = None
         self._servicing_quotes = False
         self._maintenance_mark = None
+        self._last_presentation_mono = None
+        self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261121-entry-durable-v9', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261121-entry-parallel-v10', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.market_guard = self._market_send_allowed
+        self.client.entry_account_guard = self._account_send_allowed
         self.client.entry_quote_guard = self._entry_quote_send_allowed
         self.client.entry_quote_snapshot = self._entry_quote_send_snapshot
         self._refresh_precision_readiness()
@@ -135,9 +138,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._precision_ready = isinstance(metadata, dict) and bool(metadata.get('symbols'))
 
     def _market_send_allowed(self, symbol):
-        account_ready = (not self.client.enabled or self.client.dry_run
-                         or time.time() <= self._account_deadline)
-        return account_ready and self.market.send_quote(symbol)['selected'] is not None
+        return self._account_send_allowed() and self.market.send_quote(symbol)['selected'] is not None
+
+    def _account_send_allowed(self):
+        return not self.client.enabled or self.client.dry_run or time.time() <= self._account_deadline
 
     def _entry_quote_send_allowed(self, symbol, cid, limit):
         return self._entry_quote_send_snapshot(symbol, cid, limit)['entry_qualified_by'] != 'none'
@@ -196,6 +200,19 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             return super()._render_trade(**kwargs)
         finally:
             self._maintenance_checkpoint('render')
+
+    def _presentation_due(self):
+        # Presentation is optional work, not exact accounting or close timers.
+        # Give a burst a chance to drain before another full feedback scan;
+        # continuous load still receives at least one update per second.
+        now = time.monotonic()
+        if (not self.once and self.market.events.qsize() > 32
+                and self._last_presentation_mono is not None
+                and now-self._last_presentation_mono < 1.):
+            self._deferred_presentations += 1
+            return False
+        self._last_presentation_mono = now
+        return True
 
     def _execute_entries(self, snapshot, status, **kwargs):
         with self.ledger.batch_saves():
@@ -565,6 +582,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                                        ws_direct=self.market.metrics())
         self._entry_diagnostics['ws_direct']['skipped_far_events'] = self._skipped_far_events
         self._entry_diagnostics['ws_direct']['skipped_noncompetitive_events'] = self._skipped_noncompetitive_events
+        self._entry_diagnostics['ws_direct']['deferred_presentations'] = self._deferred_presentations
         self._entry_diagnostics['ws_direct']['owner_work'] = self._owner_work.snapshot()
         self._entry_diagnostics['ws_direct']['runtime'] = self._runtime_source
         self._entry_diagnostics['ws_direct']['entry_latency'] = self.session_entries.timings.summary()

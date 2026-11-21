@@ -9,6 +9,7 @@ from tests import test_book_ticker_v2 as fixtures
 from v9711_live import config as cfg
 from v9711_live.exchange.binance_futures_trade_ws import BinanceFuturesTradeWS
 from v9711_live.execution.entry_timing import EntrySendProbe, EntryTimings
+from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.nonblocking_io import NetworkIO
 from v9711_live.execution.session_entries import SessionEntryStats
 from v9711_live.execution.stats import compute_comparison
@@ -136,6 +137,22 @@ class EntryLatencyTests(unittest.TestCase):
         self.assertEqual(result['stages']['registered_to_worker']['p95_ms'], 2)
         self.assertEqual(result['stages']['worker_to_durable']['p95_ms'], 31)
         self.assertEqual(result['stages']['durable_to_send']['p95_ms'], 3)
+
+    def test_actual_receipt_timestamp_separates_disk_completion_from_worker_resume(self):
+        self.register()
+        self.advance(1)
+        self.timing.mark('first', 'registered')
+        self.advance(2)
+        self.timing.mark('first', 'worker')
+        self.timing.mark_at('first', 'persisted', self.nano+15_000_000, self.now*1000+15)
+        self.advance(20)
+        self.timing.mark('first', 'durable')
+        self.advance(3)
+        self.timing.mark('first', 'send')
+        stages = self.timing.summary()['stages']
+        self.assertEqual(stages['registered_to_persisted']['p95_ms'], 17)
+        self.assertEqual(stages['persisted_to_durable']['p95_ms'], 5)
+        self.assertEqual(stages['worker_to_durable']['p95_ms'], 20)
 
     def test_other_session_bar_or_exact_position_cannot_supply_times(self):
         self.register('other-session', session='old')
@@ -379,6 +396,48 @@ class BatchLatencyTests(unittest.TestCase):
     ordinary_plan = fixtures.DualAdmissionTests.ordinary_plan
     plans = fixtures.DualAdmissionTests.plans
     tick = fixtures.DualAdmissionTests.tick
+
+    def test_checked_transport_reads_quote_once_after_socket_is_ready(self):
+        self.plans()
+        self.tick(1.01)
+        client = self.trade.client
+        client.enabled, client.dry_run = True, False
+        self.trade._account_deadline = self.now+100
+        row = self.trade.tracked['N0USDT']
+        stages = []
+        class CheckedBroker:
+            MANAGES_WS_LIFECYCLE = True
+            def place_order_checked(inner, *args, before_send=None, **kw):
+                stages.append('socket_ready')
+                before_send()
+                stages.append('send')
+                return dict(symbol='N0USDT', clientOrderId=row['client_order_id'], orderId='wire', status='NEW')
+        client._broker = CheckedBroker()
+        original = self.trade.market.send_quote
+        def quote(*args, **kw):
+            self.assertEqual(stages, ['socket_ready'])
+            stages.append('quote')
+            return original(*args, **kw)
+        with patch.object(self.trade.market, 'send_quote', side_effect=quote) as reads:
+            ExchangeClient.place_limit_for_bar(client, symbol='N0USDT', client_order_id=row['client_order_id'],
+                order_bar_open_ms=self.bar, limit_price=1., notional=5.)
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(stages, ['socket_ready', 'quote', 'send'])
+
+    def test_unchecked_legacy_transport_still_runs_guard_before_send(self):
+        self.plans()
+        self.tick(1.01)
+        client = self.trade.client
+        client.enabled, client.dry_run = True, False
+        stages = []
+        class LegacyBroker:
+            MANAGES_WS_LIFECYCLE = True
+            def place_order(inner, *args, **kw):
+                stages.append('send')
+                return {}
+        client._broker = LegacyBroker()
+        client._broker_call('place_order', 'N0USDT', 'BUY', '5', before_send=lambda: stages.append('guard'))
+        self.assertEqual(stages, ['guard', 'send'])
 
     def test_exact_cancel_is_retained_in_entry_lifecycle_after_retirement(self):
         self.plans()

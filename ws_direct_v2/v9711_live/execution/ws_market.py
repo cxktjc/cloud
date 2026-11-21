@@ -295,20 +295,25 @@ class DirectMarket:
             if now-previous >= 1:
                 self._rates = {key: (self.counts[key]-counts[key])/(now-previous) for key in self._rate_keys}
                 self._rate_sample = (now, {key: self.counts[key] for key in self._rate_keys})
-            values = sorted(self.latencies_us)
-            percentile = lambda p: values[min(len(values)-1, int((len(values)-1)*p))] if values else None
-            return dict(self.counts, queue=self.events.qsize(), queue_peak=self.queue_peak,
-                        receive_per_second=self._rates['received'], decide_per_second=self._rates['decided'],
-                        enqueue_per_second=self._rates['enqueued'], unchanged_per_second=self._rates['unchanged'],
-                        expired_per_second=self._rates['rejected_backlog'], old_per_second=self._rates['rejected_old'],
-                        discarded_per_second=self._rates['overload_discarded'], healthy=self.healthy(),
-                        subscribed=len(self.symbols), received_symbols=len(self.processed),
+            counts, rates = dict(self.counts), dict(self._rates)
+            samples, admissions = list(self.latencies_us), list(self.admission_latencies_us[-64:])
+            received_symbols, peak = len(self.processed), self.queue_peak
+        # Diagnostics must not hold the ingress lock while sorting samples or
+        # evaluating the quote map. Receivers keep draining during this work.
+        values = sorted(samples)
+        percentile = lambda p: values[min(len(values)-1, int((len(values)-1)*p))] if values else None
+        return dict(counts, queue=self.events.qsize(), queue_peak=peak,
+                        receive_per_second=rates['received'], decide_per_second=rates['decided'],
+                        enqueue_per_second=rates['enqueued'], unchanged_per_second=rates['unchanged'],
+                        expired_per_second=rates['rejected_backlog'], old_per_second=rates['rejected_old'],
+                        discarded_per_second=rates['overload_discarded'], healthy=self.healthy(),
+                        subscribed=len(self.symbols), received_symbols=received_symbols,
                         fresh_symbols=len(self.prices() if fresh_prices is None else fresh_prices),
                         receive_to_decision_us_p50=percentile(.5),
                         receive_to_decision_us_p95=percentile(.95),
                         receive_to_decision_us_p99=percentile(.99),
                         receive_to_decision_us_max=max(values) if values else None,
-                        admission_dispatch_us_samples=list(self.admission_latencies_us[-64:]),
+                        admission_dispatch_us_samples=admissions,
                         note='includes decision+durable intent+dispatch, not exchange ACK; rolling samples')
 
     async def _receive(self):

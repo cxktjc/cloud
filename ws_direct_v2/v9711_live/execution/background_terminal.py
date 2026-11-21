@@ -1,5 +1,5 @@
 """Latest-only detached display messages; no execution state is shared."""
-import copy
+import json
 import logging
 import threading
 import time
@@ -21,7 +21,8 @@ class BackgroundTerminal:
         now = time.monotonic()
         if not force and now < self._next_submit:
             return False
-        snapshot = copy.deepcopy(fields)
+        # Immutable message; parsing/formatting stays on the display thread.
+        snapshot = json.dumps(fields, ensure_ascii=False, separators=(',', ':'))
         with self._condition:
             if self._closing:
                 return False
@@ -39,7 +40,7 @@ class BackgroundTerminal:
                 force, fields = self._pending
                 self._pending = None
             try:
-                self.view.render(force=force, **fields)
+                self.view.render(force=force, **json.loads(fields))
             except Exception:
                 LOG.exception('background display failed; execution continues')
 

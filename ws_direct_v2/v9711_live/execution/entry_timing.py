@@ -25,12 +25,15 @@ class EntryTimings:
             self.revision += 1
 
     def mark(self, cid, stage, *, transport=None):
+        self.mark_at(cid, stage, time.monotonic_ns(), time.time()*1000, transport=transport)
+
+    def mark_at(self, cid, stage, stamp_ns, epoch_ms, *, transport=None):
         with self._lock:
             row = self._rows.get(cid)
             if row is None or stage+'_epoch_ms' in row:
                 return
-            row[stage+'_epoch_ms'] = time.time()*1000
-            row['_'+stage+'_ns'] = time.monotonic_ns()
+            row[stage+'_epoch_ms'] = epoch_ms
+            row['_'+stage+'_ns'] = stamp_ns
             if transport is not None:
                 row['transport'] = transport
             self.revision += 1
@@ -61,6 +64,8 @@ class EntryTimings:
                  ('decision_to_registered', 'decision', 'registered'),
                  ('registered_to_worker', 'registered', 'worker'),
                  ('worker_to_durable', 'worker', 'durable'),
+                 ('registered_to_persisted', 'registered', 'persisted'),
+                 ('persisted_to_durable', 'persisted', 'durable'),
                  ('durable_to_send', 'durable', 'send'),
                  ('worker_to_send', 'worker', 'send'),
                  ('send_to_response', 'send', 'response'),
@@ -96,7 +101,7 @@ class EntryTimings:
                         latest=self._public(matches[-1]) if matches else {})
 
     def summary(self):
-        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'durable', 'send')
+        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'persisted', 'durable', 'send')
         keys = tuple('_'+name+'_ns' for name in fields)
         with self._lock:
             # Copy only bounded timestamp fields, then sort outside the lock.
@@ -121,6 +126,8 @@ class EntryTimings:
             ('decision_to_registered', 'decision', 'registered'),
             ('registered_to_worker', 'registered', 'worker'),
             ('worker_to_durable', 'worker', 'durable'),
+            ('registered_to_persisted', 'registered', 'persisted'),
+            ('persisted_to_durable', 'persisted', 'durable'),
             ('durable_to_send', 'durable', 'send'),
             ('worker_to_send', 'worker', 'send'))}
         return result

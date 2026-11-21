@@ -8,10 +8,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from tests import test_book_ticker_v2 as fixtures
 from v9711_live.execution import durable_writer as module
 from v9711_live.execution.client import ExchangeClient, OwnershipLedger
+from v9711_live import config as cfg
+from v9711_live.contracts import atomic_write_json
 
 
 class WriterTests(unittest.TestCase):
@@ -110,8 +113,136 @@ class WriterTests(unittest.TestCase):
         self.ledger.close_background()
         self.ledger.close_background()
         self.assertFalse(self.ledger._background._thread.is_alive())
+        self.assertTrue(all(not thread.is_alive() for thread in self.ledger._background._file_pool._threads))
         restored = OwnershipLedger(self.ledger.path, self.ledger.state_path)
         self.assertEqual(restored.state['realized_balance'], 123)
+
+    def test_two_file_writes_start_together_but_receipt_waits_for_both(self):
+        started = {path: threading.Event() for path in (self.ledger.path, self.ledger.state_path)}
+        release_intents = threading.Event()
+        original = module.atomic_write_text
+        def write(path, encoded):
+            started[path].set()
+            gate = release_intents if path == self.ledger.path else self.release
+            if not gate.wait(3):
+                raise AssertionError('parallel file gate not released')
+            original(path, encoded)
+        try:
+            with patch.object(module, 'atomic_write_text', side_effect=write):
+                _, receipt = self.reserve('XUSDT')
+                self.assertTrue(all(event.wait(1) for event in started.values()))
+                release_intents.set()
+                self.assertFalse(receipt.done())
+                self.release.set()
+                receipt.result(1)
+        finally:
+            release_intents.set()
+            self.release.set()
+
+    def test_failed_file_must_not_allow_next_snapshot_to_overtake_busy_sibling(self):
+        old_intents_started, first_failed, newer_started = (threading.Event() for _ in range(3))
+        original = module.atomic_write_text
+        def write(path, encoded):
+            payload = json.loads(encoded)
+            if path == self.ledger.path:
+                if len(payload['intents']) == 1:
+                    old_intents_started.set()
+                    if not self.release.wait(3):
+                        raise AssertionError('old write not released')
+                else:
+                    newer_started.set()
+            elif len(payload['state']['tracked_orders']) == 1:
+                first_failed.set()
+                raise OSError('first state failed while first intents still writing')
+            original(path, encoded)
+        with patch.object(module, 'atomic_write_text', side_effect=write):
+            _, first = self.reserve('XUSDT')
+            self.assertTrue(old_intents_started.wait(1))
+            self.assertTrue(first_failed.wait(1))
+            cid, second = self.reserve('YUSDT')
+            self.assertFalse(newer_started.wait(.02))
+            self.assertFalse(first.done())
+            self.release.set()
+            with self.assertRaises(OSError):
+                first.result(1)
+            self.assertIn(('YUSDT', cid), second.result(1).reservations)
+        restored = OwnershipLedger(self.ledger.path, self.ledger.state_path)
+        self.assertEqual(len(restored.state['tracked_orders']), 2)
+        self.assertEqual(len(restored.intents), 2)
+
+
+class NativeRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.intents, self.state = root/'intents', root/'state'
+        self.cid = cfg.ORDER_CLIENT_PREFIX+'_entry_native123'
+        self.payload = dict(strategy_version=cfg.VERSION, entry_submission_sequence=19,
+            tracked_orders={'XUSDT': dict(symbol='XUSDT', client_order_id=self.cid,
+                order_id='', qty=5, limit_price=1, placed_at_epoch=1000, fate_unknown=True)},
+            owned_positions={})
+
+    def save(self, intents=None):
+        atomic_write_json(self.intents, dict(intents=intents or {}))
+        atomic_write_json(self.state, dict(state=self.payload))
+
+    def test_partial_pair_recovers_only_existing_native_cid_for_reconciliation(self):
+        self.save()
+        ledger = OwnershipLedger(self.intents, self.state)
+        self.assertTrue(ledger.owns_client(self.cid))
+        self.assertTrue(ledger.state['tracked_orders']['XUSDT']['fate_unknown'])
+        self.assertEqual(ledger.state['entry_submission_sequence'], 19)
+        self.assertEqual(json.loads(self.intents.read_text())['intents'], {})  # Pure read, not a second writer.
+        ledger.flush()
+        restored = OwnershipLedger(self.intents, self.state)
+        self.assertTrue(restored.owns_client(self.cid))
+
+    def test_foreign_strategy_or_foreign_cid_is_never_reconstructed(self):
+        self.payload['strategy_version'] = 'old_strategy'
+        self.save()
+        self.assertFalse(OwnershipLedger(self.intents, self.state).owns_client(self.cid))
+        self.payload['strategy_version'] = cfg.VERSION
+        self.payload['tracked_orders']['XUSDT']['client_order_id'] = 'foreign_entry'
+        self.save()
+        self.assertFalse(OwnershipLedger(self.intents, self.state).owns_client('foreign_entry'))
+
+    def test_partial_close_pair_keeps_existing_close_id_and_quantity(self):
+        self.payload['tracked_orders'] = {}
+        self.payload['owned_positions'] = {'XUSDT': dict(quantity=3,
+            close_client_order_id=self.cid, close_quantity=3, close_phase='MARKET')}
+        self.save()
+        ledger = OwnershipLedger(self.intents, self.state)
+        self.assertEqual(ledger.intents['c:'+self.cid]['kind'], 'close')
+        self.assertEqual(ledger.intents['c:'+self.cid]['qty'], 3)
+        self.assertEqual(ledger.state['owned_positions']['XUSDT']['quantity'], 3)
+
+    def test_conflicting_order_alias_stops_recovery_and_preserves_files(self):
+        self.payload['tracked_orders']['XUSDT']['order_id'] = '123'
+        self.save({'o:XUSDT:123': dict(symbol='XUSDT', client_order_id='conflicting')})
+        before = self.intents.read_bytes(), self.state.read_bytes()
+        with self.assertRaises(RuntimeError):
+            OwnershipLedger(self.intents, self.state)
+        self.assertEqual(before, (self.intents.read_bytes(), self.state.read_bytes()))
+
+    def test_recovered_native_slot_can_reconcile_exact_fill_without_sending(self):
+        self.save()
+        ledger = OwnershipLedger(self.intents, self.state)
+        client = ExchangeClient(enabled=False, dry_run=True)
+        fill = dict(symbol='XUSDT', clientOrderId=self.cid, orderId='123', status='FILLED',
+                    executedQty='5', avgPrice='1', updateTime=1000001)
+        client.stream = SimpleNamespace(lookup_order=lambda **kw: fill, health=lambda: None)
+        client._broker_call = Mock(side_effect=AssertionError('recovery must not send'))
+        actual, known = client.query_exact_order(ledger, symbol='XUSDT', client_order_id=self.cid, now=1001)
+        self.assertTrue(known)
+        self.assertEqual(actual, fill)
+        client._broker_call.assert_not_called()
+
+    def test_conflicting_slot_symbol_stops_recovery(self):
+        self.payload['tracked_orders']['XUSDT']['symbol'] = 'YUSDT'
+        self.save()
+        with self.assertRaises(RuntimeError):
+            OwnershipLedger(self.intents, self.state)
 
 
 class OwnerDurabilityTests(unittest.TestCase):

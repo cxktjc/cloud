@@ -17,6 +17,7 @@ def main():
     parser.add_argument('--burst', action='store_true')
     parser.add_argument('--changing', action='store_true')
     parser.add_argument('--disk-delay-ms', type=float, default=0.)
+    parser.add_argument('--ingress-burst-ms', type=float, default=0.)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     rates = [int(value) for value in args.rates.split(',')]
@@ -24,17 +25,20 @@ def main():
         parser.error('positive rates, cpus in 1..19 and trials in 1..20 required')
     if not 0 <= args.disk_delay_ms <= 1000:
         parser.error('disk-delay-ms must be in 0..1000')
+    if not 0 <= args.ingress_burst_ms <= 1000:
+        parser.error('ingress-burst-ms must be in 0..1000')
     affinity = restrict_cpus(args.cpus)
     result = dict(scope='OFFLINE: real durable files, owner maintenance, 19 workers, broker signing/JSON; '
         'fake socket, no TLS/network RTT; mocked account health/order evidence and terminal; '
         '~54KB padding plus active state. Process affinity is not equivalent to a cloud CPU quota.',
-        cpu_affinity=affinity, burst=args.burst, changing=args.changing, disk_delay_ms=args.disk_delay_ms, cases=[])
+        cpu_affinity=affinity, burst=args.burst, changing=args.changing, disk_delay_ms=args.disk_delay_ms,
+        ingress_burst_ms=args.ingress_burst_ms, cases=[])
     failed = False
     for rate in rates:
         trials = []
         for index in range(args.trials):
             value = run(8, 0, signed_socket=True, burst=args.burst, pressure_rate=rate, changing=args.changing,
-                        disk_delay_ms=args.disk_delay_ms)
+                        disk_delay_ms=args.disk_delay_ms, ingress_burst_ms=args.ingress_burst_ms)
             trials.append(value)
             evidence = value['pressure']
             failed |= bool(evidence['errors'] or evidence['unsent_symbols'] or evidence['duplicate_symbols']

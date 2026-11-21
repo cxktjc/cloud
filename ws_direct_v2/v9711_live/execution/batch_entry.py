@@ -18,6 +18,19 @@ LOG = logging.getLogger('v9711_live_trade.entry_quotes')
 
 
 class BatchEntryMixin:
+    def _check_entry_market(self, symbol):
+        # A detailed quote snapshot already validates feed health/freshness.
+        # v2 supplies a separate account gate, so it needn't read both market
+        # sources once here and again in _checked_entry_quote.
+        account = getattr(self, 'entry_account_guard', None)
+        if callable(account):
+            if not account():
+                raise EntryQuoteUnavailable('account stream unavailable before send')
+            return
+        market = getattr(self, 'market_guard', None)
+        if callable(market) and not market(symbol):
+            raise EntryQuoteUnavailable('internal WS quotes unavailable before send')
+
     def _checked_entry_quote(self, symbol, cid, limit):
         capture = getattr(self, 'entry_quote_snapshot', None)
         if callable(capture):
@@ -50,12 +63,11 @@ class BatchEntryMixin:
     def _entry_send_check(self, row: Mapping[str, Any]) -> dict:
         symbol, cid = str(row['symbol']).upper(), str(row['client_order_id'])
         bar = int(row['order_bar_open_ms'])
-        market_guard = getattr(self, 'market_guard', None)
-        if callable(market_guard) and not market_guard(symbol):
-            raise EntryQuoteUnavailable('internal WS quotes unavailable before batch send')
-        following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, cid, bar, now=time.time())
+        self._check_entry_market(symbol)
         if self.network_io is not None:
             following = self.network_io.check_entry(symbol, cid, bar)
+        else:
+            following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, cid, bar, now=time.time())
         detail = self._checked_entry_quote(symbol, cid, float(row['limit_price']))
         from .. import config as cfg
         if not following and not bar <= time.time() * 1000 < bar + cfg.BAR_MS:

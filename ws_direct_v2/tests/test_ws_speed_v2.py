@@ -1,9 +1,11 @@
 """Decision-local quote reuse must never bypass live send or state guards."""
 import time
+import threading
 import unittest
 from unittest.mock import patch
 
 from tests import test_book_ticker_v2 as fixtures
+from v9711_live.execution import ws_market as module
 
 
 class PriceViewTests(unittest.TestCase):
@@ -39,6 +41,38 @@ class PriceViewTests(unittest.TestCase):
             metrics = self.market.metrics()
             capture.assert_called_once_with()
         self.assertEqual((metrics['fresh_symbols'], metrics['bid0_symbols'], metrics['entry_symbols']), (0, 1, 1))
+
+    def test_diagnostic_sort_does_not_hold_the_ingress_lock(self):
+        self.quote()
+        started, release, accepted = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        def slow_sort(values, **kwargs):
+            started.set()
+            if not release.wait(2):
+                raise AssertionError('diagnostic sort not released')
+            return sorted(values, **kwargs)
+        def capture_metrics():
+            try:
+                self.market.metrics()
+            except Exception as exc:
+                errors.append(exc)
+        with patch.object(module, 'sorted', side_effect=slow_sort, create=True):
+            metrics = threading.Thread(target=capture_metrics)
+            metrics.start()
+            try:
+                self.assertTrue(started.wait(1))
+                def ingress():
+                    self.market.update('XUSDT', '1.03', int(time.time()*1000))
+                    accepted.set()
+                receiver = threading.Thread(target=ingress)
+                receiver.start()
+                self.assertTrue(accepted.wait(.5), 'diagnostic sort blocked WS ingestion')
+                receiver.join(1)
+            finally:
+                release.set()
+                metrics.join(2)
+        self.assertFalse(metrics.is_alive())
+        self.assertEqual(errors, [])
 
 
 class OwnerPriceViewTests(unittest.TestCase):

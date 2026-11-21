@@ -46,6 +46,29 @@ class EntryFirstTests(unittest.TestCase):
     refresh_quotes = fixtures.FlashOwnerTests.refresh_quotes
     publish, held = fixtures.FlashOwnerTests.publish, fixtures.FlashOwnerTests.held
 
+    def test_backlog_defers_presentation_but_does_not_starve_it(self):
+        with patch.object(self.trade.market.events, 'qsize', return_value=100), \
+                patch('time.monotonic', return_value=100):
+            self.assertTrue(self.trade._presentation_due())
+            self.assertFalse(self.trade._presentation_due())
+        with patch.object(self.trade.market.events, 'qsize', return_value=100), \
+                patch('time.monotonic', return_value=101):
+            self.assertTrue(self.trade._presentation_due())
+        self.assertEqual(self.trade._deferred_presentations, 1)
+
+    def test_presentation_deferral_keeps_entries_close_checks_and_durable_state(self):
+        self.plans(1)
+        with patch.object(self.trade, '_presentation_due', return_value=False), \
+                patch.object(self.trade, '_comparison', side_effect=AssertionError('presentation delayed')), \
+                patch.object(self.trade, '_timed_exits', wraps=self.trade._timed_exits) as closes, \
+                patch.object(self.trade, 'write_feedback') as feedback:
+            self.trade.step(now=self.now)
+        closes.assert_called_once()
+        feedback.assert_not_called()
+        self.assertIn('N0USDT', self.trade.tracked)
+        restored = OwnershipLedger(self.trade.ledger.path, self.trade.ledger.state_path)
+        self.assertTrue(restored.owns_client(self.trade.tracked['N0USDT']['client_order_id']))
+
     def test_maintenance_coalesces_multiple_fill_saves(self):
         self.plans(3)
         self.event('N0USDT', 1.01)
@@ -103,7 +126,7 @@ class EntryFirstTests(unittest.TestCase):
     def test_blocked_feedback_disk_does_not_block_next_actual_entry(self):
         self.plans(1)
         started, release, sent = threading.Event(), threading.Event(), threading.Event()
-        original_write = feedback_module.atomic_write_json
+        original_write = feedback_module.atomic_write_text
         def slow_feedback(path, payload):
             started.set()
             if not release.wait(3):
@@ -115,7 +138,7 @@ class EntryFirstTests(unittest.TestCase):
                 sent.set()
             return result
         self.trade.client.place_limit_for_bar = Mock(side_effect=place)
-        with patch.object(feedback_module, 'atomic_write_json', side_effect=slow_feedback):
+        with patch.object(feedback_module, 'atomic_write_text', side_effect=slow_feedback):
             self.trade.enable_nonblocking_io()
             try:
                 self.trade.step(now=self.now)
@@ -223,15 +246,16 @@ class BackgroundOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'feedback.json'
             started, release = threading.Event(), threading.Event()
-            original_write = feedback_module.atomic_write_json
+            original_write = feedback_module.atomic_write_text
             calls = []
             def write(path, payload):
-                calls.append(payload['revision'])
-                if payload['revision'] == 1:
+                revision = json.loads(payload)['revision']
+                calls.append(revision)
+                if revision == 1:
                     started.set()
                     self.assertTrue(release.wait(3))
                 original_write(path, payload)
-            with patch.object(feedback_module, 'atomic_write_json', side_effect=write):
+            with patch.object(feedback_module, 'atomic_write_text', side_effect=write):
                 writer = FeedbackWriter(path)
                 try:
                     writer.submit({'revision': 1})
@@ -250,15 +274,15 @@ class BackgroundOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'feedback.json'
             failed = threading.Event()
-            original_write = feedback_module.atomic_write_json
+            original_write = feedback_module.atomic_write_text
             calls = []
             def write(path, payload):
-                calls.append(payload['revision'])
+                calls.append(json.loads(payload)['revision'])
                 if len(calls) == 1:
                     failed.set()
                     raise OSError('temporary feedback failure')
                 original_write(path, payload)
-            with patch.object(feedback_module, 'atomic_write_json', side_effect=write):
+            with patch.object(feedback_module, 'atomic_write_text', side_effect=write):
                 writer = FeedbackWriter(path)
                 try:
                     writer.submit({'revision': 1})

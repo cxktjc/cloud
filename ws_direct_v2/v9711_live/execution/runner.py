@@ -959,6 +959,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self.ledger.save()
         checkpoint('ledger')
         admission_turn()
+        if not getattr(self, '_presentation_due', lambda: True)():
+            checkpoint('presentation_deferred')
+            return  # Exact accounting, entries and close timers already ran.
         stream_health = self._stream_health()
         comparison = self._comparison(
             snapshot=snapshot, price_map=price_map,
