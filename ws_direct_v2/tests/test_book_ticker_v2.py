@@ -397,6 +397,8 @@ class DualAdmissionTests(unittest.TestCase):
         self.assertTrue(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))
         self.trade.market.update_book('N8USDT', '1.0188001', '2', int(self.now*1000), 3)
         self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        self.assertFalse(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))
+        self.trade.market.update_book('N8USDT', '1.0188', '2', int(self.now*1000), 4)
         self.assertTrue(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))
 
     def test_bid_can_admit_with_tick_connection_down(self):

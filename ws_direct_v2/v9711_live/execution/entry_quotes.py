@@ -1,5 +1,17 @@
 """Freeze which valid quote(s) satisfy this exact entry's distance ceiling."""
+import math
 from ..entry_policy import at_most
+
+SEND_RECHECK_GAP = .015
+
+
+def admission_gap(detail, limit):
+    """Signed OR gap from frozen, valid same-symbol admission prices."""
+    if not math.isfinite(limit) or limit <= 0:
+        return None
+    prices = [price for key in ('entry_tick', 'entry_bid0')
+              if isinstance(price := detail.get(key), (int, float)) and math.isfinite(price) and price > 0]
+    return (min(prices)-limit)/limit if prices else None
 
 
 def qualify_quote(quote, limit, ceiling, *, following=False):
@@ -17,4 +29,5 @@ def qualify_quote(quote, limit, ceiling, *, following=False):
 
 
 QUOTE_FIELDS = ('entry_qualified_by', 'entry_quote_source', 'entry_tick', 'entry_bid0',
-                'entry_tick_gap', 'entry_depth_gap', 'entry_gap_ceiling', 'entry_quote_policy')
+                'entry_tick_gap', 'entry_depth_gap', 'entry_gap_ceiling', 'entry_quote_policy',
+                'entry_recheck_gap', 'entry_recheck_threshold', 'entry_send_check')

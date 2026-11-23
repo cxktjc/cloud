@@ -375,7 +375,12 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 for row in (trade.session_entries.timings.order(s['client_order_id']) for s in sends)
                 if name in row.get('latencies_ms', {})]) for name in pressure['stages']}
             for send in sends+background_sends:
-                send['stages_ms'] = trade.session_entries.timings.order(send['client_order_id']).get('latencies_ms', {})
+                audit = trade.session_entries.timings.order(send['client_order_id'])
+                send['stages_ms'] = audit.get('latencies_ms', {})
+                send['send_quote_check'] = audit.get('entry_send_check')
+                send['admission_recheck_gap'] = audit.get('entry_recheck_gap')
+            pressure['sent_check_counts'] = {key: sum(s.get('send_quote_check') == key for s in sends+background_sends)
+                for key in ('near_skipped', 'far_passed', 'far_rejected', 'follow_skipped')}
             values = [s['ms'] for s in sends]
         elif blocked:
             # One resting exact order is queried while another symbol crosses.

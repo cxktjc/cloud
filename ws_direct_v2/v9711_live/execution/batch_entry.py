@@ -19,8 +19,7 @@ LOG = logging.getLogger('v9711_live_trade.entry_quotes')
 
 class BatchEntryMixin:
     def _check_entry_market(self, symbol):
-        # v2 uses frozen admission evidence and a separate account gate.
-        # Sending must not fetch WS quotes again after admission.
+        # Account readiness is independent of v2's distance-tiered WS recheck.
         account = getattr(self, 'entry_account_guard', None)
         if callable(account):
             if not account():
@@ -60,7 +59,7 @@ class BatchEntryMixin:
             raise ConfirmedSubmitRejection('batch credentials unavailable; request never sent')
         return rest_place_order_batch(key, secret, orders, recv_window=5000, request_timeout=5)
 
-    def _entry_send_check(self, row: Mapping[str, Any]) -> dict:
+    def _entry_send_check(self, row: Mapping[str, Any], *, check_quotes: bool = True) -> dict:
         symbol, cid = str(row['symbol']).upper(), str(row['client_order_id'])
         bar = int(row['order_bar_open_ms'])
         self._check_entry_market(symbol)
@@ -68,7 +67,7 @@ class BatchEntryMixin:
             following = self.network_io.check_entry(symbol, cid, bar)
         else:
             following = follow_send_allowed(getattr(self, 'entry_gate', {}), symbol, cid, bar, now=time.time())
-        detail = self._checked_entry_quote(symbol, cid, float(row['limit_price']))
+        detail = self._checked_entry_quote(symbol, cid, float(row['limit_price'])) if check_quotes else {}
         from .. import config as cfg
         if not following and not bar <= time.time() * 1000 < bar + cfg.BAR_MS:
             raise ConfirmedSubmitRejection('entry order bar expired/not active before batch send')
@@ -90,12 +89,12 @@ class BatchEntryMixin:
             if timings is not None:
                 timings.mark(cid, 'worker')
             try:
-                self._entry_send_check(row)
+                self._entry_send_check(row, check_quotes=False)
                 prepared = self.prepare_limit(str(row['symbol']), float(row['limit_price']), float(row['notional']))
                 if not prepared['ok']:
                     raise ConfirmedSubmitRejection(str(prepared['reason']))
                 # Metadata/preparation is local, but may have taken time.
-                self._entry_send_check(row)
+                self._entry_send_check(row, check_quotes=False)
                 wire = dict(symbol=str(row['symbol']).upper(),side='BUY',type='LIMIT',
                     timeInForce='GTC',positionSide='LONG',price=str(prepared['price']),
                     quantity=str(prepared['qty']),newClientOrderId=cid)

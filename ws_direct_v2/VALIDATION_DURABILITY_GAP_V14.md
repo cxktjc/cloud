@@ -1,5 +1,8 @@
 # 保存优化与触发价差验证：2026-11-23
 
+本文保留 v14 历史验证。当前发送前 WS 检查已改为 v15 的 1.5% 分级，
+见 [VALIDATION_TIERED_RECHECK_V15.md](VALIDATION_TIERED_RECHECK_V15.md)；保存优化及触发价差继续保留。
+
 运行标识：`20261123-durable-gap-v14`。范围仅为 cloud 的 `ws_direct_v2`。
 继续执行 v13 的冻结准入、取消 WS 二次比价、到期直接 MARKET 平仓。
 所有验证使用临时账本和离线假交易所/socket，未下真实订单或修改生产状态。

@@ -3,6 +3,7 @@
 本文是 v12 的历史验证。当前 v13 已取消发送前 WS 二次检查，并改为到期 MARKET 平仓，
 最新规则和测试见 [VALIDATION_FROZEN_ENTRY_MARKET_EXIT_V13.md](VALIDATION_FROZEN_ENTRY_MARKET_EXIT_V13.md)。
 保存优化、触发价差和当前 v14 验证见 [VALIDATION_DURABILITY_GAP_V14.md](VALIDATION_DURABILITY_GAP_V14.md)。
+当前 v15 的 1.5% 分级二次检查见 [VALIDATION_TIERED_RECHECK_V15.md](VALIDATION_TIERED_RECHECK_V15.md)。
 下文的发送前报价复核及限价平仓描述不再作为当前执行规则。
 
 运行标识：`20261123-ingress-journal-v12`。仅改 cloud 仓库 `ws_direct_v2`。

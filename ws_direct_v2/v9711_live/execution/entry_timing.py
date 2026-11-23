@@ -55,7 +55,7 @@ class EntryTimings:
             self.revision += 1
 
     def outcome(self, cid, **fields):
-        """Owner-only diagnostics after ACK/reconciliation; never fill evidence."""
+        """Thread-safe diagnostics; status/fill updates remain owner-only."""
         with self._lock:
             row = self._rows.get(cid)
             if row is None:
@@ -68,6 +68,15 @@ class EntryTimings:
                 return
             row.update(fields, outcome_updated_epoch_ms=time.time()*1000)
             self.revision += 1
+
+    def quote_check(self, cid, detail):
+        """Worker-only quote audit; no status, fills or execution-ledger writes."""
+        fields = {key: detail[key] for key in ('entry_send_check', 'entry_recheck_gap', 'entry_recheck_threshold')
+                  if key in detail}
+        if detail.get('entry_quote_policy') == 'distance_rechecked':
+            fields.update(entry_recheck_tick_gap=detail.get('entry_tick_gap'),
+                          entry_recheck_depth_gap=detail.get('entry_depth_gap'))
+        self.outcome(cid, **fields)
 
     @staticmethod
     def _public(row):

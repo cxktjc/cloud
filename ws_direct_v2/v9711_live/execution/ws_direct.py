@@ -15,7 +15,7 @@ from .metadata_sync import MetadataSync
 from .position_identity import CAPITAL_MODE
 from .sizing import CountSizingMixin
 from .signal_follow import SignalFollowMixin
-from .entry_quotes import qualify_quote, QUOTE_FIELDS
+from .entry_quotes import qualify_quote, QUOTE_FIELDS, admission_gap, SEND_RECHECK_GAP
 from .submit_errors import ConfirmedSubmitRejection
 from .owner_work import OwnerWork
 from .feedback_writer import FeedbackWriter
@@ -84,7 +84,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261123-durable-gap-v14', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261123-tiered-recheck-v15', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -164,13 +164,28 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return self._entry_quote_send_snapshot(symbol, cid, limit)['entry_qualified_by'] != 'none'
 
     def _entry_quote_send_snapshot(self, symbol, cid, limit):
-        # Exact admission evidence, frozen by the owner. No WS read, freshness
-        # test or distance comparison after this entry has been admitted.
-        detail = self.client.entry_gate.get('admitted_entry_quotes', {}).get(cid)
+        gate = self.client.entry_gate  # Immutable owner evidence, no worker ledger access.
+        detail = gate.get('admitted_entry_quotes', {}).get(cid)
         if (not detail or detail.get('symbol') != symbol
                 or detail.get('entry_qualified_by') not in {'tick', 'depth', 'all', 'signal_follow'}):
             raise ConfirmedSubmitRejection('exact entry admission missing before send')
-        return {key: detail[key] for key in QUOTE_FIELDS if key in detail}
+        limit = self._finite(detail.get('submitted_limit_price'), limit)
+        gap = admission_gap(detail, limit)
+        following = cid in gate.get('follow_entries', {}) or detail['entry_qualified_by'] == 'signal_follow'
+        if following or gap is not None and at_most(gap, SEND_RECHECK_GAP):
+            result = {key: detail[key] for key in QUOTE_FIELDS if key in detail}
+            result.update(entry_quote_policy='admission_frozen',
+                          entry_send_check='follow_skipped' if following else 'near_skipped')
+        else:
+            # Far entries recheck latest ingress only at send, after durability
+            # and socket readiness; near entries perform no secondary WS read.
+            result = qualify_quote(self.market.send_quote(symbol), limit,
+                                   gate.get('entry_gap_limits', {}).get(cid, detail.get('entry_gap_ceiling')))
+            result.update(entry_quote_policy='distance_rechecked',
+                entry_send_check='far_passed' if result['entry_qualified_by'] != 'none' else 'far_rejected')
+        result.update(entry_recheck_gap=gap, entry_recheck_threshold=SEND_RECHECK_GAP)
+        self.session_entries.timings.quote_check(cid, result)
+        return result
 
     def step(self, *, now=None):
         started = self._maintenance_mark = time.perf_counter_ns()
@@ -311,7 +326,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         if detail['entry_qualified_by'] == 'none':
             self._submit_skip_reasons[symbol] = 'admission_quote_not_qualified'
             return
-        detail['entry_quote_policy'] = 'admission_frozen'
+        detail['entry_quote_policy'] = 'tiered_admission'
         return super()._place_order(dict(row, **detail, _entry_timing_context=context))
 
     def desired_snapshot(self, *, now):
@@ -353,8 +368,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self.market.events.set_policy(self._templates,
             set(self._eligible) | set(self.tracked) | set(self.positions) | self._queue_targets)
         snapshot, status = self._io_signal
-        # Market readiness is checked when admitting new entries. Once a CID
-        # is reserved, publication must not reinstate a secondary WS gate.
+        # Market readiness is checked at admission. A global readiness gate
+        # would incorrectly reinstate a WS recheck for already-admitted near entries.
         if self.client.enabled and not self.client.dry_run and time.time() > self._account_deadline:
             self._io_signal = (snapshot, 'account_not_ready')
         try:
@@ -642,7 +657,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             return False
         # A far quote changed no signal/order/position state. Rebuilding the
         # immutable worker gate for it cannot change admission; workers still
-        # check the frozen admission identity, account state, TTL and capacity.
+        # check identity/account/TTL/capacity plus the distance-tiered quote policy.
         # Maintenance and every state-changing path continue publishing it.
         self._quote_checkpoint('screening')
         self._collect_distinct_candidates(tick)

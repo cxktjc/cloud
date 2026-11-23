@@ -404,7 +404,8 @@ class NetworkTradeMixin:
             entry_gap_limits={str(row.get('client_order_id')): row.get('entry_gap_ceiling', cfg.CANCEL_GAP)
                               for row in self.tracked.values() if not row.get('signal_follow')},
             admitted_entry_quotes={str(row.get('client_order_id')):
-                dict(symbol=symbol, **{key: row[key] for key in QUOTE_FIELDS if key in row})
+                dict(symbol=symbol, submitted_limit_price=row.get('submitted_limit_price', row.get('limit_price')),
+                     **{key: row[key] for key in QUOTE_FIELDS if key in row})
                 for symbol, row in self.tracked.items()},
             # Only the owner reads positions. Workers receive a normalized,
             # immutable snapshot, never signal targets or a mutable ledger.
@@ -519,7 +520,7 @@ class NetworkTradeMixin:
                                 epoch_ms = receipt.completed_epoch_ms-(receipt.completed_ns-stamp)/1e6
                                 timings.mark_at(item[2], stage, stamp, epoch_ms)
                         timings.mark(item[2], 'durable')
-                return original_work()  # Account/identity gates and frozen admission, after durability.
+                return original_work()  # Account/identity gates and tiered quotes, after durability.
         if self._network_io is None:
             try:
                 result = work()

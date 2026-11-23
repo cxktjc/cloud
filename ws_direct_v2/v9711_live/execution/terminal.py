@@ -89,8 +89,14 @@ def entry_timing_lines(timing):
     save_parts = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
         ('journal_prepare', '准备'), ('journal_write', '写入'),
         ('journal_sync', '同步'), ('journal_receipt', '回执')) if key in delays)
+    checks = {'near_skipped': '准入距离≤1.5%，免二次行情检查',
+              'follow_skipped': '补挂单沿用原规则',
+              'far_passed': '准入距离>1.5%，二次行情检查通过',
+              'far_rejected': '准入距离>1.5%，二次行情检查拒绝'}
+    check = timing.get('entry_send_check')
+    check_lines = [f'      发送检查: {checks.get(check, check)}'] if check else []
     return [line]+([stages] if timing else [])+([f'      分段耗时: {details}'] if details else [])+(
-        [f'      保存细分: {save_parts}'] if save_parts else [])+quote_lines+(
+        [f'      保存细分: {save_parts}'] if save_parts else [])+quote_lines+check_lines+(
         [f'      入场链路: {trigger}{extra}'] if extra else [])
 
 
@@ -113,7 +119,7 @@ def compact_positions(rows: Any, limit: int) -> str:
         if 'client_order_id' in row:
             sent = row.get('entry_send_quote') or {}
             stage = '发送' if sent else '登记'
-            if (sent or row).get('entry_quote_policy') == 'admission_frozen':
+            if (sent or row).get('entry_quote_policy') in {'admission_frozen', 'tiered_admission'}:
                 stage = '准入'
             qualified = (sent or row).get('entry_qualified_by', 'unknown')
             label += f'[{stage}满足={qualified}]'
