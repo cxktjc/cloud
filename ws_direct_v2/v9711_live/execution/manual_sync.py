@@ -222,7 +222,9 @@ def sync(state_dir, *, prices=None, symbols=None, apply=False, candidates=None, 
     with ExitStack() as leases:
         leases.enter_context(SingleWriter(state_dir/'trade.lock'))
         leases.enter_context(SingleWriter(state_dir/'signal.lock'))
-        for name in (*BACKUP_FILES, JOURNAL):
+        from .journal_store import artifacts
+        backup_files = (*BACKUP_FILES, *(p.name for p in artifacts(state_dir/'execution_ledger.json')))
+        for name in (*backup_files, JOURNAL):
             if not (state_dir/name).resolve().is_relative_to(state_dir):
                 raise ValueError(f'accounting path escapes state directory: {name}')
         pending = _read(state_dir/JOURNAL)
@@ -336,7 +338,7 @@ def sync(state_dir, *, prices=None, symbols=None, apply=False, candidates=None, 
             FILES[2]:_encode(feedback), FILES[3]:_encode(receipt)}
         backup.mkdir(parents=True)
         originals, backup_hashes = {}, {}
-        for name in BACKUP_FILES:
+        for name in backup_files:
             path = state_dir/name
             if path.exists():
                 raw = path.read_bytes()

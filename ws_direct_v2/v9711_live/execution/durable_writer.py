@@ -224,6 +224,9 @@ def commit_snapshot_slot(handle, record):
 
 
 def resolve_store(payload, state_path):
+    if 'execution_journal_store' in payload:
+        from .journal_store import resolve_journal
+        return resolve_journal(payload, state_path)
     epoch = payload.get('execution_dispatch_store')
     if epoch is None:
         return payload

@@ -295,14 +295,15 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.fail('network jobs did not settle')
 
     def block_disk(self):
-        original = module.commit_snapshot_slot
+        from v9711_live.execution import journal_store
+        original = journal_store.commit_journal
         started = threading.Event()
         def write(path, encoded):
             started.set()
             if not self.release.wait(3):
                 raise AssertionError('test disk not released')
             original(path, encoded)
-        context = patch.object(module, 'commit_snapshot_slot', side_effect=write)
+        context = patch.object(journal_store, 'commit_journal', side_effect=write)
         context.start()
         self.addCleanup(context.stop)
         return started
@@ -498,7 +499,8 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.assertFalse(self.sent)
 
     def test_failed_disk_never_calls_exchange(self):
-        with patch.object(module, 'commit_snapshot_slot', side_effect=OSError('simulated disk failure')):
+        from v9711_live.execution import journal_store
+        with patch.object(journal_store, 'commit_journal', side_effect=OSError('simulated disk failure')):
             self.case.event('N0USDT')
             self.wait_done()
             self.assertFalse(self.sent)
@@ -507,7 +509,12 @@ class OwnerDurabilityTests(unittest.TestCase):
                 self.trade.ledger.flush_pending().result(1)
             except OSError:
                 pass  # Finish the deliberately failed background rejection save.
-        self.trade.ledger.flush()  # Explicitly recover the test disk before cleanup.
+        # A journal with an uncertain partial append is poisoned until restart.
+        # It must not append behind that tail, even after the test disk recovers.
+        with self.assertRaises(OSError):
+            self.trade.ledger.flush()
+        self.trade.ledger._background.close()
+        self.trade.ledger._background_closed = True
 
     def test_signal_withdrawn_during_disk_wait_is_checked_again_at_send(self):
         self.case.templates = self.case.templates[:1]

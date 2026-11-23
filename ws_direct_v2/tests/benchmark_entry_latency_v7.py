@@ -105,6 +105,16 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                         threading.Event().wait(disk_delay_ms/1000)
                         return original_slot(*args, **kwargs)
                     case.stack.enter_context(patch.object(durable_module, 'commit_snapshot_slot', side_effect=slow_slot))
+                try:
+                    from v9711_live.execution import journal_store
+                except ImportError:
+                    pass
+                else:
+                    original_journal = journal_store.commit_journal
+                    def slow_journal(*args, **kwargs):
+                        threading.Event().wait(disk_delay_ms/1000)
+                        return original_journal(*args, **kwargs)
+                    case.stack.enter_context(patch.object(journal_store, 'commit_journal', side_effect=slow_journal))
         for feed in (market, market.book):
             for group in feed.generation:
                 feed.group_connected(group)
@@ -334,7 +344,8 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 seconds=duration, actual_seconds=round(time.perf_counter()-started, 3),
                 achieved_raw_rate=round((final.get('received', 0)-initial.get('received', 0))/duration, 1),
                 achieved_effective_rate=round((final.get('enqueued', 0)-initial.get('enqueued', 0))/duration, 1),
-                counters={k: final.get(k, 0)-initial.get(k, 0) for k in keys},
+                counters={k: final.get(k, 0)-initial.get(k, 0) for k in
+                          (*keys, 'screened_far', 'screened_replayed', 'unchanged')},
                 queue_peak=final.get('queue_peak'), final_queue=market.events.qsize(),
                 opportunities=len(opportunities), sent_symbols=len({s['symbol'] for s in sends}),
                 unsent_symbols=[item['symbol'] for item in opportunities if item['symbol'] not in {s['symbol'] for s in sends}],

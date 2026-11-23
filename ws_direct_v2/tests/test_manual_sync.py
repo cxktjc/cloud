@@ -3,6 +3,7 @@ from contextlib import ExitStack
 import copy
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -74,6 +75,30 @@ class ManualSyncTests(unittest.TestCase):
         self.assert_original()
         self.assertFalse((self.state/'execution_backups').exists())
         self.assertFalse((self.state/'WS_MIGRATION.json').exists())
+
+    def test_abrupt_journal_state_is_resolved_and_all_segments_are_backed_up(self):
+        code = '''
+import os, sys
+from pathlib import Path
+from v9711_live.execution.client import OwnershipLedger
+root = Path(sys.argv[1])
+ledger = OwnershipLedger(root/'execution_intents.json', root/'execution_ledger.json')
+ledger.enable_background(incremental=True)
+ledger.state['realized_balance'] = 13.4
+ledger.flush()
+os._exit(0)
+'''
+        result = subprocess.run([sys.executable, '-B', '-c', code, str(self.state)],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        from v9711_live.execution.journal_store import artifacts
+        expected = {path.name: path.read_bytes() for path in artifacts(self.state/'execution_ledger.json')}
+        self.assertGreaterEqual(len(expected), 2)
+        plan = self.sync(apply=True)
+        for name, raw in expected.items():
+            self.assertEqual((Path(plan['backup'])/name).read_bytes(), raw)
+        self.assertEqual(self.read_state()['realized_balance'], 14.9)
+        self.assertNotIn('execution_journal_store', json.loads((self.state/'execution_ledger.json').read_text()))
 
     def test_apply_imports_funds_positions_and_due_without_modifying_signal(self):
         plan = self.sync(apply=True)

@@ -82,6 +82,7 @@ class OwnershipLedger:
         self._background_closed = False
         self._last_barrier = None
         self._dispatch_group = None
+        self._delta_capture = None
 
     def _recover_native_slot_intents(self):
         # A crash between the two atomic file replacements can leave a native
@@ -175,8 +176,14 @@ class OwnershipLedger:
             return self.flush_for_dispatch()
         return self._last_barrier
 
-    def enable_background(self, *, atomic_bundle=False, persistent_slots=False):
+    def enable_background(self, *, atomic_bundle=False, persistent_slots=False, incremental=False):
         if self._background is None:
+            if incremental:
+                from .journal_store import DeltaCapture, JournalWriter
+                capture = DeltaCapture(self.intents, self.state)
+                self._background = JournalWriter(self.path, self.state_path, initial=capture.root)
+                self._delta_capture = capture
+                return
             from .durable_writer import BundleWriter, DurableWriter, SlotWriter
             writer = SlotWriter if persistent_slots else BundleWriter if atomic_bundle else DurableWriter
             self._background = writer(self.path, self.state_path,
@@ -210,6 +217,13 @@ class OwnershipLedger:
                 intent = self.intents.get('c:'+cid) or {}
                 if cid and intent.get('symbol') == symbol and intent.get('kind') == kind and intent.get('client_order_id') == cid:
                     reservations.add((symbol, cid))
+        if self._delta_capture is not None:
+            delta, root = self._delta_capture.prepare(self.intents, self.state, reservations)
+            barrier = self._background.submit(delta)
+            self._delta_capture.root = root
+            self._last_barrier = barrier
+            self._save_pending = False
+            return barrier
         encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
         self._last_barrier = self._background.submit(Snapshot(
             encode(self.intents), encode(self.state), frozenset(reservations)))

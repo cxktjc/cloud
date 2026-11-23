@@ -231,6 +231,7 @@ class TradeTerminalView:
                          f'决策={ws.get("decide_per_second", 0):.0f}/s 积压={ws.get("queue", 0)} '
                          f'峰值={ws.get("queue_peak", 0)} 买一未变={ws.get("unchanged", 0)} '
                          f'远价快速处理={ws.get("skipped_far_events", 0)} '
+                         f'接收侧远价完成={ws.get("screened_far", 0)} '
                          f'过载丢弃={ws.get("overload_discarded", 0)} '
                          f'当前丢弃={ws.get("discarded_per_second", 0):.0f}/s')
             work = ws.get('owner_work') or {}
@@ -283,6 +284,11 @@ class TradeTerminalView:
                            if durability.get('persistent_slots') else
                            f'intents/state={(durability.get("file_write_ms") or {}).get("intents", 0):.3f}/'
                            f'{(durability.get("file_write_ms") or {}).get("state", 0):.3f}ms ')
+                if durability.get('incremental_journal'):
+                    storage = (f'增量日志={durability.get("record_bytes", 0)}B '
+                               f'序号={durability.get("commit_sequence", 0)} '
+                               f'检查点={durability.get("checkpoint_sequence", 0)} '
+                               f'检查点错误={durability.get("checkpoint_error") or "无"} ')
                 lines.insert(-1, f'订单账本后台写盘: 写入中={int(durability.get("writing", False))} '
                              f'待写={durability.get("pending", 0)} 合并={durability.get("coalesced", 0)} '
                              f'最近={durability.get("last_write_ms", 0):.3f}ms '

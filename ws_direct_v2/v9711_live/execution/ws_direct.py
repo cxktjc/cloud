@@ -83,7 +83,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261123-entry-priority-v11', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261123-ingress-journal-v12', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -101,7 +101,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 raise ValueError('V9711_LIVE_GIL_SWITCH_SECONDS must be in [0.0005, 0.005]')
         super().enable_nonblocking_io()
         if self.client.enabled and not self.client.dry_run:
-            self.ledger.enable_background(persistent_slots=True)
+            self.ledger.enable_background(incremental=True)
+            self.market.events.enable_ingress_screening()
             if self._previous_switch_interval is None:
                 # CPython's default 5ms GIL interval can be paid repeatedly
                 # between the quote owner, disk writer and socket loop.

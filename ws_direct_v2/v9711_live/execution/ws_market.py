@@ -1,7 +1,8 @@
 """WS ingress -> owner decision -> committed mirror, never file -> decision.
 
 Receiver and snapshot writer are independent of the execution state owner.
-Every price/validity change is queued, not last-price-coalesced before admission.
+Actionable price/validity changes are queued, including crossings/rebounds.
+Provably irrelevant unowned far prices may finish comparison on ingress.
 Identical consecutive book prices only refresh receipt/quantity freshness.
 Overflow, stale backlog, reconnect generations and silence fail closed.
 """
@@ -48,6 +49,7 @@ class DirectMarket:
             raise ValueError('WS symbol list is empty')
         self.group_for = {symbol: index for index, group in enumerate(self.groups, 1) for symbol in group}
         self.events = QuoteQueue(maxsize=cfg.WS_QUEUE_SIZE if queue_size is None else queue_size)
+        self.events.refresh_quotes[source] = self.quote_tick
         self._lock = threading.RLock()
         self.generation = {index:0 for index in range(1, len(self.groups)+1)}
         self.receipts = {}
@@ -62,8 +64,8 @@ class DirectMarket:
         self.sequence = 0
         self.overloaded = False
         self.counts = dict(received=0, decided=0, rejected_old=0, rejected_backlog=0, overflow=0,
-                           enqueued=0, unchanged=0, overload_discarded=0)
-        self._rate_keys = ('received', 'enqueued', 'decided', 'unchanged', 'rejected_backlog', 'rejected_old', 'overload_discarded')
+                           enqueued=0, unchanged=0, overload_discarded=0, screened_far=0)
+        self._rate_keys = ('received', 'enqueued', 'decided', 'unchanged', 'rejected_backlog', 'rejected_old', 'overload_discarded', 'screened_far')
         self._rate_sample = (time.monotonic(), {key: 0 for key in self._rate_keys})
         self._rates = {key: 0. for key in self._rate_keys}
         self.queue_peak = 0
@@ -177,7 +179,7 @@ class DirectMarket:
                 self.counts['unchanged'] += 1
                 return True
         try:
-            self.events.put_nowait(tick)
+            enqueued = self.events.put_quote(tick, self._complete_far)
         except queue.Full:
             with self._lock:
                 self.counts['overflow'] += 1
@@ -186,8 +188,22 @@ class DirectMarket:
                 self._overflow_groups.add(group)
                 self.group_failed(group, 'WS owner queue overflow; old generation revoked; socket kept open')
             raise BufferError('WS decision queue overflow; old generation revoked; draining without reconnect')
+        if not enqueued:
+            return True
         self.counts['enqueued'] += 1
         self.queue_peak = max(self.queue_peak, self.events.qsize())
+        return True
+
+    def _complete_far(self, tick):
+        # Called under the policy mutex; no order mutation or network/disk IO.
+        with self._lock:
+            if (self.overloaded or tick.generation != self.generation[tick.group]
+                    or (time.monotonic_ns()-tick.received_ns)/1e9 > cfg.WS_MAX_QUEUE_AGE_SECONDS):
+                return False
+            self.processed[tick.symbol] = tick
+            self.committed[tick.symbol] = tick
+            self.committed_receipts[tick.group] = (tick.generation, tick.received_epoch_ms/1000)
+            self.counts['screened_far'] += 1
         return True
 
     def quote_tick(self, symbol, tick):
@@ -231,6 +247,12 @@ class DirectMarket:
                     and -5 <= now-tick.exchange_ms/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS}
 
     def decide(self, tick, callback):
+        try:
+            return self._decide(tick, callback)
+        finally:
+            self.events.finish(tick)
+
+    def _decide(self, tick, callback):
         if tick is None:
             return False
         # Owner-only boundary, immediately after the caller takes the event.
@@ -297,8 +319,10 @@ class DirectMarket:
                 self._rates = {key: (self.counts[key]-counts[key])/(now-previous) for key in self._rate_keys}
                 self._rate_sample = (now, {key: self.counts[key] for key in self._rate_keys})
             counts, rates = dict(self.counts), dict(self._rates)
+            counts['enqueued'] += self.events.replayed.get(self.source, 0)
+            counts['screened_replayed'] = self.events.replayed.get(self.source, 0)
             samples, admissions = list(self.latencies_us), list(self.admission_latencies_us[-64:])
-            received_symbols, peak = len(self.processed), self.queue_peak
+            received_symbols, peak = len(self.processed), max(self.queue_peak, self.events.peak)
         # Diagnostics must not hold the ingress lock while sorting samples or
         # evaluating the quote map. Receivers keep draining during this work.
         values = sorted(samples)
@@ -308,6 +332,7 @@ class DirectMarket:
                         enqueue_per_second=rates['enqueued'], unchanged_per_second=rates['unchanged'],
                         expired_per_second=rates['rejected_backlog'], old_per_second=rates['rejected_old'],
                         discarded_per_second=rates['overload_discarded'], healthy=self.healthy(),
+                        screened_far_per_second=rates['screened_far'],
                         subscribed=len(self.symbols), received_symbols=received_symbols,
                         fresh_symbols=len(self.prices() if fresh_prices is None else fresh_prices),
                         receive_to_decision_us_p50=percentile(.5),
@@ -407,6 +432,7 @@ class DualMarket(DirectMarket):
         super().__init__(symbols, output, **kwargs)
         self.book = DirectMarket(symbols, output, source='bid0', dedupe_unchanged=True, **kwargs)
         self.book.events = self.events  # one owner, distinct per-feed generations
+        self.events.refresh_quotes['bid0'] = self.book.quote_tick
         self.book.update_book = self.update_book
         self._book_ids = {}
 
@@ -557,13 +583,15 @@ class DualMarket(DirectMarket):
         result['receive_to_decision_us_max'] = max(values, default=None)
         book_metrics = self.book.metrics(fresh_prices=bids)
         for key in ('received', 'decided', 'rejected_old', 'rejected_backlog', 'overflow',
-                    'enqueued', 'unchanged', 'overload_discarded'):
-            result[key] += self.book.counts[key]
-        result['queue_peak'] = max(self.queue_peak, self.book.queue_peak)
+                    'enqueued', 'unchanged', 'overload_discarded', 'screened_far'):
+            result[key] += book_metrics[key]
+        result['queue_peak'] = max(self.queue_peak, self.book.queue_peak, self.events.peak)
         for key in ('receive_per_second', 'decide_per_second', 'enqueue_per_second', 'unchanged_per_second',
                     'expired_per_second', 'old_per_second', 'discarded_per_second'):
             result[key] += book_metrics[key]
         result.update(bid0_symbols=len(bids), entry_symbols=len(entries),
+                      screened_replayed=result['screened_replayed']+book_metrics['screened_replayed'],
+                      screened_far_per_second=result['screened_far_per_second']+book_metrics['screened_far_per_second'],
                       book_received=self.book.counts['received'], book_decided=self.book.counts['decided'],
                       book_rejected_backlog=self.book.counts['rejected_backlog'],
                       book_overflow=self.book.counts['overflow'])
