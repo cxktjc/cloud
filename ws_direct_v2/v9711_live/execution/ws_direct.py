@@ -84,7 +84,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261123-tiered-recheck-v15', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261123-retry-evidence-v16', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -179,13 +179,24 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         else:
             # Far entries recheck latest ingress only at send, after durability
             # and socket readiness; near entries perform no secondary WS read.
-            result = qualify_quote(self.market.send_quote(symbol), limit,
+            live_quote = self.market.send_quote(symbol)
+            result = qualify_quote(live_quote, limit,
                                    gate.get('entry_gap_limits', {}).get(cid, detail.get('entry_gap_ceiling')))
             result.update(entry_quote_policy='distance_rechecked',
                 entry_send_check='far_passed' if result['entry_qualified_by'] != 'none' else 'far_rejected')
+            if result['entry_qualified_by'] == 'none':
+                result['entry_recheck_watermarks'] = live_quote.get('observed_watermarks')
         result.update(entry_recheck_gap=gap, entry_recheck_threshold=SEND_RECHECK_GAP)
         self.session_entries.timings.quote_check(cid, result)
         return result
+
+    def _entry_retry_rejected(self, symbol, exc):
+        # Owner-only: a rejected ingress view must not be re-admitted from
+        # older queued decisions. Do not invalidate tick valuation or signal.
+        if exc.retry_gate == 'quote':
+            self.market.reject_entry_quotes(symbol, exc.quote_watermarks)
+            self._cycle_price_maps = None
+        self._update_rank(symbol, float('inf'))
 
     def step(self, *, now=None):
         started = self._maintenance_mark = time.perf_counter_ns()
@@ -286,7 +297,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         if status == 'valid':
             if not self.market.healthy():
                 status = 'ws_not_ready'
-            elif self.client.enabled and not self.client.dry_run and time.time() > self._account_deadline:
+            elif not self._account_send_allowed():
                 status = 'account_not_ready'
         if status == 'valid' and not self._precision_ready:
             status = 'precision_cache_not_ready'
@@ -315,6 +326,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def _place_order(self, row):
         symbol = str(row.get('symbol') or '').upper()
+        if not self._account_send_allowed():
+            self._submit_skip_reasons[symbol] = 'account_not_ready_before_registration'
+            return
         ceiling = row.get('entry_gap_ceiling', GapPolicy().admission_gap(self._ordinary_pending_count()))
         context = dict(decision_epoch_ms=time.time()*1000, _decision_ns=time.monotonic_ns())
         quote = self.market.entry_quote(symbol)

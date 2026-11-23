@@ -36,6 +36,7 @@ class Tick:
     valid: bool = True
     quantity: str | None = None
     received_epoch_ms: float = 0.
+    receive_seq: int = 0
 
 
 class DirectMarket:
@@ -150,10 +151,10 @@ class DirectMarket:
             if old and stamp < old.exchange_ms:
                 self.counts['rejected_old'] += 1
                 return False
-            tick = Tick(symbol, str(price), stamp, received_ns, group, generation, self.source, valid, quantity,
-                        received_epoch_ms)
-            self.latest_ingress[symbol] = tick
             self.counts['received'] += 1
+            tick = Tick(symbol, str(price), stamp, received_ns, group, generation, self.source, valid, quantity,
+                        received_epoch_ms, self.counts['received'])
+            self.latest_ingress[symbol] = tick
             if group in self._overflow_groups:
                 # The explicit overflow has revoked ALL queued prices of this
                 # generation. Keep the socket draining, but admit no old work.
@@ -435,6 +436,28 @@ class DualMarket(DirectMarket):
         self.events.refresh_quotes['bid0'] = self.book.quote_tick
         self.book.update_book = self.update_book
         self._book_ids = {}
+        self._entry_reject_cutoffs = {}  # Owner-only, process-local; never a valuation cutoff.
+
+    def reject_entry_quotes(self, symbol, watermarks=None):
+        """Require evidence newer than the ingress view that rejected a send."""
+        if watermarks is None:
+            watermarks = {}
+            for source, feed in (('tick', self), ('bid0', self.book)):
+                with feed._lock:
+                    latest = feed.latest_ingress.get(symbol)
+                    watermarks[source] = latest.receive_seq if latest else 0
+        previous = self._entry_reject_cutoffs.get(symbol, {})
+        self._entry_reject_cutoffs[symbol] = {
+            source: max(previous.get(source, 0), int(watermarks.get(source) or 0))
+            for source in ('tick', 'bid0')}
+
+    def _post_rejection_price(self, feed, symbol, price, cutoff):
+        if price is not None:
+            with feed._lock:
+                tick = feed.quote_tick(symbol, feed.processed.get(symbol))
+                if tick is None or tick.receive_seq <= cutoff:
+                    return None
+        return price
 
     def update_book(self, symbol, bid, quantity, stamp, update_id):
         try:
@@ -479,8 +502,13 @@ class DualMarket(DirectMarket):
 
     def order_allowed(self, symbol):
         clock = self._quote_clock()
-        return (self._quote(self, symbol, clock=clock) is not None
-                or self._quote(self.book, symbol, clock=clock) is not None)
+        tick = self._quote(self, symbol, clock=clock)
+        bid = self._quote(self.book, symbol, clock=clock)
+        cutoffs = self._entry_reject_cutoffs.get(symbol)
+        if cutoffs:
+            tick = self._post_rejection_price(self, symbol, tick, cutoffs['tick'])
+            bid = self._post_rejection_price(self.book, symbol, bid, cutoffs['bid0'])
+        return tick is not None or bid is not None
 
     def prices(self, symbols=None):
         # Deliberately keep tick-only valuation and the signal price mirror.
@@ -497,9 +525,14 @@ class DualMarket(DirectMarket):
             bid = self._quote(self.book, symbol, clock=clock)
             if tick is not None:
                 ticks[symbol] = tick
+            entry_tick = tick
+            cutoffs = self._entry_reject_cutoffs.get(symbol)
+            if cutoffs:
+                entry_tick = self._post_rejection_price(self, symbol, tick, cutoffs['tick'])
+                bid = self._post_rejection_price(self.book, symbol, bid, cutoffs['bid0'])
             if bid is not None:
                 bids[symbol] = bid
-            selected = bid if tick is None else tick if bid is None else min(tick, bid)
+            selected = bid if entry_tick is None else entry_tick if bid is None else min(entry_tick, bid)
             if selected is not None:
                 entries[symbol] = selected
         return ticks, bids, entries
@@ -508,6 +541,10 @@ class DualMarket(DirectMarket):
         clock = self._quote_clock()
         tick = self._quote(self, symbol, clock=clock)
         bid = self._quote(self.book, symbol, clock=clock)
+        cutoffs = self._entry_reject_cutoffs.get(symbol)
+        if cutoffs:
+            tick = self._post_rejection_price(self, symbol, tick, cutoffs['tick'])
+            bid = self._post_rejection_price(self.book, symbol, bid, cutoffs['bid0'])
         candidates = [(price, source) for price, source in ((tick, 'tick'), (bid, 'bid0')) if price is not None]
         selected, source = min(candidates, default=(None, None))
         with self.book._lock:
@@ -524,10 +561,11 @@ class DualMarket(DirectMarket):
         at send, including time spent registering the exact durable intent.
         """
         clock = self._quote_clock()
-        prices, quantity = {}, None
+        prices, quantity, watermarks = {}, None, {}
         for source, feed in (('tick', self), ('bid0', self.book)):
             with feed._lock:
                 latest = feed.latest_ingress.get(symbol)
+                watermarks[source] = latest.receive_seq if latest else 0
                 price = self._quote(feed, symbol, latest, clock=clock) if latest is not None else None
                 if latest is not None and (clock[2]-latest.received_ns)/1e9 > cfg.WS_MAX_QUEUE_AGE_SECONDS:
                     price = None
@@ -535,7 +573,8 @@ class DualMarket(DirectMarket):
                 if source == 'bid0' and price is not None:
                     quantity = float(latest.quantity or 0)
         selected, source = min(((p, s) for s, p in prices.items() if p is not None), default=(None, None))
-        return dict(prices, selected=selected, source=source, bid_quantity=quantity)
+        return dict(prices, selected=selected, source=source, bid_quantity=quantity,
+                    observed_watermarks=watermarks)
 
     def entry_prices(self, symbols=None):
         return self.price_maps(symbols)[2]
@@ -553,6 +592,8 @@ class DualMarket(DirectMarket):
     def quote_state(self, symbol):
         if self.order_allowed(symbol):
             return 'quote_ready'
+        if symbol in self._entry_reject_cutoffs:
+            return 'quote_waiting_fresh_after_send_rejection'
         if symbol not in self.processed and symbol not in self.book.processed:
             return 'quote_waiting_first_tick'
         return 'quote_stale_or_disconnected_both_sources'

@@ -18,6 +18,11 @@ class ConfirmedSubmitRejection(RuntimeError):
 class EntryQuoteUnavailable(ConfirmedSubmitRejection):
     """No request sent; a fresh qualifying quote may retry the same signal plan."""
 
+    def __init__(self, message, *, retry_gate='quote', quote_watermarks=None):
+        super().__init__(message)
+        self.retry_gate = retry_gate
+        self.quote_watermarks = dict(quote_watermarks) if quote_watermarks is not None else None
+
 
 _TRANSPORT = (
     'network', 'ssl', 'eof', 'connection', 'timeout', 'timed out',

@@ -1,5 +1,8 @@
 # 1.5% 分级二次检查验证：2026-11-23
 
+本文保留 v15 验证。v16 继续 1.5% 分级，并修复拒绝后反复使用旧报价登记的循环，
+见 [VALIDATION_RETRY_EVIDENCE_V16.md](VALIDATION_RETRY_EVIDENCE_V16.md)。
+
 运行标识：`20261123-tiered-recheck-v15`。仅修改 cloud 仓库 `ws_direct_v2`。
 测试使用临时账本及离线假交易所/socket；没有下真实订单或修改生产状态。
 

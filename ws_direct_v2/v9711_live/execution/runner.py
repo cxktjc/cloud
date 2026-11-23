@@ -534,6 +534,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 self.ledger.state['pending_rotation'] = dict(origin)
                 LOG.info('replacement rejected; restore original rotation gates symbol=%s', symbol)
         self.tracked.pop(symbol, None)
+        if isinstance(exc, EntryQuoteUnavailable):
+            retry_rejected = getattr(self, '_entry_retry_rejected', None)
+            if retry_rejected is not None:
+                retry_rejected(symbol, exc)
         self.ledger.state['entry_submit_rejections'][cid] = {
             'symbol': symbol, 'client_order_id': cid,
             'order_bar_open_ms': int(self._finite(row.get('order_bar_open_ms'))),

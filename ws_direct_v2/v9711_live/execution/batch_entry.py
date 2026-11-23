@@ -23,7 +23,7 @@ class BatchEntryMixin:
         account = getattr(self, 'entry_account_guard', None)
         if callable(account):
             if not account():
-                raise EntryQuoteUnavailable('account stream unavailable before send')
+                raise EntryQuoteUnavailable('account stream unavailable before send', retry_gate='account')
             return
         market = getattr(self, 'market_guard', None)
         if callable(market) and not market(symbol):
@@ -34,7 +34,8 @@ class BatchEntryMixin:
         if callable(capture):
             detail = capture(symbol, cid, limit)
             if detail['entry_qualified_by'] == 'none':
-                raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send')
+                raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send',
+                                            quote_watermarks=detail.get('entry_recheck_watermarks'))
             return detail
         guard = getattr(self, 'entry_quote_guard', None)
         if callable(guard) and not guard(symbol, cid, limit):
