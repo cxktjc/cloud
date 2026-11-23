@@ -10,6 +10,7 @@ import asyncio
 import logging
 import math
 import queue
+from .quote_queue import QuoteQueue
 import threading
 import time
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ class DirectMarket:
         if not self.groups:
             raise ValueError('WS symbol list is empty')
         self.group_for = {symbol: index for index, group in enumerate(self.groups, 1) for symbol in group}
-        self.events = queue.Queue(maxsize=cfg.WS_QUEUE_SIZE if queue_size is None else queue_size)
+        self.events = QuoteQueue(maxsize=cfg.WS_QUEUE_SIZE if queue_size is None else queue_size)
         self._lock = threading.RLock()
         self.generation = {index:0 for index in range(1, len(self.groups)+1)}
         self.receipts = {}

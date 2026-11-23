@@ -45,7 +45,7 @@ class EntryCancelPacing:
             if self._entry_cancel_hold <= 0:
                 raise RuntimeError('Unbalanced entry cancel collection')
             self._entry_cancel_hold -= 1
-            self._condition.notify_all()
+            self._wake_queued()
 
     def update_entry_cancels(self, orders: Mapping[tuple, Mapping[str, Any]]) -> None:
         """Owner publishes immutable exact identities + already-fresh local quotes.
@@ -69,7 +69,7 @@ class EntryCancelPacing:
             # Filtering a heap preserves its partial ordering, not necessarily
             # its array shape; rebuild before the dispatcher's next pop.
             heapq.heapify(self._heap)
-            self._condition.notify_all()
+            self._wake_queued()
 
     def _entry_cancel_distance(self, job) -> float:
         row = (self._entry_cancel_orders or {}).get(job.key) or {}

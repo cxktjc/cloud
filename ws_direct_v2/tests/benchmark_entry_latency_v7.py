@@ -6,6 +6,7 @@ Run from the version under test, with this script's absolute path if needed.
 import argparse
 import asyncio
 import json
+import hashlib
 import os
 import sys
 import queue
@@ -57,7 +58,8 @@ def restrict_cpus(count):
 
 
 def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=False,
-        pressure_rate=0, interval=1., changing=False, disk_delay_ms=0, ingress_burst_ms=0):
+        pressure_rate=0, interval=1., changing=False, disk_delay_ms=0, ingress_burst_ms=0,
+        rounds=1, round_seconds=15., timing_history=0, near_symbols=0):
     case = DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     read_started, release_read = threading.Event(), threading.Event()
@@ -77,6 +79,9 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             s: dict(tick='.0001', step='1', min_qty='1', min_notional='5') for s in case.symbols}}))
         case.make_trade()
         trade, market = case.trade, case.trade.market
+        for index in range(timing_history):
+            trade.session_entries.timings.register('HISTORYUSDT', 'historical-'+str(index),
+                dict(order_bar_open_ms=case.bar-cfg.BAR_MS))
         if disk_delay_ms:
             from v9711_live.execution import client as client_module
             original_json = client_module.atomic_write_json
@@ -94,6 +99,12 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                     threading.Event().wait(disk_delay_ms/1000)
                     return original_text(*args, **kwargs)
                 case.stack.enter_context(patch.object(durable_module, 'atomic_write_text', side_effect=slow_text))
+                if hasattr(durable_module, 'commit_snapshot_slot'):
+                    original_slot = durable_module.commit_snapshot_slot
+                    def slow_slot(*args, **kwargs):
+                        threading.Event().wait(disk_delay_ms/1000)
+                        return original_slot(*args, **kwargs)
+                    case.stack.enter_context(patch.object(durable_module, 'commit_snapshot_slot', side_effect=slow_slot))
         for feed in (market, market.book):
             for group in feed.generation:
                 feed.group_connected(group)
@@ -107,7 +118,8 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 market.decide(market.events.get_nowait(), lambda event: None)
         case.targets = []
         case.templates = [dict(symbol=s, limit_price=1., notional=5., order_bar_open_ms=case.bar,
-            reference_bar_open_ms=case.bar-cfg.BAR_MS, exit_due_epoch=case.now+900) for s in case.symbols]
+            reference_bar_open_ms=case.bar-cfg.BAR_MS, exit_due_epoch=case.now+900,
+            exit_due_ms=int((case.now+900)*1000)) for s in case.symbols]
         case.publish()
         trade.step(now=case.now)
         for i in range(history):
@@ -117,16 +129,30 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
         if pressure_rate:
             # User reported ~54KB state and <1KB intents. Do not benchmark an
             # empty ledger then attribute live delays to huge history files.
-            trade.ledger.state['_offline_padding'] = 'x'*54000
+            # Deterministic high-entropy padding: compression must not obtain
+            # an artificial win from 54KB of repeated 'x' characters.
+            trade.ledger.state['_offline_padding'] = ''.join(
+                hashlib.sha256(str(i).encode()).hexdigest() for i in range(844))[:54000]
         trade.ledger.flush()
-        sends, received = [], {}
+        sends, received, background_sends = [], {}, []
+        def record_send(symbol, cid, sent):
+            first = received.get(symbol)
+            if first is None:
+                try:
+                    with trade.session_entries.timings._lock:
+                        first = trade.session_entries.timings._rows[cid]['_received_ns']
+                except KeyError:
+                    pressure_errors.append('background send missing quote timestamp: '+symbol)
+                    raise
+            target = sends if symbol in received else background_sends
+            target.append(dict(symbol=symbol, client_order_id=cid, ms=(sent-first)/1e6,
+                               before_read_release=not release_read.is_set()))
         def fake_socket(method, symbol, side, qty, *, client_order_id, before_send, **kwargs):
             before_send()
             sent = time.perf_counter_ns()
             before_send.wire_sent()
-            sends.append(dict(symbol=symbol, ms=(sent-received[symbol])/1e6,
-                              before_read_release=not release_read.is_set()))
-            result = dict(symbol=symbol, clientOrderId=client_order_id, orderId=str(len(sends)),
+            record_send(symbol, client_order_id, sent)
+            result = dict(symbol=symbol, clientOrderId=client_order_id, orderId=str(len(sends)+len(background_sends)),
                           status='NEW', executedQty='0', avgPrice='0', origQty=qty)
             case.orders[client_order_id] = result
             before_send.reply_received()
@@ -149,9 +175,8 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                     assert payload['method'] == 'order.place' and params['apiKey'] == 'offline-key'
                     assert len(params['signature']) == 64
                     symbol, cid = params['symbol'], params['newClientOrderId']
-                    sends.append(dict(symbol=symbol, ms=(sent-received[symbol])/1e6,
-                                      before_read_release=not release_read.is_set()))
-                    result = dict(symbol=symbol, clientOrderId=cid, orderId=str(len(sends)),
+                    record_send(symbol, cid, sent)
+                    result = dict(symbol=symbol, clientOrderId=cid, orderId=str(len(sends)+len(background_sends)),
                                   status='NEW', executedQty='0', avgPrice='0', origQty=params['quantity'])
                     case.orders[cid] = result
                     self.responses.put_nowait(json.dumps(dict(id=payload['id'], status=200, result=result)))
@@ -179,6 +204,13 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
         if trade._network_io.health()['transport_warmup']['failed']:
             raise AssertionError('offline worker prewarm failed')
         trade._account_deadline = case.now+3600
+        if hasattr(trade, 'enable_signal_reader'):
+            trade.enable_signal_reader()
+            deadline = time.perf_counter()+2
+            while not trade._signal_reader.healthy() and time.perf_counter() < deadline:
+                threading.Event().wait(.001)
+            if not trade._signal_reader.healthy():
+                raise AssertionError('offline signal reader did not initialize')
         maintenance = time.perf_counter()+.25
         cycles = 0
         def pump_until(count):
@@ -211,11 +243,13 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             # crossing before its explicitly scheduled one-second rebound.
             initial = market.metrics()
             started = time.perf_counter()
-            duration = 2. if burst else samples*interval+1.
-            background = case.symbols[samples:]
+            total_samples = samples*rounds
+            duration = rounds*round_seconds if rounds > 1 else 2. if burst else samples*interval+1.
+            background = case.symbols[total_samples:]
+            nearby = set(background[:near_symbols])
             # Build server-side payloads before measuring. The client should
             # pay JSON decoding cost, not the exchange's per-frame encoding.
-            wires = {(symbol, change): json.dumps(dict(s=symbol, p=str(1.03+.0001*change),
+            wires = {(symbol, change): json.dumps(dict(s=symbol, p=str((1.017 if symbol in nearby else 1.03)+.0001*change),
                 E=int(case.now*1000))) for symbol in background for change in (0, 1)}
             opportunities = []
             started = time.perf_counter()
@@ -227,8 +261,11 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                         elapsed = time.perf_counter()-started
                         if elapsed >= duration:
                             break
-                        due = min(samples, samples if burst and elapsed >= .5 else
-                                  max(0, int((elapsed-.5)/interval)+1) if elapsed >= .5 else 0)
+                        round_index = int(elapsed/round_seconds) if rounds > 1 else 0
+                        phase = elapsed-round_index*round_seconds
+                        due = min(total_samples, round_index*samples + min(samples,
+                            samples if burst and phase >= .5 else
+                            max(0, int((phase-.5)/interval)+1) if phase >= .5 else 0))
                         while triggered < due:
                             symbol = case.symbols[triggered]
                             received[symbol] = time.perf_counter_ns()
@@ -277,7 +314,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 except queue.Empty:
                     continue
                 if event is None:
-                    if trade._drain_network():
+                    if trade._drain_network() and getattr(trade._network_io, 'last_drain_urgent', True):
                         maintenance = 0
                     trade._publish_entry_gate()
                 else:
@@ -302,20 +339,31 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 opportunities=len(opportunities), sent_symbols=len({s['symbol'] for s in sends}),
                 unsent_symbols=[item['symbol'] for item in opportunities if item['symbol'] not in {s['symbol'] for s in sends}],
                 duplicate_symbols=len(sends)-len({s['symbol'] for s in sends}),
+                duplicate_client_ids=len(sends+background_sends)-len({s['client_order_id'] for s in sends+background_sends}),
+                near_symbols=near_symbols, background_orders=len(background_sends),
                 io_at_end=trade._network_io.health(),
                 maintenance_cycles=cycles, errors=pressure_errors,
                 decoded_json=True, state_bytes=cfg.EXECUTION_LEDGER_FILE.stat().st_size,
+                durable_snapshot_bytes=(trade.ledger._background.health().get('snapshot_bytes')
+                    if getattr(trade.ledger, '_background', None) else None),
                 disk_delay_ms_per_changed_file=disk_delay_ms,
                 ingress_burst_ms=ingress_burst_ms,
+                rounds=rounds, round_seconds=round_seconds, timing_history=timing_history,
+                latency_by_round=[summary([s['ms'] for s in sends if s['symbol'] in
+                    set(case.symbols[index*samples:(index+1)*samples])]) for index in range(rounds)],
                 gil_switch_ms=sys.getswitchinterval()*1000,
                 durability_writer=trade.ledger._background.health() if getattr(trade.ledger, '_background', None) else None,
+                owner_work=trade._owner_work.snapshot() if hasattr(trade, '_owner_work') else None,
+                quote_routes=dict(getattr(trade, '_quote_routes', {})),
                 stages={name: None for name in ('queue_wait', 'dequeued_to_decision', 'decision_to_registered',
                                                'registered_to_worker', 'worker_to_durable', 'registered_to_persisted',
                                                'persisted_to_durable', 'durable_to_send', 'worker_to_send')})
             # Timing rows survive retirement, use their exact CIDs for all sends.
             pressure['stages'] = {name: summary([row['latencies_ms'][name]
-                for row in (trade.session_entries.timings.order(cid) for cid in case.orders)
+                for row in (trade.session_entries.timings.order(s['client_order_id']) for s in sends)
                 if name in row.get('latencies_ms', {})]) for name in pressure['stages']}
+            for send in sends+background_sends:
+                send['stages_ms'] = trade.session_entries.timings.order(send['client_order_id']).get('latencies_ms', {})
             values = [s['ms'] for s in sends]
         elif blocked:
             # One resting exact order is queried while another symbol crosses.
@@ -387,7 +435,9 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
         return dict(scope=('800 templates; real durable files/worker/broker loop/signing/JSON to FAKE socket.send; no TLS/network RTT'
                           if signed_socket else '800 templates; real temporary durable files; guarded FAKE socket, no signing/network/ACK RTT'),
             scenario='100ms_blocked_account' if blocked else 'burst_entries' if burst else 'sequential_entries', history_intents=history,
-            latency=summary(values), sends=sends,
+            latency=summary(values), all_orders_latency=summary(values+[s['ms'] for s in background_sends]),
+            sends=sends, background_sends=background_sends,
+            background_latency=summary([s['ms'] for s in background_sends]),
             account_worker=trade._account_reader is not None if hasattr(trade, '_account_reader') else False,
             pressure=pressure)
     finally:
@@ -413,6 +463,11 @@ if __name__ == '__main__':
     parser.add_argument('--cpus', type=int, help='Restrict this process to N available logical CPUs')
     parser.add_argument('--disk-delay-ms', type=float, default=0., help='Offline added latency per changed durable file')
     parser.add_argument('--ingress-burst-ms', type=float, default=0., help='Deliver background frames in periodic batches, keeping the mean rate')
+    parser.add_argument('--rounds', type=int, default=1)
+    parser.add_argument('--round-seconds', type=float, default=15.)
+    parser.add_argument('--timing-history', type=int, default=0)
+    parser.add_argument('--require-ms', type=float)
+    parser.add_argument('--near-symbols', type=int, default=0)
     args = parser.parse_args()
     if not 1 <= args.samples <= 800 or args.history < 0:
         parser.error('samples in 1..800 and nonnegative history required')
@@ -426,9 +481,20 @@ if __name__ == '__main__':
         parser.error('disk-delay-ms must be in 0..1000')
     if not 0 <= args.ingress_burst_ms <= 1000:
         parser.error('ingress-burst-ms must be in 0..1000')
+    if not 1 <= args.rounds or args.rounds*args.samples >= 800 or args.timing_history < 0:
+        parser.error('positive rounds, samples*rounds < 800, nonnegative timing-history required')
+    if args.rounds > 1 and (not args.pressure_rate or not args.burst or args.round_seconds < 15):
+        parser.error('soak requires pressure, burst and round-seconds >=15 for real paced cancellations')
+    if not 0 <= args.near_symbols <= 800-args.rounds*args.samples or (args.near_symbols and not args.pressure_rate):
+        parser.error('near-symbols must fit the background universe and requires pressure')
     affinity = restrict_cpus(args.cpus) if args.cpus else None
     result = run(args.samples, args.history, args.blocked_account, args.signed_socket, args.burst,
-                 args.pressure_rate, args.interval, args.changing, args.disk_delay_ms, args.ingress_burst_ms)
+                 args.pressure_rate, args.interval, args.changing, args.disk_delay_ms, args.ingress_burst_ms,
+                 args.rounds, args.round_seconds, args.timing_history, args.near_symbols)
+    result['latency_target_ms'] = args.require_ms
+    result['latency_target_passed'] = (args.require_ms is None or
+        result['latency']['samples'] == args.samples*args.rounds
+        and result['all_orders_latency']['max_ms'] <= args.require_ms)
     result['cpu_affinity'] = affinity
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -436,7 +502,9 @@ if __name__ == '__main__':
     print(json.dumps(result['latency']))
     if result['pressure']:
         evidence = result['pressure']
-        raise SystemExit(int(bool(evidence['errors'] or evidence['unsent_symbols'] or evidence['duplicate_symbols']
+        integrity_failed = bool(evidence['errors'] or evidence['unsent_symbols'] or evidence['duplicate_symbols']
+            or evidence.get('duplicate_client_ids')
             or evidence['counters']['overflow'] or evidence['counters']['overload_discarded']
             or evidence['counters']['rejected_backlog']
-            or evidence['achieved_raw_rate'] < .9*args.pressure_rate)))
+            or evidence['achieved_raw_rate'] < .9*args.pressure_rate)
+        raise SystemExit(1 if integrity_failed else 2 if not result['latency_target_passed'] else 0)

@@ -295,17 +295,179 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.fail('network jobs did not settle')
 
     def block_disk(self):
-        original = module.atomic_write_text
+        original = module.commit_snapshot_slot
         started = threading.Event()
         def write(path, encoded):
             started.set()
             if not self.release.wait(3):
                 raise AssertionError('test disk not released')
             original(path, encoded)
-        context = patch.object(module, 'atomic_write_text', side_effect=write)
+        context = patch.object(module, 'commit_snapshot_slot', side_effect=write)
         context.start()
         self.addCleanup(context.stop)
         return started
+
+    def prime_distinct_batch(self):
+        self.case.templates = self.case.templates[:3]
+        for symbol in ('N0USDT', 'N1USDT', 'N2USDT'):
+            self.trade.market.update(symbol, '1.03', int(self.case.now*1000))
+            self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
+        self.case.publish()
+        self.trade.desired_snapshot(now=self.case.now)
+
+    def test_one_network_callback_turn_saves_all_ack_identities_in_one_snapshot(self):
+        self.case.event('N0USDT')
+        io = self.trade._network_io
+        deadline = time.perf_counter()+2
+        while io.health()['completed'] != 8 and time.perf_counter() < deadline:
+            threading.Event().wait(.001)
+        self.assertEqual(io.health()['completed'], 8)
+        io.callback_limit = io.callback_budget_seconds = None
+        before = self.trade.ledger._background.health()['submitted']
+        self.assertEqual(self.trade._drain_network(), 8)
+        self.trade.ledger.flush_pending().result(2)
+        self.assertEqual(self.trade.ledger._background.health()['submitted'], before+1)
+        restored = OwnershipLedger(self.trade.ledger.path, self.trade.ledger.state_path)
+        self.assertTrue(all(row.get('order_id') for row in restored.state['tracked_orders'].values()))
+
+    def test_distinct_simultaneous_crossings_use_one_plan_and_keep_each_trigger_timestamp(self):
+        self.prime_distinct_batch()
+        for symbol in ('N0USDT', 'N1USDT', 'N2USDT'):
+            self.trade.market.update(symbol, '.99', int(self.case.now*1000))
+        first = self.trade.market.events.get_nowait()
+        with patch.object(self.trade, '_execute_entries', wraps=self.trade._execute_entries) as execute:
+            self.trade.market.decide(first, self.trade.on_tick)
+            self.assertEqual(execute.call_count, 1)
+        self.trade.market.events.task_done()
+        self.wait_done()
+        self.assertEqual(len(self.sent), 3)
+        for cid in self.sent:
+            timing = self.trade.session_entries.timings.order(cid)
+            self.assertEqual(timing['trigger_symbol'], timing['symbol'])
+        self.assertFalse(self.trade._batch_event_contexts)
+
+    def prime_full_book_replacements(self):
+        self.case.event('N0USDT')
+        self.wait_done()
+        old = {s: r['client_order_id'] for s, r in self.trade.tracked.items()}
+        challengers = ('AUSDT', 'BUSDT', 'CUSDT', 'N8USDT')
+        self.case.templates.extend(dict(self.case.templates[0], symbol=s) for s in challengers)
+        for symbol in (*old, *challengers):
+            self.trade.market.update(symbol, '1.02' if symbol in old else '1.03', int(self.case.now*1000))
+        while not self.trade.market.events.empty():
+            event = self.trade.market.events.get_nowait()
+            if event is not None:
+                self.trade.market.decide(event, lambda event: None)
+            self.trade.market.events.task_done()
+        self.case.publish()
+        self.trade.desired_snapshot(now=self.case.now)
+        for symbol in challengers:
+            self.trade.market.update(symbol, '.99', int(self.case.now*1000))
+        return old, challengers
+
+    def test_full_book_replaces_all_distinct_challengers_in_one_durable_turn(self):
+        old, challengers = self.prime_full_book_replacements()
+        started = self.block_disk()
+        before = self.trade.ledger._background.health()['submitted']
+        event = self.trade.market.events.get_nowait()
+        self.trade.market.decide(event, self.trade.on_tick)
+        self.trade.market.events.task_done()
+        self.assertTrue(started.wait(1))
+        self.assertEqual(self.trade.ledger._background.health()['submitted'], before+1)
+        self.assertEqual(self.trade._ordinary_pending_count(), 8)
+        self.assertEqual(len(self.trade.tracked), 12)
+        self.assertEqual(len(self.sent), 8)  # New IDs still await their shared receipt.
+        self.assertIsNone(self.trade.ledger.state.get('pending_rotation'))
+        for symbol, cid in old.items():
+            self.assertEqual(self.trade.tracked[symbol]['client_order_id'], cid)
+        self.assertEqual(sum(bool(r.get('cancel_requested')) for r in self.trade.tracked.values()), 4)
+        for symbol in challengers:
+            self.assertEqual(self.trade.tracked[symbol]['rotation_origin']['original_order_count'], 8)
+        self.release.set()
+        deadline = time.perf_counter()+2
+        while len(self.sent) < 12 and time.perf_counter() < deadline:
+            self.trade._drain_network()
+            threading.Event().wait(.001)
+        self.assertEqual(len(set(self.sent)), 12)
+
+    def test_replacement_without_registration_stops_replanning_and_keeps_reservation(self):
+        self.prime_full_book_replacements()
+        event = self.trade.market.events.get_nowait()
+        with patch.object(self.trade, '_place_order') as place:
+            self.trade.market.decide(event, self.trade.on_tick)
+        self.trade.market.events.task_done()
+        self.assertEqual(place.call_count, 1)
+        self.assertEqual(len(self.trade.tracked), 8)
+        self.assertIsNotNone(self.trade.ledger.state.get('pending_rotation'))
+
+    def test_cancel_backlog_stays_owned_and_distance_ranked_without_competing_in_fast_plan(self):
+        from v9711_live.execution import runner
+        old, _ = self.prime_full_book_replacements()
+        victims = list(old)[:3]
+        seen = []
+        original = runner.select_physical_orders
+        def select(desired, tracked, **kwargs):
+            seen.append(set(tracked))
+            return original(desired, tracked, **kwargs)
+        with self.trade.entry_cancel_plan():
+            for symbol in victims:
+                self.trade._request_cancel(symbol, self.trade.tracked[symbol], 'previous_cancel')
+            event = self.trade.market.events.get_nowait()
+            with patch.object(runner, 'select_physical_orders', side_effect=select):
+                self.trade.market.decide(event, self.trade.on_tick)
+            self.trade.market.events.task_done()
+            self.assertTrue(seen)
+            self.assertFalse(set(victims) & set.union(*seen))
+            for symbol in victims:
+                self.assertEqual(self.trade.tracked[symbol]['client_order_id'], old[symbol])
+                self.assertEqual(self.trade._cancel_prices[symbol], 1.02)
+            self.trade._refresh_entry_cancel_plan()
+            rows = self.trade._network_io._entry_cancel_orders
+            for symbol in victims:
+                key = ('cancel', symbol, old[symbol], self.trade.tracked[symbol]['order_id'])
+                self.assertEqual(rows[key]['price'], 1.02)
+
+    def test_maintenance_full_universe_plans_once_even_with_multiple_replacements(self):
+        self.prime_full_book_replacements()
+        while not self.trade.market.events.empty():
+            event = self.trade.market.events.get_nowait()
+            if event is not None:
+                self.trade.market.decide(event, lambda event: None)
+            self.trade.market.events.task_done()
+        snapshot, status = self.trade.desired_snapshot(now=self.case.now)
+        self.assertFalse(self.trade._fast_tick)
+        with patch.object(self.trade, '_execute_entries_with_prices',
+                          wraps=self.trade._execute_entries_with_prices) as execute:
+            self.trade._execute_entries(snapshot, status, now=self.case.now,
+                                        targets={}, final_exit_bar=False)
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(len(self.trade.tracked), 9)
+
+    def test_optional_exit_milliseconds_use_same_identity_before_and_after_planner(self):
+        from v9711_live.execution.logic import Row
+        raw = dict(self.case.templates[0], observed_price=1.01, gap=.01)
+        normalized = Row.from_dict(raw)
+        canonical = dict(raw, exit_due_ms=normalized.exit_due_ms)
+        self.assertEqual(self.trade._entry_plan_signature(raw), self.trade._entry_plan_signature(canonical))
+        self.trade.ledger.state['rotated_out_plans']['old'] = dict(symbol=raw['symbol'],
+            plan_signature=self.trade._entry_plan_signature(canonical), retryable=False)
+        self.assertTrue(self.trade._entry_submission_blocked(raw))
+        self.assertTrue(self.trade._entry_submission_blocked(canonical))
+
+    def test_batch_keeps_repeated_symbol_rebound_and_final_live_guard_rejects_it(self):
+        self.prime_distinct_batch()
+        for symbol, price in (('N0USDT', '.99'), ('N1USDT', '.99'), ('N1USDT', '1.03')):
+            self.trade.market.update(symbol, price, int(self.case.now*1000))
+        first = self.trade.market.events.get_nowait()
+        self.trade.market.decide(first, self.trade.on_tick)
+        self.trade.market.events.task_done()
+        rebound = self.trade.market.events.get_nowait()
+        self.assertEqual((rebound.symbol, rebound.price), ('N1USDT', '1.03'))
+        self.trade.market.decide(rebound, self.trade.on_tick)
+        self.trade.market.events.task_done()
+        self.wait_done()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.trade.session_entries.timings.order(self.sent[0])['symbol'], 'N0USDT')
 
     def test_owner_continues_quotes_and_reserves_eight_while_disk_blocked_then_sends_exactly_once(self):
         started = self.block_disk()
@@ -336,7 +498,7 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.assertFalse(self.sent)
 
     def test_failed_disk_never_calls_exchange(self):
-        with patch.object(module, 'atomic_write_text', side_effect=OSError('simulated disk failure')):
+        with patch.object(module, 'commit_snapshot_slot', side_effect=OSError('simulated disk failure')):
             self.case.event('N0USDT')
             self.wait_done()
             self.assertFalse(self.sent)
@@ -359,12 +521,48 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.wait_done()
         self.assertFalse(self.sent)
 
+    def test_stalled_background_signal_read_cannot_send_after_publication_expires(self):
+        self.case.templates = self.case.templates[:1]
+        self.case.publish()
+        self.trade.enable_signal_reader()
+        reader = self.trade._signal_reader
+        deadline = time.perf_counter()+1
+        while not reader.healthy() and time.perf_counter() < deadline:
+            threading.Event().wait(.001)
+        self.assertTrue(reader.healthy())
+        started = self.block_disk()
+        self.trade.market.update('N0USDT', '1.01', int(self.case.now*1000))
+        while not self.trade.market.events.empty():
+            event = self.trade.market.events.get_nowait()
+            if event is not None:
+                self.trade.market.decide(event, self.trade.on_tick)
+            self.trade.market.events.task_done()
+        self.assertTrue(started.wait(1))
+        reading, resume = threading.Event(), threading.Event()
+        original = reader.source.read
+        def stalled():
+            reading.set()
+            resume.wait(2)
+            return original()
+        try:
+            with patch.object(reader.source, 'read', side_effect=stalled):
+                self.assertTrue(reading.wait(1))
+                reader._max_age = .01
+                threading.Event().wait(.02)
+                self.assertFalse(reader.healthy())
+                self.release.set()
+                self.wait_done()
+                self.assertFalse(self.sent)
+        finally:
+            resume.set()
+
     def test_network_ticket_cannot_send_an_identity_absent_from_coalesced_snapshot(self):
         self.case.templates = self.case.templates[:1]
         self.case.publish()
         started = self.block_disk()
         # Occupy the active write so the entry ticket belongs to the pending
         # group, which is then superseded before any positive receipt.
+        self.trade.ledger.state['_test_changed_snapshot'] = True
         self.trade.ledger.flush_for_dispatch()
         self.assertTrue(started.wait(1))
         self.case.event('N0USDT')

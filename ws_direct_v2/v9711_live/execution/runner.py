@@ -447,7 +447,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 int(self._finite(row.get('reference_bar_open_ms'))),
                 self._finite(row.get('limit_price')), self._finite(row.get('notional')),
                 self._finite(row.get('exit_due_epoch')),
-                int(self._finite(row.get('exit_due_ms')))]
+                int(self._finite(row.get('exit_due_ms'), self._finite(row.get('exit_due_epoch'))*1000.0))]
 
     def _note_entry_absence(self, symbol: str, row: Mapping[str, Any], *, now: float) -> None:
         """A retry needs exact negative evidence AND a live desired plan later."""
@@ -730,7 +730,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                      timing.get('response_epoch_ms'), timing.get('owner_ack_epoch_ms'),
                      timing.get('transport'), timing.get('latencies_ms'))
             self.ledger.save()
-        self._run_network(('entry', symbol, client_id), send, complete, priority=10,
+        self._run_network(('entry', symbol, client_id), send, complete, priority=1,
             entry_request=None if following else dict(symbol=symbol, client_order_id=client_id, limit_price=price,
                                                      notional=notional, order_bar_open_ms=bar_ms))
 
@@ -1039,8 +1039,15 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 filtered_entries[symbol or '<missing-symbol>'] = (
                     'order_bar_mismatch' if row_bar != bar_ms else 'missing_or_stale_price_or_invalid_limit')
         tracked_view = {}
+        pending_victim = (self.ledger.state.get('pending_rotation') or {}).get('victim')
         for symbol, old in self.tracked.items():
             if old.get('signal_follow'):
+                continue
+            if (getattr(self, '_fast_tick', False) and self._network_io is not None and old.get('cancel_requested')
+                    and symbol != pending_victim):
+                # Already paced independently. Keep the exact identity in
+                # self.tracked and reconcile/retry in maintenance; it cannot
+                # compete for an active entry slot on every fresh quote.
                 continue
             item = dict(old)
             price = self._finite(price_map.get(symbol), float('nan'))

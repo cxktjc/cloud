@@ -52,10 +52,16 @@ def entry_timing_lines(timing):
               ('durable_to_send', '落盘后→发送'), ('worker_to_send', '线程→发送'),
               ('send_to_response', '发送→回包'), ('response_to_owner', '回包→主线程确认'))
     delays = timing.get('latencies_ms') or {}
+    if 'write_started_to_persisted' in delays:
+        labels = (('quote_to_decision', '收行情→判断'), ('decision_to_registered', '判断→登记'),
+                  ('registered_to_write_started', '保存排队'), ('write_started_to_persisted', '保存'),
+                  ('persisted_to_durable', '保存后→线程'), ('durable_to_send', '线程→发送'),
+                  ('send_to_response', '发送→回包'), ('response_to_owner', '回包→主线程确认'))
     details = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in labels if key in delays
                       and (key != 'worker_to_send' or 'durable_to_send' not in delays))
     stages = (f'      该单登记={iso_ms(timing.get("registered_epoch_ms"))} '
-              +(f'落盘完成={iso_ms(timing["durable_epoch_ms"])} ' if timing.get('durable_epoch_ms') else '')
+              +(f'落盘完成={iso_ms(timing.get("persisted_epoch_ms") or timing["durable_epoch_ms"])} '
+                if timing.get('persisted_epoch_ms') or timing.get('durable_epoch_ms') else '')
               +f'回包={iso_ms(timing.get("response_epoch_ms"))} '
               f'主线程确认={iso_ms(timing.get("owner_ack_epoch_ms"))}')
     extra = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
@@ -240,15 +246,25 @@ class TradeTerminalView:
                              f'最大={latency.get("max_ms")} ≤10ms={latency.get("within_10ms")}/{latency.get("samples")}')
                 stages = latency.get('stages') or {}
                 if stages:
-                    parts = [f'{label}={(stages.get(key) or {}).get("p95_ms")}' for key, label in (
+                    edges = (
                         ('queue_wait', '排队'), ('dequeued_to_decision', '选单'),
                         ('decision_to_registered', '登记快照'), ('registered_to_worker', 'worker调度'),
-                        ('worker_to_durable', '等待落盘'), ('durable_to_send', '落盘后发送'))]
+                        ('worker_to_durable', '等待落盘'), ('durable_to_send', '落盘后发送'))
+                    if (stages.get('write_started_to_persisted') or {}).get('samples'):
+                        edges = (('queue_wait', '排队'), ('dequeued_to_decision', '选单'),
+                                 ('decision_to_registered', '登记快照'),
+                                 ('registered_to_persisted', '保存等待'),
+                                 ('persisted_to_durable', '保存后调度'), ('durable_to_send', '发送准备'))
+                    parts = [f'{label}={(stages.get(key) or {}).get("p95_ms")}' for key, label in edges]
                     lines.insert(-1, '已发送订单分段P95(ms): '+ ' '.join(parts)+'；各段分位数不可相加')
                     if (stages.get('persisted_to_durable') or {}).get('samples'):
                         lines.insert(-1, '落盘等待细分P95(ms): 登记→保存回执就绪='
                                      f'{stages["registered_to_persisted"].get("p95_ms")} '
                                      f'回执就绪→worker续发={stages["persisted_to_durable"].get("p95_ms")}')
+                    if (stages.get('write_started_to_persisted') or {}).get('samples'):
+                        lines.insert(-1, '保存细分P95(ms): 登记→开始保存='
+                                     f'{(stages.get("registered_to_write_started") or {}).get("p95_ms")} '
+                                     f'开始保存→回执={stages["write_started_to_persisted"].get("p95_ms")}')
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
                 lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '
@@ -263,12 +279,15 @@ class TradeTerminalView:
             writer = ws.get('feedback_writer') or {}
             durability = ws.get('durability_writer') or {}
             if durability.get('enabled'):
+                storage = ('双槽单次同步='+str((durability.get('file_write_ms') or {}).get('state', 0))+'ms '
+                           if durability.get('persistent_slots') else
+                           f'intents/state={(durability.get("file_write_ms") or {}).get("intents", 0):.3f}/'
+                           f'{(durability.get("file_write_ms") or {}).get("state", 0):.3f}ms ')
                 lines.insert(-1, f'订单账本后台写盘: 写入中={int(durability.get("writing", False))} '
                              f'待写={durability.get("pending", 0)} 合并={durability.get("coalesced", 0)} '
                              f'最近={durability.get("last_write_ms", 0):.3f}ms '
                              f'快照排队={durability.get("queue_wait_ms", 0):.3f}ms '
-                             f'intents/state={(durability.get("file_write_ms") or {}).get("intents", 0):.3f}/'
-                             f'{(durability.get("file_write_ms") or {}).get("state", 0):.3f}ms '
+                             +storage+
                              f'失败={durability.get("failures", 0)} 错误={durability.get("error") or "无"}；落盘成功后才发单')
             if writer.get('enabled'):
                 lines.insert(-1, f'反馈写盘: 后台待写={writer.get("pending", 0)} '

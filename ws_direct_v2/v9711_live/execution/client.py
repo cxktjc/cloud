@@ -55,14 +55,18 @@ class OwnershipLedger:
                  state_path: Path = cfg.EXECUTION_LEDGER_FILE):
         self.path = Path(path)
         self.state_path = Path(state_path)
-        self.intents = self._load(self.path, 'intents', {})
-        self.state = self._load(self.state_path, 'state', {
+        from .durable_writer import embedded_intents, resolve_store
+        state_payload = resolve_store(read_json(self.state_path) or {}, self.state_path)
+        canonical = embedded_intents(state_payload)
+        self.intents = dict(canonical) if canonical is not None else self._load(self.path, 'intents', {})
+        initial_state = {
             'schema_version': 1,
             'tracked_orders': {},
             'owned_positions': {},
             'reopen_until_epoch': {},
             'realized_balance': cfg.EQUITY0,
-        })
+        }
+        self.state = dict(state_payload['state']) if isinstance(state_payload.get('state'), Mapping) else initial_state
         self.state.setdefault('tracked_orders', {})
         self.state.setdefault('owned_positions', {})
         self.state.setdefault('reopen_until_epoch', {})
@@ -77,6 +81,7 @@ class OwnershipLedger:
         self._background = None
         self._background_closed = False
         self._last_barrier = None
+        self._dispatch_group = None
 
     def _recover_native_slot_intents(self):
         # A crash between the two atomic file replacements can leave a native
@@ -147,6 +152,9 @@ class OwnershipLedger:
     def flush(self) -> None:
         if self._background is not None:
             self.flush_for_dispatch().result()
+            export = getattr(self._background, 'export_intents', None)
+            if export is not None:
+                export()
             return
         # A successful save is still durable before dispatch. Unchanged files
         # need no new fsync; cache each document ONLY after its replace succeeds
@@ -167,13 +175,29 @@ class OwnershipLedger:
             return self.flush_for_dispatch()
         return self._last_barrier
 
-    def enable_background(self):
+    def enable_background(self, *, atomic_bundle=False, persistent_slots=False):
         if self._background is None:
-            from .durable_writer import DurableWriter
-            self._background = DurableWriter(self.path, self.state_path,
+            from .durable_writer import BundleWriter, DurableWriter, SlotWriter
+            writer = SlotWriter if persistent_slots else BundleWriter if atomic_bundle else DurableWriter
+            self._background = writer(self.path, self.state_path,
                 saved=(self._saved_intents, self._saved_state))
+            if persistent_slots:
+                # Pre-open/seed both slots before WS ingress starts. No entry
+                # is allowed to pay first-time initialization at its crossing.
+                try:
+                    self.flush_for_dispatch().result()
+                except BaseException:
+                    try:
+                        self._background.close()
+                    finally:
+                        self._background = self._last_barrier = None
+                    raise
 
     def flush_for_dispatch(self):
+        if self._dispatch_group is not None:
+            self._save_pending = True
+            self._last_barrier = self._dispatch_group
+            return self._dispatch_group
         if self._background is None:
             self.flush()
             return None
@@ -191,6 +215,38 @@ class OwnershipLedger:
             encode(self.intents), encode(self.state), frozenset(reservations)))
         self._save_pending = False
         return self._last_barrier
+
+    @contextmanager
+    def dispatch_group(self):
+        """One owner admission plan, one complete snapshot, no early sender.
+
+        Each request receives the group's unresolved positive receipt. Only
+        after all slots/identities have been reserved does the owner serialize
+        and submit the actual snapshot. Nested groups share that same barrier.
+        """
+        if self._background is None or self._dispatch_group is not None:
+            yield
+            return
+        from concurrent.futures import Future
+        group = self._dispatch_group = Future()
+        try:
+            yield
+        finally:
+            self._dispatch_group = None
+            try:
+                barrier = self.flush_for_dispatch()
+            except BaseException as exc:
+                group.set_exception(exc)
+                raise
+            else:
+                def complete(saved):
+                    try:
+                        receipt = saved.result()
+                    except BaseException as exc:
+                        group.set_exception(exc)
+                    else:
+                        group.set_result(receipt)
+                barrier.add_done_callback(complete)
 
     def close_background(self):
         if self._background is not None and not self._background_closed:
@@ -280,6 +336,7 @@ class ExchangeClient(BatchEntryMixin):
         self._meta_cache: dict[str, dict[str, Any]] = {}
         self._metadata_snapshot_enabled = False
         self._metadata_payload = None
+        self._metadata_publication = [None]  # Shared by shallow-copied worker lanes.
         self._meta_revision = -1
         self._prepared_cache = {}
         self._order_queries: dict[str, dict[str, Any]] = {}
@@ -432,17 +489,27 @@ class ExchangeClient(BatchEntryMixin):
             self._broker_last_io_mono = time.monotonic()
 
     def _metadata_view(self):
-        payload = self._metadata_payload if self._metadata_snapshot_enabled else self._metadata_reader.read()
-        if self._meta_revision != self._metadata_reader.revision:
+        publication = self._metadata_publication[0]
+        if publication is None:
+            payload = self._metadata_reader.read()
+            revision = self._metadata_reader.revision
+        else:
+            payload, revision = publication
+        if self._meta_revision != revision:
             self._meta_cache.clear()
             self._prepared_cache.clear()
-            self._meta_revision = self._metadata_reader.revision
+            self._meta_revision = revision
         return payload
 
     def refresh_metadata_snapshot(self):
         """Owner maintenance publishes a revision; workers use memory only."""
+        # Do not hold the worker's precision lock across stat/open/JSON reads.
+        # Until the read completes, senders use the last coherent publication.
+        payload = self._metadata_reader.read()
+        revision = self._metadata_reader.revision
         with self._metadata_lock:
-            self._metadata_payload = self._metadata_reader.read()
+            self._metadata_publication[0] = (payload, revision)
+            self._metadata_payload = payload
             self._metadata_snapshot_enabled = True
             return self._metadata_view()
 
@@ -469,7 +536,8 @@ class ExchangeClient(BatchEntryMixin):
         meta['tick_text'] = str(item['tick'])
         meta['step_text'] = str(item['step'])
         with self._metadata_lock:
-            if payload is (self._metadata_payload if self._metadata_snapshot_enabled else self._metadata_reader.payload):
+            publication = self._metadata_publication[0]
+            if payload is (publication[0] if publication is not None else self._metadata_reader.payload):
                 self._meta_cache[symbol] = meta
         return meta
 

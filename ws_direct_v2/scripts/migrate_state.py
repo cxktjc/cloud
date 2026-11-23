@@ -45,6 +45,15 @@ def migrate(source, destination, *, apply=False):
                 payloads[name] = raw
         if not isinstance(json.loads(payloads['execution_ledger.json']).get('state'), dict):
             raise ValueError('legacy execution ledger has no state object')
+        # Export the current complete bundle, never copy an epoch marker
+        # without its slot files or revive the older compatibility intents.
+        from v9711_live.execution.durable_writer import resolve_store, embedded_intents
+        execution = resolve_store(json.loads(payloads['execution_ledger.json']), source/'execution_ledger.json')
+        canonical = embedded_intents(execution)
+        if canonical is not None:
+            payloads['execution_ledger.json'] = json.dumps(execution, ensure_ascii=False, allow_nan=False).encode('utf-8')
+            payloads['execution_intents.json'] = json.dumps(dict(schema_version=1, component='execution',
+                intents=canonical), ensure_ascii=False, allow_nan=False).encode('utf-8')
         if any((destination/name).exists() for name in FILES):
             raise ValueError('destination changed during migration; refusing overwrite')
         marker = destination/'.migration_in_progress'

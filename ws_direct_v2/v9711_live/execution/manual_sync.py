@@ -30,7 +30,7 @@ KIND = 'manual_signal_to_trade_v1'
 # The receipt is committed last. A pending journal blocks ALL trade startups.
 FILES = ('execution_intents.json', 'execution_ledger.json',
          'execution_feedback.json', 'WS_MIGRATION.json')
-BACKUP_FILES = (*FILES, cfg.SIGNAL_BOOK_FILENAME)
+BACKUP_FILES = (*FILES, cfg.SIGNAL_BOOK_FILENAME, 'execution_ledger.json.dispatch0', 'execution_ledger.json.dispatch1')
 
 
 def _encode(data):
@@ -47,6 +47,9 @@ def _read(path, default=None):
     data = json.loads(path.read_text(encoding='utf-8-sig'))
     if not isinstance(data, dict):
         raise ValueError(f'invalid JSON object at {path}; no reset')
+    if path.name == 'execution_ledger.json':
+        from .durable_writer import resolve_store
+        data = resolve_store(data, path)
     return data
 
 
@@ -245,6 +248,11 @@ def sync(state_dir, *, prices=None, symbols=None, apply=False, candidates=None, 
         state_payload = _read(state_dir/FILES[1], {'schema_version':1, 'component':'execution', 'state':{}})
         intent_payload = _read(state_dir/FILES[0], {'schema_version':1, 'component':'execution', 'intents':{}})
         state, intents = state_payload.get('state'), intent_payload.get('intents')
+        from .durable_writer import embedded_intents
+        canonical = embedded_intents(state_payload)
+        if canonical is not None:
+            intents = canonical
+            intent_payload = dict(schema_version=1, component='execution', intents=canonical)
         if not isinstance(state, dict) or not isinstance(intents, dict):
             raise ValueError('invalid current execution state/intents; no reset')
         if not paper and (_simulated(state_payload) or _simulated(intent_payload)):

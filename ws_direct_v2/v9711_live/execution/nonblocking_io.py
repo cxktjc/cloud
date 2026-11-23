@@ -41,10 +41,12 @@ class _Job:
     state: str = 'queued'
     value: Any = None
     error: BaseException | None = None
+    ready: Any = None
 
 
 class NetworkIO(EntryCancelPacing):
     def __init__(self, max_jobs: int = 64, workers: int | None = None, *,
+                 max_entry_cancels: int = 1024,
                  cancel_interval_seconds: float = ENTRY_CANCEL_INTERVAL_SECONDS,
                  cancel_clock: Callable[[], float] | None = None,
                  worker_start: Callable[[], None] | None = None,
@@ -53,6 +55,9 @@ class NetworkIO(EntryCancelPacing):
         if not 1 <= workers <= 19:
             raise ValueError('I/O workers must be between 1 and 19')
         self.worker_count = workers
+        # With the default 19 workers, keep eight available for fresh entries
+        # and urgent closes even if remote exact-order queries await replies.
+        self._query_workers = workers-cfg.MAX_PENDING_ORDERS if workers > cfg.MAX_PENDING_ORDERS else workers
         self.worker_exit = None
         self._worker_start = worker_start
         self._owner_wake = owner_wake
@@ -61,16 +66,21 @@ class NetworkIO(EntryCancelPacing):
         self._completed_callbacks = threading.Event()
         self.callback_limit = None
         self.callback_budget_seconds = None
+        self.last_drain_urgent = False
         self._valid_query_keys = None
         self._query_keys = set()  # Only the owner adds/retires exact query identities.
         self._owner = threading.get_ident()
         self._condition = threading.Condition()
         self._jobs: dict[tuple, _Job] = {}
+        self._watched_ready = set()
         self._aliases: dict[tuple, tuple] = {}
         self._heap: list[tuple[int, int, tuple]] = []
         self._sequence = itertools.count()
         self._closed = False
         self._max_jobs = max_jobs
+        if max_jobs < 1 or max_entry_cancels < 1:
+            raise ValueError('network queue capacities must be positive')
+        self._max_entry_cancels = max_entry_cancels
         self._entry_gate: dict[str, Any] = {}
         self._init_entry_cancels(interval=cancel_interval_seconds, clock=cancel_clock)
         self._threads = [threading.Thread(target=self._loop, name=f'v9711-network-io-{i}',
@@ -92,19 +102,24 @@ class NetworkIO(EntryCancelPacing):
 
     def submit(self, key: tuple, work: Callable[[], Any], *, priority: int,
                done: Callable[[Any, BaseException | None], None] | None = None,
-               aliases: tuple[tuple, ...] = (), entry_cancel: bool = False) -> bool:
+               aliases: tuple[tuple, ...] = (), entry_cancel: bool = False,
+               ready: Any = None) -> bool:
         self._assert_owner()
         with self._condition:
             if key in self._jobs or key in self._aliases:
                 return False
             if any(a in self._jobs or a in self._aliases for a in aliases):
                 raise ConfirmedSubmitRejection('duplicate exact batch member; request never sent')
-            if self._closed or len(self._jobs) >= self._max_jobs:
+            lane = 'cancel' if entry_cancel else 'query' if key[0] == 'query' else 'mutation'
+            used = sum(('cancel' if j.entry_cancel else 'query' if j.key[0] == 'query' else 'mutation') == lane
+                       for j in self._jobs.values())
+            capacity = self._max_entry_cancels if entry_cancel else self._max_jobs
+            if self._closed or used >= capacity:
                 raise ConfirmedSubmitRejection('local I/O queue unavailable; request never sent')
             identities = aliases or (key,)
             symbols = frozenset(str(k[2] if k[0] == 'query' else k[1]) for k in identities)
             self._jobs[key] = _Job(key, work, done, priority, symbols, aliases,
-                                   entry_cancel=bool(entry_cancel))
+                                   entry_cancel=bool(entry_cancel), ready=ready)
             if key[0] == 'query':
                 self._valid_query_keys = None
                 self._query_keys.add(key)
@@ -113,8 +128,20 @@ class NetworkIO(EntryCancelPacing):
             heapq.heappush(self._heap, (priority, next(self._sequence), key))
             # One new job needs one idle worker. Waking all 19 on every entry
             # creates avoidable GIL/condition contention during a burst.
-            self._condition.notify(1)
+            if ready is None or ready.done():
+                self._condition.notify(1)
+            elif ready not in self._watched_ready:
+                # A durable write does not occupy a network worker. The
+                # writer signals readiness without touching owner accounting.
+                self._watched_ready.add(ready)
+                ready.add_done_callback(self._job_ready)
         return True
+
+    def _job_ready(self, future):
+        with self._condition:
+            self._watched_ready.discard(future)
+            if not self._closed:
+                self._wake_queued()
 
     def poll(self, key: tuple, work: Callable[[], Any], *, priority: int = 20) -> Any:
         self._assert_owner()
@@ -132,6 +159,7 @@ class NetworkIO(EntryCancelPacing):
     def drain(self) -> int:
         """Apply completed mutations on owner only; never wait for a worker."""
         self._assert_owner()
+        self.last_drain_urgent = False
         if not self._completed_callbacks.is_set():
             return 0
         with self._condition:
@@ -152,13 +180,29 @@ class NetworkIO(EntryCancelPacing):
             except BaseException:
                 self._completed_callbacks.set()  # accounting/save must retry on the owner
                 raise
+            # NEW/zero-fill entry ACK only adds exchange identity evidence.
+            # Its owner callback has already saved it and published the gate.
+            # All fills, cancels, rejects and uncertain results remain urgent.
+            value = job.value
+            try:
+                ordinary_ack = (job.key[0] == 'entry' and job.error is None
+                    and isinstance(value, dict) and str(value.get('status')).upper() == 'NEW'
+                    and str(value.get('orderId') or '') not in ('', '0')
+                    and value.get('symbol') == job.key[1] and value.get('clientOrderId') == job.key[2]
+                    and float(value.get('executedQty', 'nan')) == 0.)
+            except (ValueError, TypeError, OverflowError):
+                ordinary_ack = False
+            self.last_drain_urgent |= not ordinary_ack
             with self._condition:
                 if self._jobs.get(job.key) is job:
                     self._jobs.pop(job.key)
                     for alias in job.aliases:
                         self._aliases.pop(alias, None)
-                self._condition.notify_all()
+                self._wake_queued()
             count += 1
+        # A time-budgeted tail may contain a fill/reject. Never classify an
+        # uninspected completion as a harmless NEW acknowledgment.
+        self.last_drain_urgent |= self._completed_callbacks.is_set()
         return count
 
     def prune_queries(self, valid: set[tuple]) -> None:
@@ -219,14 +263,23 @@ class NetworkIO(EntryCancelPacing):
                 j.state == 'done' and j.done is not None for j in self._jobs.values()):
             return None
         busy = set().union(*(j.symbols for j in self._jobs.values()
-            if j.state == 'running' or j.state == 'done' and j.done is not None))
+            if j.state == 'running' or j.state == 'done' and j.done is not None
+            or j.state == 'queued' and j.ready is not None and not j.ready.done()))
         deferred = []
         selected = None
         next_cancel = self._next_entry_cancel()
+        query_slots = self._query_workers-sum(j.key[0] == 'query' and j.state == 'running'
+                                            for j in self._jobs.values())
         while self._heap:
             ticket = heapq.heappop(self._heap)
             job = self._jobs.get(ticket[2])
             if job is None or job.state != 'queued':
+                continue
+            if job.ready is not None and not job.ready.done():
+                deferred.append(ticket)
+                continue
+            if job.key[0] == 'query' and query_slots <= 0:
+                deferred.append(ticket)
                 continue
             if job.entry_cancel and job is not next_cancel:
                 deferred.append(ticket)
@@ -239,6 +292,26 @@ class NetworkIO(EntryCancelPacing):
         for ticket in deferred:
             heapq.heappush(self._heap, ticket)
         return selected
+
+    def _wake_queued(self):
+        # Called under _condition. A completed request/owner ACK must not
+        # awaken 19 idle workers when there is no work. Broadcasts made the
+        # quote owner and newly durable entries compete with empty scanners.
+        queued = [job for job in self._jobs.values() if job.state == 'queued']
+        if not queued:
+            return
+        busy = set().union(*(job.symbols for job in self._jobs.values()
+            if job.state == 'running' or job.state == 'done' and job.done is not None
+            or job.state == 'queued' and job.ready is not None and not job.ready.done()))
+        next_cancel = self._next_entry_cancel()
+        eligible = [job for job in queued if (job.ready is None or job.ready.done()) and not job.symbols & busy
+                    and (not job.entry_cancel or job is next_cancel)]
+        query_slots = max(0, self._query_workers-sum(j.key[0] == 'query' and j.state == 'running'
+                                                  for j in self._jobs.values()))
+        queries = sum(job.key[0] == 'query' for job in eligible)
+        count = len(eligible)-queries+min(queries, query_slots)
+        if count:
+            self._condition.notify(min(count, self.worker_count))
 
     def _loop(self) -> None:
         try:
@@ -278,7 +351,7 @@ class NetworkIO(EntryCancelPacing):
                     job.value, job.error, job.state = value, error, 'done'
                     if job.done is not None:
                         self._completed_callbacks.set()
-                    self._condition.notify_all()
+                    self._wake_queued()
                 if job.done is not None and self._owner_wake is not None:
                     self._owner_wake()
 
@@ -386,7 +459,7 @@ class NetworkTradeMixin:
                 group = items[start:start + 5]
                 if len(group) == 1:
                     key, work, done, request = group[0]
-                    self._run_network(key, work, done, priority=10)
+                    self._run_network(key, work, done, priority=1)
                 else:
                     aliases = tuple(item[0] for item in group)
                     key = ('entry_batch', aliases)
@@ -399,7 +472,7 @@ class NetworkTradeMixin:
                             value, member_error = (None, error) if error else values.get(
                                 member_key[2], (None, RuntimeError('batch member result missing; exact fate unknown')))
                             done(value, member_error)
-                    self._run_network(key, send, complete, priority=10, aliases=aliases)
+                    self._run_network(key, send, complete, priority=1, aliases=aliases)
 
     def _run_network(self, key: tuple, work: Callable[[], Any],
                      done: Callable[[Any, BaseException | None], None], *, priority: int,
@@ -432,6 +505,8 @@ class NetworkTradeMixin:
                     raise ConfirmedSubmitRejection('durable reservation superseded; request never sent')
                 for item in identities:
                     if item[0] == 'entry':
+                        if receipt.write_started_ns:
+                            timings.mark_at(item[2], 'write_started', receipt.write_started_ns, receipt.write_started_epoch_ms)
                         if receipt.completed_ns:
                             timings.mark_at(item[2], 'persisted', receipt.completed_ns, receipt.completed_epoch_ms)
                         timings.mark(item[2], 'durable')
@@ -451,7 +526,7 @@ class NetworkTradeMixin:
                 self._publish_entry_gate()
         try:
             self._network_io.submit(key, work, priority=priority, done=complete,
-                                    aliases=aliases, entry_cancel=entry_cancel)
+                                    aliases=aliases, entry_cancel=entry_cancel, ready=barrier)
         except ConfirmedSubmitRejection as exc:
             complete(None, exc)
 
@@ -461,7 +536,11 @@ class NetworkTradeMixin:
 
     def _drain_network(self) -> int:
         if self._network_io is not None:
-            completed = self._network_io.drain()
+            # Apply one bounded callback turn as one owner save. Network wake
+            # turns run outside maintenance's existing batch; serializing the
+            # whole ledger after every NEW ACK needlessly delayed quote intake.
+            with self.ledger.batch_saves():
+                completed = self._network_io.drain()
             if not self._network_io._query_keys:
                 return completed
             valid = set()

@@ -101,6 +101,54 @@ class PrecisionSnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'metadata missing'):
             self.client.prepare_limit('XUSDT', .0179, 5)
 
+    def test_existing_worker_lane_receives_new_precision_and_invalid_publications(self):
+        self.client.refresh_metadata_snapshot()
+        lane = self.client._worker_transport()
+        self.assertEqual(lane.prepare_limit('XUSDT', .0179, 5)['price'], '0.017')
+        self.write('.01', '10')
+        self.client.refresh_metadata_snapshot()
+        changed = lane.prepare_limit('XUSDT', .0179, 5)
+        self.assertEqual(changed['price'], '0.01')
+        self.assertEqual(float(changed['qty']) % 10, 0)
+        self.path.write_text('{invalid')
+        self.client.refresh_metadata_snapshot()
+        with self.assertRaisesRegex(ValueError, 'metadata missing'):
+            lane.prepare_limit('XUSDT', .0179, 5)
+
+    def test_slow_metadata_file_read_cannot_hold_worker_precision_lock(self):
+        self.client.refresh_metadata_snapshot()
+        lane = self.client._worker_transport()
+        started, release, done = threading.Event(), threading.Event(), threading.Event()
+        results, errors = [], []
+        original = self.client._metadata_reader.read
+        def blocked():
+            started.set()
+            release.wait(2)
+            return original()
+        def prepare():
+            try:
+                results.append(lane.prepare_limit('XUSDT', .0179, 5)['price'])
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+        refresh = threading.Thread(target=self.client.refresh_metadata_snapshot)
+        sender = threading.Thread(target=prepare)
+        with patch.object(self.client._metadata_reader, 'read', side_effect=blocked):
+            try:
+                refresh.start()
+                self.assertTrue(started.wait(1))
+                sender.start()
+                self.assertTrue(done.wait(.5), 'sender waited for metadata file I/O')
+                self.assertEqual(results, ['0.017'])
+                self.assertFalse(errors)
+                self.assertFalse(release.is_set())
+            finally:
+                release.set()
+                refresh.join(2)
+                if sender.ident is not None:
+                    sender.join(2)
+
 
 class IndependentRotationTests(unittest.TestCase):
     def test_another_queued_cancel_cannot_block_relative_replacement(self):

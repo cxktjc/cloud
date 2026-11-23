@@ -17,6 +17,22 @@ from v9711_live.execution.terminal import entry_timing_lines, TradeTerminalView
 
 
 class EntryLatencyTests(unittest.TestCase):
+    def test_summary_only_visits_recent_512_but_old_exact_order_records_remain(self):
+        timing = EntryTimings()
+        for index in range(600):
+            cid = str(index)
+            timing.register('XUSDT', cid, dict(_entry_timing_context=dict(_received_ns=1_000_000,
+                _event_received_ns=1_000_000)))
+            timing.mark_at(cid, 'send', 2_000_000 if index else 10_000_000_000, self.now*1000)
+        class NoFullScan(dict):
+            def values(self):
+                raise AssertionError('summary scanned full process history')
+        timing._rows = NoFullScan(timing._rows)
+        result = timing.summary()
+        self.assertEqual(result['samples'], 512)
+        self.assertEqual(result['max_ms'], 1)
+        self.assertEqual(timing.order('0')['latencies_ms']['quote_to_send'], 9999)
+
     def setUp(self):
         self.bar = 1800000
         self.now = self.bar/1000+39

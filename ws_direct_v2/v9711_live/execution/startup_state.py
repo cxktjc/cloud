@@ -54,6 +54,14 @@ def _read_pair(directory):
                 if not isinstance(data[key].get(field, {}), dict):
                     raise RuntimeError(f'invalid {field} at {path}')
         result[name] = raw
+    from .durable_writer import embedded_intents, resolve_store
+    state_payload = resolve_store(json.loads(result[FILES[1]]), directory/FILES[1])
+    if state_payload.get('execution_bundle_version'):
+        result[FILES[1]] = json.dumps(state_payload, ensure_ascii=False, allow_nan=False).encode('utf-8')
+    canonical = embedded_intents(state_payload)
+    if canonical is not None:
+        result[FILES[0]] = json.dumps(dict(schema_version=1, component='execution', intents=canonical),
+                                    ensure_ascii=False, allow_nan=False).encode('utf-8')
     # Feedback is a display snapshot, not evidence that durable orders are fake.
     if any(_simulated(json.loads(raw)) for raw in result.values()):
         raise SimulatedHistory(directory, result)

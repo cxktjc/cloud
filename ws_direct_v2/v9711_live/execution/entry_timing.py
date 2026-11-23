@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 
 
 class EntryTimings:
@@ -10,6 +11,7 @@ class EntryTimings:
         self._lock = threading.RLock()
         self._rows = {}
         self._plans = {}
+        self._recent = deque(maxlen=512)
         self.revision = 0
 
     def register(self, symbol, cid, row, *, session_id=''):
@@ -22,6 +24,7 @@ class EntryTimings:
                 order_bar_open_ms=int(row.get('order_bar_open_ms') or 0))
             key = (symbol, int(row.get('order_bar_open_ms') or 0), str(session_id or ''))
             self._plans.setdefault(key, []).append(cid)
+            self._recent.append(cid)
             self.revision += 1
 
     def mark(self, cid, stage, *, transport=None):
@@ -65,6 +68,8 @@ class EntryTimings:
                  ('registered_to_worker', 'registered', 'worker'),
                  ('worker_to_durable', 'worker', 'durable'),
                  ('registered_to_persisted', 'registered', 'persisted'),
+                 ('registered_to_write_started', 'registered', 'write_started'),
+                 ('write_started_to_persisted', 'write_started', 'persisted'),
                  ('persisted_to_durable', 'persisted', 'durable'),
                  ('durable_to_send', 'durable', 'send'),
                  ('worker_to_send', 'worker', 'send'),
@@ -101,13 +106,13 @@ class EntryTimings:
                         latest=self._public(matches[-1]) if matches else {})
 
     def summary(self):
-        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'persisted', 'durable', 'send')
+        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'write_started', 'persisted', 'durable', 'send')
         keys = tuple('_'+name+'_ns' for name in fields)
         with self._lock:
             # Copy only bounded timestamp fields, then sort outside the lock.
             # Aggregation runs during feedback, never inside quote selection.
             rows = [tuple(r.get(key) for key in keys)
-                    for r in list(self._rows.values())[-512:]]
+                    for r in (self._rows[cid] for cid in self._recent)]
         def summarize(start, end='send'):
             first, last = fields.index(start), fields.index(end)
             values = sorted((r[last]-r[first])/1e6 for r in rows
@@ -127,6 +132,8 @@ class EntryTimings:
             ('registered_to_worker', 'registered', 'worker'),
             ('worker_to_durable', 'worker', 'durable'),
             ('registered_to_persisted', 'registered', 'persisted'),
+            ('registered_to_write_started', 'registered', 'write_started'),
+            ('write_started_to_persisted', 'write_started', 'persisted'),
             ('persisted_to_durable', 'persisted', 'durable'),
             ('durable_to_send', 'durable', 'send'),
             ('worker_to_send', 'worker', 'send'))}
