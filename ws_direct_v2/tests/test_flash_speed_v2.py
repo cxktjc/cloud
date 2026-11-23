@@ -592,8 +592,8 @@ class FlashOwnerTests(unittest.TestCase):
 
 
 class ReboundTransportTests(unittest.TestCase):
-    def test_already_received_rebound_prevents_actual_adapter_dispatch(self):
+    def test_already_received_rebound_does_not_revoke_frozen_admission(self):
         result = benchmark_flash_entry.probe(1, True, rebound=True)
-        self.assertFalse(result['received_rebound_but_guard_used_old_quote'])
-        self.assertEqual(result['sends'], [])
-        self.assertEqual(result['pending_after_callbacks'], 0)
+        self.assertTrue(result['sent_after_rebound_with_frozen_admission'])
+        self.assertEqual(len(result['sends']), 1)
+        self.assertEqual(result['pending_after_callbacks'], 1)

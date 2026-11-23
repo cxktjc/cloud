@@ -356,7 +356,7 @@ class SignalFollowTests(unittest.TestCase):
         self.targets = []
         self.publish()
         self.event()
-        self.now = row['exit_due_epoch'] - 1
+        self.now = row['exit_due_epoch']
         close = Mock()
         self.trade._close_position = close
         self.trade._timed_exits(now=self.now)

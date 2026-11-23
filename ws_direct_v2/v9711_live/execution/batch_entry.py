@@ -19,9 +19,8 @@ LOG = logging.getLogger('v9711_live_trade.entry_quotes')
 
 class BatchEntryMixin:
     def _check_entry_market(self, symbol):
-        # A detailed quote snapshot already validates feed health/freshness.
-        # v2 supplies a separate account gate, so it needn't read both market
-        # sources once here and again in _checked_entry_quote.
+        # v2 uses frozen admission evidence and a separate account gate.
+        # Sending must not fetch WS quotes again after admission.
         account = getattr(self, 'entry_account_guard', None)
         if callable(account):
             if not account():
@@ -46,8 +45,9 @@ class BatchEntryMixin:
     @staticmethod
     def _log_entry_quote(symbol, cid, detail):
         if detail:
-            LOG.info('entry pre-send symbol=%s id=%s 满足=%s tick=%s depth_bid0=%s '
-                     'tick_gap=%s depth_gap=%s gap_ceiling=%s', symbol, cid,
+            stage = 'admission retained' if detail.get('entry_quote_policy') == 'admission_frozen' else 'pre-send'
+            LOG.info('entry %s symbol=%s id=%s 满足=%s tick=%s depth_bid0=%s '
+                     'tick_gap=%s depth_gap=%s gap_ceiling=%s', stage, symbol, cid,
                      detail['entry_qualified_by'], detail['entry_tick'], detail['entry_bid0'],
                      detail['entry_tick_gap'], detail['entry_depth_gap'], detail['entry_gap_ceiling'])
 

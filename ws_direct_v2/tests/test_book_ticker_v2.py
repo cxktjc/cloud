@@ -285,7 +285,7 @@ class DualAdmissionTests(unittest.TestCase):
                 detail = qualify_quote(dict(tick=tick, bid0=bid, source='bid0'), 1., ceiling)
                 self.assertEqual(detail['entry_qualified_by'], expected)
 
-    def test_send_quote_after_reconnect_overrides_intent_display_and_persists(self):
+    def test_changed_book_after_admission_does_not_overwrite_frozen_source(self):
         self.plans()
         client = self.trade.client
         client.enabled, client.dry_run = True, False
@@ -302,12 +302,12 @@ class DualAdmissionTests(unittest.TestCase):
             self.tick(1.01)
         row = self.trade.tracked['N0USDT']
         self.assertEqual(row['entry_qualified_by'], 'tick')
-        self.assertEqual(row['entry_send_quote']['entry_qualified_by'], 'all')
-        self.assertIn('发送满足=all', compact_positions(self.trade.tracked, 12))
+        self.assertEqual(row['entry_send_quote']['entry_qualified_by'], 'tick')
+        self.assertIn('准入满足=tick', compact_positions(self.trade.tracked, 12))
         self.assertIn('满足=tick', '\n'.join(logs.output))
-        self.assertIn('满足=all', '\n'.join(logs.output))
+        self.assertNotIn('满足=all', '\n'.join(logs.output))
         saved = json.loads(cfg.EXECUTION_LEDGER_FILE.read_text())
-        self.assertEqual(saved['state']['tracked_orders']['N0USDT']['entry_send_quote']['entry_qualified_by'], 'all')
+        self.assertEqual(saved['state']['tracked_orders']['N0USDT']['entry_send_quote']['entry_qualified_by'], 'tick')
 
     def test_batch_send_retains_each_members_own_qualification(self):
         self.plans(2)
@@ -334,7 +334,7 @@ class DualAdmissionTests(unittest.TestCase):
         self.event()
         row = self.trade.tracked['AUSDT']
         self.assertEqual(row['entry_qualified_by'], 'signal_follow')
-        self.assertIn('登记满足=signal_follow', compact_positions(self.trade.tracked, 12))
+        self.assertIn('准入满足=signal_follow', compact_positions(self.trade.tracked, 12))
         legacy = dict(symbol='OLDUSDT', client_order_id='old', quantity=1)
         self.assertIn('登记满足=unknown', compact_positions([legacy], 12))
 
@@ -397,7 +397,7 @@ class DualAdmissionTests(unittest.TestCase):
         self.assertTrue(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))
         self.trade.market.update_book('N8USDT', '1.0188001', '2', int(self.now*1000), 3)
         self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
-        self.assertFalse(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))
+        self.assertTrue(self.trade._entry_quote_send_allowed('N8USDT', row['client_order_id'], 1.))
 
     def test_bid_can_admit_with_tick_connection_down(self):
         self.plans()
@@ -415,7 +415,7 @@ class DualAdmissionTests(unittest.TestCase):
         self.assertFalse(self.cancels)
         self.assertEqual(self.trade.tracked['AUSDT']['qty'], original['qty'])
 
-    def test_send_rechecks_current_or_quotes_for_single_and_batch(self):
+    def test_single_and_batch_retain_admitted_quote_after_price_changes(self):
         self.plans()
         self.tick(1.01)
         row = self.trade.tracked['N0USDT']
@@ -432,10 +432,11 @@ class DualAdmissionTests(unittest.TestCase):
         client._broker_call = Mock(side_effect=dispatch)
         request = dict(symbol='N0USDT', client_order_id=row['client_order_id'],
                        order_bar_open_ms=self.bar, limit_price=1., notional=5.)
-        with self.assertRaises(EntryQuoteUnavailable):
-            ExchangeClient.place_limit_for_bar(client, **request)
-        with self.assertRaises(EntryQuoteUnavailable):
-            client._entry_send_check(request)
+        with patch.object(self.trade.market, 'send_quote', side_effect=AssertionError('secondary WS read')):
+            result = ExchangeClient.place_limit_for_bar(client, **request)
+            detail = client._entry_send_check(request)
+        self.assertEqual(result['_entry_send_quote']['entry_tick'], 1.01)
+        self.assertEqual(detail['entry_qualified_by'], 'tick')
         self.trade.market.update_book('N0USDT', '1.018', '2', int(self.now*1000), 1)
         self.trade.market.decide(self.trade.market.events.get_nowait(), lambda event: None)
         ExchangeClient.place_limit_for_bar(client, **request)

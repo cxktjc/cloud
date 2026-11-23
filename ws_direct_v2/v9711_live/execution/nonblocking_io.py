@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from .. import config as cfg
 from .submit_errors import ConfirmedSubmitRejection
+from .entry_quotes import QUOTE_FIELDS
 from .signal_follow import follow_send_allowed, FOLLOW_POSITION_CAP
 from .cancel_pacing import (EntryCancelPacing, ENTRY_CANCEL_INTERVAL_SECONDS,
                             exact_entry_cancel_key)
@@ -402,6 +403,9 @@ class NetworkTradeMixin:
             follow_entries=follow_entries,
             entry_gap_limits={str(row.get('client_order_id')): row.get('entry_gap_ceiling', cfg.CANCEL_GAP)
                               for row in self.tracked.values() if not row.get('signal_follow')},
+            admitted_entry_quotes={str(row.get('client_order_id')):
+                dict(symbol=symbol, **{key: row[key] for key in QUOTE_FIELDS if key in row})
+                for symbol, row in self.tracked.items()},
             # Only the owner reads positions. Workers receive a normalized,
             # immutable snapshot, never signal targets or a mutable ledger.
             position_exit_due_epochs=tuple(self._finite(pos.get('exit_due_epoch'))

@@ -164,17 +164,15 @@ class HotOwnedQuotesTests(unittest.TestCase):
         self.assertTrue(self.trade._entry_submission_blocked(candidate))
         self.assertFalse(self.trade._entry_submission_blocked(dict(candidate, notional=candidate['notional']+1)))
 
-    def test_known_rebound_is_skipped_before_any_identity_or_disk_write(self):
+    def test_qualifying_owner_event_retains_admission_when_newer_ingress_rebounds(self):
         self.plans(1)
         market = self.trade.market
         market.update('N0USDT', '1.01', int(self.now*1000))
         first = market.events.get_nowait()
         market.update('N0USDT', '1.04', int(self.now*1000))
-        with patch.object(self.trade.ledger, 'reserve_entry_client_id', side_effect=AssertionError('unqualified intent')):
-            market.decide(first, self.trade.on_tick)
-        self.assertFalse(self.submits)
-        self.assertFalse(self.trade.tracked)
-        self.assertEqual(self.trade._submit_skip_reasons['N0USDT'], 'latest_quote_not_qualified_before_registration')
+        market.decide(first, self.trade.on_tick)
+        self.assertEqual(len(self.submits), 1)
+        self.assertEqual(self.trade.tracked['N0USDT']['entry_tick'], 1.01)
         market.decide(market.events.get_nowait(), self.trade.on_tick)
         self.event('N0USDT', 1.01)
         self.assertIn('N0USDT', self.trade.tracked)

@@ -171,7 +171,7 @@ class CloseLadderV2Tests(unittest.TestCase):
     def test_fixed_v2_timing_and_attempt_contract(self):
         self.assertEqual(policy.LIMIT_SECONDS, 5.0)
         self.assertEqual(policy.LIMIT_ATTEMPTS, 12)
-        self.assertEqual(policy.TIMED_EXIT_LEAD_SECONDS, 1.0)
+        self.assertEqual(policy.TIMED_EXIT_LEAD_SECONDS, 0.0)
 
     def test_twelve_queue_rounds_then_exactly_one_market_with_unique_identities(self):
         self.close(100.)
@@ -380,17 +380,24 @@ class CloseLadderV2Tests(unittest.TestCase):
         self.assertEqual(self.exchange.queue_calls, [])
         self.assertEqual(self.exchange.market_calls, [])
 
-    def test_timed_exit_starts_one_second_early_without_mutating_due_fields(self):
+    def test_timed_exit_waits_for_exact_due_and_uses_market_without_mutating_due_fields(self):
         original = (self.pos['exit_due_epoch'], self.pos['exit_due_ms'])
         self.trade._timed_exits(now=100.)
         self.assertEqual(self.exchange.queue_calls, [])
         self.trade._timed_exits(now=101.999)
         self.assertEqual(self.exchange.queue_calls, [])
         self.trade._timed_exits(now=102.)
-        self.assertEqual(len(self.exchange.queue_calls), 1)
+        self.assertEqual(self.exchange.queue_calls, [])
+        self.assertEqual(self.exchange.market_calls, [])
+        with patch.object(policy, 'LIMIT_ENABLED', False):
+            self.trade._timed_exits(now=102.999)
+            self.assertFalse(self.exchange.market_calls)
+            self.trade._timed_exits(now=103.)
+        self.assertEqual(len(self.exchange.market_calls), 1)
+        self.assertEqual(self.exchange.queue_calls, [])
         self.assertEqual((self.pos['exit_due_epoch'], self.pos['exit_due_ms']), original)
-        self.assertEqual(self.pos['close_requested_epoch'], 102.)
-        self.assertEqual(self.pos['close_deadline_epoch'], 107.)
+        self.assertEqual(self.pos['close_requested_epoch'], 103.)
+        self.assertNotIn('close_deadline_epoch', self.pos)
 
     def test_disabled_queue_after_restart_cannot_use_persisted_between_round_phase(self):
         cid = self.seed_exact(rounds=7, deadline=105.)
@@ -457,6 +464,69 @@ class CloseLadderV2Tests(unittest.TestCase):
         self.next_round(109.)
         self.assertEqual(len(self.exchange.cancel_calls), 1)
         self.assertEqual(self.pos['close_queue_rounds'], 2)
+
+
+class MarketExitV13Tests(unittest.TestCase):
+    pos = CloseLadderV2Tests.pos
+    exchange = CloseLadderV2Tests.exchange
+    close = CloseLadderV2Tests.close
+    seed_exact = CloseLadderV2Tests.seed_exact
+
+    def setUp(self):
+        CloseLadderV2Tests.setUp(self)
+        self.enabled.stop()  # Production policy: MARKET, no legacy ladder.
+
+    def test_default_market_closes_at_due_once_and_awaits_exact_fill(self):
+        self.assertFalse(policy.LIMIT_ENABLED)
+        self.trade._timed_exits(now=102.999)
+        self.assertFalse(self.exchange.market_calls)
+        self.trade._timed_exits(now=103.)
+        self.assertEqual(self.exchange.queue_calls, [])
+        self.assertEqual(len(self.exchange.market_calls), 1)
+        self.assertEqual(self.exchange.market_calls[0]['qty'], 10.)
+        cid = self.pos['close_client_order_id']
+        self.trade._timed_exits(now=104.)
+        self.assertEqual(len(self.exchange.market_calls), 1)
+        self.exchange.orders[cid].update(status='FILLED', executedQty='10', avgPrice='11')
+        self.trade._timed_exits(now=105.)
+        self.assertNotIn(SYMBOL, self.trade.positions)
+
+    def test_legacy_queue_is_canceled_immediately_and_only_residual_goes_market(self):
+        cid = self.seed_exact()
+        self.exchange.orders[cid].update(status='PARTIALLY_FILLED', executedQty='4', avgPrice='11')
+        self.close(103.)
+        self.assertEqual(len(self.exchange.cancel_calls), 1)
+        self.assertEqual(len(self.exchange.market_calls), 1)
+        self.assertEqual(self.exchange.market_calls[0]['qty'], 6.)
+        self.assertEqual(self.exchange.queue_calls, [])
+
+    def test_uncertain_legacy_cancel_does_not_allow_duplicate_market_close(self):
+        cid = self.seed_exact()
+        self.exchange.cancel_error = TimeoutError('lost cancel reply')
+        self.close(103.)
+        self.assertEqual(self.pos['close_client_order_id'], cid)
+        self.assertFalse(self.exchange.market_calls)
+        self.exchange.cancel_error = None
+        self.close(109.)
+        self.assertEqual(len(self.exchange.market_calls), 1)
+
+    def test_unknown_legacy_order_without_exchange_id_is_query_only(self):
+        cid = self.seed_exact()
+        self.pos['close_order_id'] = ''
+        self.exchange.query_unknown = True
+        self.close(103.)
+        self.assertEqual(self.pos['close_client_order_id'], cid)
+        self.assertFalse(self.exchange.market_calls)
+        self.assertFalse(self.exchange.cancel_calls)
+
+    def test_legacy_deadline_does_not_move_or_resave_on_each_reconcile(self):
+        self.seed_exact()
+        self.trade._restore_queue_close_policy(SYMBOL, now=103.)
+        self.assertEqual(self.pos['close_deadline_epoch'], 103.)
+        with patch.object(self.trade.ledger, 'save') as save:
+            self.trade._restore_queue_close_policy(SYMBOL, now=104.)
+            save.assert_not_called()
+        self.assertEqual(self.pos['close_deadline_epoch'], 103.)
 
 
 if __name__ == '__main__':

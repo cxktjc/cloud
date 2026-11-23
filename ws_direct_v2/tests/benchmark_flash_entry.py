@@ -156,7 +156,7 @@ def probe(near, batch_enabled, rebound=False):
                         after_rebound_ms=round((row['at_ns']-rebound_ns[0])/1e6, 3) if rebound_ns else None)
                    for row in sends])
         if rebound:
-            result['received_rebound_but_guard_used_old_quote'] = any(
+            result['sent_after_rebound_with_frozen_admission'] = any(
                 row['at_ns'] > rebound_ns[0] and row['raw_tick'] > 1.0185
                 and row['raw_bid'] > 1.0185 and row['owner_quote'] <= 1.0185
                 for row in sends) if rebound_ns else False

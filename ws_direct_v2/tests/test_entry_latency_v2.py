@@ -413,7 +413,7 @@ class BatchLatencyTests(unittest.TestCase):
     plans = fixtures.DualAdmissionTests.plans
     tick = fixtures.DualAdmissionTests.tick
 
-    def test_checked_transport_reads_quote_once_after_socket_is_ready(self):
+    def test_checked_transport_does_not_read_ws_again_after_socket_is_ready(self):
         self.plans()
         self.tick(1.01)
         client = self.trade.client
@@ -429,16 +429,11 @@ class BatchLatencyTests(unittest.TestCase):
                 stages.append('send')
                 return dict(symbol='N0USDT', clientOrderId=row['client_order_id'], orderId='wire', status='NEW')
         client._broker = CheckedBroker()
-        original = self.trade.market.send_quote
-        def quote(*args, **kw):
-            self.assertEqual(stages, ['socket_ready'])
-            stages.append('quote')
-            return original(*args, **kw)
-        with patch.object(self.trade.market, 'send_quote', side_effect=quote) as reads:
+        with patch.object(self.trade.market, 'send_quote', side_effect=AssertionError('secondary WS read')) as reads:
             ExchangeClient.place_limit_for_bar(client, symbol='N0USDT', client_order_id=row['client_order_id'],
                 order_bar_open_ms=self.bar, limit_price=1., notional=5.)
-        self.assertEqual(reads.call_count, 1)
-        self.assertEqual(stages, ['socket_ready', 'quote', 'send'])
+        reads.assert_not_called()
+        self.assertEqual(stages, ['socket_ready', 'send'])
 
     def test_unchecked_legacy_transport_still_runs_guard_before_send(self):
         self.plans()

@@ -1,7 +1,7 @@
-"""Durable, non-blocking LONG close ladder, adapted from trade1026/0930.
+"""Durable LONG market exits, retaining exact legacy close reconciliation.
 
-Normal exits: up to 12 SELL LIMIT/GTC priceMatch=QUEUE rounds, each resting
-5s before exact cancel confirmation, then MARKET for the still-owned residual.
+New exits use MARKET at the scheduled due time. Existing QUEUE orders must
+have exact cancellation/fill confirmation before closing the residual.
 Unknown order fate never
 permits a second close. No strategy decisions, exchange imports or background
 threads live here. Existing pre-ladder market close identities remain valid.
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 from typing import Any, Mapping
 
@@ -20,12 +19,12 @@ from .submit_errors import require_submit_ack, submit_error_is_ambiguous
 
 LOG = logging.getLogger('v9711_live_trade')
 _monotonic = time.monotonic
-LIMIT_ENABLED = os.environ.get('V9711_LIVE_CLOSE_LIMIT_ENABLED', '1').strip().lower() in {
-    '1', 'true', 'yes', 'on'}
-# Fixed v2 policy: copied v1 .env files must not restore the old 60s wait.
+# Fixed policy: an old .env cannot re-enable the retired limit ladder.
+LIMIT_ENABLED = False
+# Retained for reconciliation of legacy in-flight QUEUE identities.
 LIMIT_SECONDS = 5.0
 LIMIT_ATTEMPTS = 12
-TIMED_EXIT_LEAD_SECONDS = 1.0
+TIMED_EXIT_LEAD_SECONDS = 0.0
 CANCEL_RETRY_SECONDS = cfg.env_float('V9711_LIVE_CLOSE_CANCEL_RETRY_SECONDS', 5.0)
 if not (math.isfinite(CANCEL_RETRY_SECONDS) and 1.0 <= CANCEL_RETRY_SECONDS <= 60.0):
     raise ValueError('Invalid QUEUE close cancel retry seconds')
@@ -76,12 +75,17 @@ class CloseLongMixin:
                            and bool(pos.get('close_client_order_id')))
         return max(legacy_round, int(self._finite(pos.get('close_queue_rounds'))))
 
-    def _restore_queue_close_policy(self, symbol: str) -> None:
-        """Resume old 60s QUEUE orders without resending or restarting a timer."""
+    def _restore_queue_close_policy(self, symbol: str, *, now: float | None = None) -> None:
+        """Cancel legacy QUEUE orders before switching the exact residual."""
         pos = self.positions[symbol]
         if pos.get('close_phase') != QUEUE or not pos.get('close_client_order_id'):
             return
         before = dict(pos)
+        if not LIMIT_ENABLED:
+            pos['close_urgent'] = True
+            pos['close_deadline_epoch'] = min(
+                self._finite(pos.get('close_deadline_epoch'), float('inf')),
+                time.time() if now is None else now)
         pos['close_queue_rounds'] = self._queue_close_rounds(pos)
         if (pos.get('close_order_id') not in (None, '', 0, '0')
                 and not pos.get('close_timer_pending')):
@@ -213,7 +217,7 @@ class CloseLongMixin:
         pos = self.positions.get(symbol)
         if not pos or not pos.get('close_client_order_id'):
             return
-        self._restore_queue_close_policy(symbol)
+        self._restore_queue_close_policy(symbol, now=now)
         query = getattr(self.client, 'query_exact_order', None)
         if callable(query):
             result, known = query(

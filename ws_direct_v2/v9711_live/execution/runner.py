@@ -1163,11 +1163,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         LOG.info('entry plans: immediate individual WS by default; optional V9711_LIVE_ENTRY_BATCH=1 REST chunks<=5; entry cancels independently paced')
         LOG.info('entry cancels: nearest absolute relative gap first; one at a time; '
                  '1.5s after previous response; exit/QUEUE cancels and other I/O bypass this lane')
-        LOG.info('close policy normal=%s wait=%.1fs rounds=%d timed_exit_lead=%.1fs cancel_retry=%.1fs '
-                 'fallback=confirmed_cancel_after_last_round_then_market_residual; unknown_fate=query_only',
-                 'LIMIT/GTC/QUEUE' if close_policy.LIMIT_ENABLED else 'MARKET',
-                 close_policy.LIMIT_SECONDS, close_policy.LIMIT_ATTEMPTS,
-                 close_policy.TIMED_EXIT_LEAD_SECONDS, close_policy.CANCEL_RETRY_SECONDS)
+        LOG.info('close policy=MARKET at exit_due_epoch; timed_exit_lead=%.1fs; '
+                 'legacy_QUEUE=confirm_cancel_then_market_residual; unknown_fate=query_only',
+                 close_policy.TIMED_EXIT_LEAD_SECONDS)
         if self.once:
             self.step()
             return 0

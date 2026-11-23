@@ -92,6 +92,8 @@ def compact_positions(rows: Any, limit: int) -> str:
         if 'client_order_id' in row:
             sent = row.get('entry_send_quote') or {}
             stage = '发送' if sent else '登记'
+            if (sent or row).get('entry_quote_policy') == 'admission_frozen':
+                stage = '准入'
             qualified = (sent or row).get('entry_qualified_by', 'unknown')
             label += f'[{stage}满足={qualified}]'
         parts.append(f'{symbol}{label} qty={qty} mark={mark} pnl={pnl}')

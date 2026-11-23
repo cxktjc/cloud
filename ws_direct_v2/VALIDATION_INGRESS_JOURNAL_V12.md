@@ -1,5 +1,9 @@
 # 接收侧比价与增量账本验证：2026-11-23
 
+本文是 v12 的历史验证。当前 v13 已取消发送前 WS 二次检查，并改为到期 MARKET 平仓，
+最新规则和测试见 [VALIDATION_FROZEN_ENTRY_MARKET_EXIT_V13.md](VALIDATION_FROZEN_ENTRY_MARKET_EXIT_V13.md)。
+下文的发送前报价复核及限价平仓描述不再作为当前执行规则。
+
 运行标识：`20261123-ingress-journal-v12`。仅改 cloud 仓库 `ws_direct_v2`。
 全部测试使用临时账本及离线假 socket，没有访问交易所、下真实订单或修改生产状态。
 **逐笔接收→发送 10ms 尚未通过，不能把本次交付称为达到该目标。**

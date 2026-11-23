@@ -17,4 +17,4 @@ def qualify_quote(quote, limit, ceiling, *, following=False):
 
 
 QUOTE_FIELDS = ('entry_qualified_by', 'entry_quote_source', 'entry_tick', 'entry_bid0',
-                'entry_tick_gap', 'entry_depth_gap', 'entry_gap_ceiling')
+                'entry_tick_gap', 'entry_depth_gap', 'entry_gap_ceiling', 'entry_quote_policy')

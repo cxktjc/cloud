@@ -455,20 +455,23 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.assertTrue(self.trade._entry_submission_blocked(raw))
         self.assertTrue(self.trade._entry_submission_blocked(canonical))
 
-    def test_batch_keeps_repeated_symbol_rebound_and_final_live_guard_rejects_it(self):
+    def test_batch_preserves_rebound_but_already_admitted_entries_can_send(self):
         self.prime_distinct_batch()
         for symbol, price in (('N0USDT', '.99'), ('N1USDT', '.99'), ('N1USDT', '1.03')):
             self.trade.market.update(symbol, price, int(self.case.now*1000))
         first = self.trade.market.events.get_nowait()
         self.trade.market.decide(first, self.trade.on_tick)
         self.trade.market.events.task_done()
+        self.wait_done()
+        self.assertEqual(len(self.sent), 2)
         rebound = self.trade.market.events.get_nowait()
         self.assertEqual((rebound.symbol, rebound.price), ('N1USDT', '1.03'))
         self.trade.market.decide(rebound, self.trade.on_tick)
         self.trade.market.events.task_done()
         self.wait_done()
-        self.assertEqual(len(self.sent), 1)
-        self.assertEqual(self.trade.session_entries.timings.order(self.sent[0])['symbol'], 'N0USDT')
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual({self.trade.session_entries.timings.order(cid)['symbol'] for cid in self.sent},
+                         {'N0USDT', 'N1USDT'})
 
     def test_owner_continues_quotes_and_reserves_eight_while_disk_blocked_then_sends_exactly_once(self):
         started = self.block_disk()
@@ -486,17 +489,19 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 8)
         self.assertEqual(len(set(self.sent)), 8)
 
-    def test_rebound_received_during_disk_wait_prevents_stale_send(self):
+    def test_rebound_received_during_disk_wait_keeps_frozen_admission(self):
         self.case.templates = self.case.templates[:1]
         self.case.publish()
         started = self.block_disk()
         self.case.event('N0USDT')
         self.assertTrue(started.wait(1))
         self.trade.market.update('N0USDT', '1.03', int(self.case.now*1000))
-        # The final guard reads live ingress even before the owner dequeues it.
-        self.release.set()
-        self.wait_done()
-        self.assertFalse(self.sent)
+        # Sending must not read or compare another quote after admission.
+        with patch.object(self.trade.market, 'send_quote', side_effect=AssertionError('secondary WS read')):
+            self.release.set()
+            self.wait_done()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.trade.tracked['N0USDT']['entry_send_quote']['entry_tick'], 1.01)
 
     def test_failed_disk_never_calls_exchange(self):
         from v9711_live.execution import journal_store
@@ -524,6 +529,30 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.assertTrue(started.wait(1))
         self.trade._io_signal = ({}, 'expired')
         self.trade._publish_entry_gate()
+        self.release.set()
+        self.wait_done()
+        self.assertFalse(self.sent)
+
+    def test_expired_quote_after_admission_does_not_cancel_send_but_account_gate_still_runs(self):
+        self.case.templates = self.case.templates[:1]
+        self.case.publish()
+        started = self.block_disk()
+        self.case.event('N0USDT')
+        self.assertTrue(started.wait(1))
+        self.trade.market.group_failed(1, 'quote stream disconnected after admission')
+        self.trade._publish_entry_gate()
+        with patch.object(self.trade.market, 'send_quote', side_effect=AssertionError('secondary WS read')):
+            self.release.set()
+            self.wait_done()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_account_expiry_still_blocks_an_admitted_entry_after_disk_wait(self):
+        self.case.templates = self.case.templates[:1]
+        self.case.publish()
+        started = self.block_disk()
+        self.case.event('N0USDT')
+        self.assertTrue(started.wait(1))
+        self.trade._account_deadline = self.case.now-1
         self.release.set()
         self.wait_done()
         self.assertFalse(self.sent)

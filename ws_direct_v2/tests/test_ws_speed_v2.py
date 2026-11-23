@@ -1,4 +1,4 @@
-"""Decision-local quote reuse must never bypass live send or state guards."""
+"""Decision-local quotes, frozen admission and timed maintenance wakeups."""
 import time
 import threading
 import unittest
@@ -90,7 +90,28 @@ class OwnerPriceViewTests(unittest.TestCase):
     tick = fixtures.DualAdmissionTests.tick
     bid = fixtures.DualAdmissionTests.bid
 
-    def test_owner_view_does_not_let_worker_use_disconnected_bid(self):
+    def test_exit_wakeup_uses_nearest_due_not_maintenance_interval(self):
+        self.trade.positions.update({
+            'AUSDT': dict(exit_due_epoch=100.1),
+            'BUSDT': dict(exit_due_epoch=102.),
+        })
+        self.assertAlmostEqual(self.trade._next_exit_wake_delay(now=100.), .1)
+        self.assertEqual(self.trade._next_exit_wake_delay(now=100.2), 0.)
+
+    def test_exit_wakeup_excludes_inflight_close_and_respects_retry_cooldown(self):
+        self.trade.positions.update({
+            'AUSDT': dict(exit_due_epoch=99., close_client_order_id='exact_close'),
+            'BUSDT': dict(exit_due_epoch=99., close_retry_after_epoch=101.),
+        })
+        self.assertEqual(self.trade._next_exit_wake_delay(now=100.), 1.)
+        self.trade.positions.pop('BUSDT')
+        self.assertEqual(self.trade._next_exit_wake_delay(now=100.), float('inf'))
+
+    def test_exit_wakeup_ignores_missing_deadline(self):
+        self.trade.positions['AUSDT'] = dict(quantity=1.)
+        self.assertEqual(self.trade._next_exit_wake_delay(now=100.), float('inf'))
+
+    def test_owner_view_refresh_does_not_change_frozen_admission(self):
         self.plans()
         self.tick(1.03)
         self.bid(1.01)
@@ -99,7 +120,7 @@ class OwnerPriceViewTests(unittest.TestCase):
         def disconnect_during_decision(*args, **kwargs):
             self.assertEqual(self.trade.refresh_entry_prices()['N0USDT'], 1.01)
             self.trade.market.book.group_failed(1, 'disconnected during planning')
-            self.assertFalse(self.trade._entry_quote_send_allowed('N0USDT', row['client_order_id'], 1.))
+            self.assertTrue(self.trade._entry_quote_send_allowed('N0USDT', row['client_order_id'], 1.))
         with patch.object(self.trade, '_execute_entries_with_prices', side_effect=disconnect_during_decision):
             self.trade._execute_entries({}, 'valid')
         self.assertIsNone(self.trade._cycle_price_maps)
