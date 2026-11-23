@@ -345,6 +345,8 @@ class OwnerDurabilityTests(unittest.TestCase):
         for cid in self.sent:
             timing = self.trade.session_entries.timings.order(cid)
             self.assertEqual(timing['trigger_symbol'], timing['symbol'])
+            self.assertEqual(timing['trigger_price'], .99)
+            self.assertAlmostEqual(timing['trigger_gap'], -.01)
         self.assertFalse(self.trade._batch_event_contexts)
 
     def prime_full_book_replacements(self):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from collections import deque
 
 
@@ -16,6 +17,18 @@ class EntryTimings:
 
     def register(self, symbol, cid, row, *, session_id=''):
         context = dict(row.get('_entry_timing_context') or {})
+        limit = row.get('submitted_limit_price', row.get('limit_price'))
+        def gap(price):
+            try:
+                price, limit_value = float(price), float(limit)
+                if price > 0 and limit_value > 0 and math.isfinite(price) and math.isfinite(limit_value):
+                    return (price-limit_value)/limit_value
+            except (TypeError, ValueError, OverflowError):
+                pass
+            return None
+        context.update(order_limit_price=limit, signal_limit_price=row.get('limit_price'),
+            admission_gap=gap(context.get('admission_price')),
+            trigger_gap=gap(context.get('trigger_price')) if context.get('trigger_symbol') == symbol else None)
         with self._lock:
             if cid in self._rows:
                 return
@@ -70,6 +83,10 @@ class EntryTimings:
                  ('registered_to_persisted', 'registered', 'persisted'),
                  ('registered_to_write_started', 'registered', 'write_started'),
                  ('write_started_to_persisted', 'write_started', 'persisted'),
+                 ('journal_prepare', 'write_started', 'prepared'),
+                 ('journal_write', 'prepared', 'written'),
+                 ('journal_sync', 'written', 'synced'),
+                 ('journal_receipt', 'synced', 'persisted'),
                  ('persisted_to_durable', 'persisted', 'durable'),
                  ('durable_to_send', 'durable', 'send'),
                  ('worker_to_send', 'worker', 'send'),
@@ -106,7 +123,8 @@ class EntryTimings:
                         latest=self._public(matches[-1]) if matches else {})
 
     def summary(self):
-        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker', 'write_started', 'persisted', 'durable', 'send')
+        fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker',
+                  'write_started', 'prepared', 'written', 'synced', 'persisted', 'durable', 'send')
         keys = tuple('_'+name+'_ns' for name in fields)
         with self._lock:
             # Copy only bounded timestamp fields, then sort outside the lock.
@@ -134,6 +152,10 @@ class EntryTimings:
             ('registered_to_persisted', 'registered', 'persisted'),
             ('registered_to_write_started', 'registered', 'write_started'),
             ('write_started_to_persisted', 'write_started', 'persisted'),
+            ('journal_prepare', 'write_started', 'prepared'),
+            ('journal_write', 'prepared', 'written'),
+            ('journal_sync', 'written', 'synced'),
+            ('journal_receipt', 'synced', 'persisted'),
             ('persisted_to_durable', 'persisted', 'durable'),
             ('durable_to_send', 'durable', 'send'),
             ('worker_to_send', 'worker', 'send'))}

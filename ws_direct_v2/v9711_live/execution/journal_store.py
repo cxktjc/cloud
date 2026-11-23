@@ -55,8 +55,9 @@ def changes(old, new, path=()):
 
 
 def apply_changes(root, operations):
-    """Copy-on-write only the dictionary paths touched by a transaction."""
+    """Copy each touched dictionary once, retaining all prior roots intact."""
     result = root
+    copied = {}  # Strong references prevent id reuse when a branch is replaced.
     for operation in operations:
         if not isinstance(operation, list) or len(operation) not in (1, 2):
             raise ValueError('invalid journal operation')
@@ -64,13 +65,18 @@ def apply_changes(root, operations):
         if (not isinstance(path, list) or not path or path[0] not in ('intents', 'state')
                 or not all(isinstance(key, str) for key in path)):
             raise ValueError('invalid journal path')
-        result = dict(result)
+        if not copied:
+            result = dict(root)
+            copied[id(result)] = result
         target = result
         for key in path[:-1]:
             child = target.get(key)
             if not isinstance(child, dict):
                 raise ValueError('journal parent is not a dictionary')
-            target[key] = dict(child)
+            if id(child) not in copied:
+                child = dict(child)
+                copied[id(child)] = child
+                target[key] = child
             target = target[key]
         if len(operation) == 1:
             if path[-1] not in target:
@@ -207,14 +213,32 @@ def resolve_journal(payload, state_path):
             raise RuntimeError('invalid execution journal; retained without stale-ledger fallback') from exc
 
 
-def commit_journal(handle, records):
+@dataclass(frozen=True)
+class CommitTiming:
+    written_ns: int
+    synced_ns: int
+    sync_method: str
+
+
+def _write_journal(handle, records, sync, sync_method):
     remaining = memoryview(records)
     while remaining:
         count = handle.write(remaining)
         if not count:
             raise OSError('short durable journal write')
         remaining = remaining[count:]
-    os.fsync(handle.fileno())
+    written_ns = time.monotonic_ns()
+    sync(handle.fileno())
+    return CommitTiming(written_ns, time.monotonic_ns(), sync_method)
+
+
+def commit_journal(handle, records):
+    # Linux fdatasync persists data AND metadata required to retrieve it
+    # (including appended length), without unrelated timestamp metadata.
+    # New segments and directory entries retain their full fsync path.
+    sync = getattr(os, 'fdatasync', None)
+    return _write_journal(handle, records, sync or os.fsync,
+                          'fdatasync' if sync else 'fsync')
 
 
 class JournalWriter:
@@ -242,6 +266,8 @@ class JournalWriter:
         self._sequence = self._checkpoint_sequence = 0
         self._submitted = self._written = self._coalesced = self._failures = 0
         self._last_ms = self._queue_wait_ms = self._record_bytes = self._checkpoint_ms = 0.
+        self._prepare_ms = self._write_ms = self._sync_ms = self._receipt_ms = 0.
+        self._sync_method = 'fdatasync' if hasattr(os, 'fdatasync') else 'fsync'
         self._error = self._checkpoint_error = ''
         self._latest = self._latest_future = None
         self._fatal = None
@@ -274,7 +300,7 @@ class JournalWriter:
         temporary = path.with_name(path.name + '.creating')
         try:
             with temporary.open('xb', buffering=0) as handle:
-                commit_journal(handle, _SEGMENT.pack(_SEG_MAGIC, self._epoch_bytes, first))
+                _write_journal(handle, _SEGMENT.pack(_SEG_MAGIC, self._epoch_bytes, first), os.fsync, 'fsync')
             os.replace(temporary, path)
             sync_directory(path.parent)
         except BaseException:
@@ -331,7 +357,8 @@ class JournalWriter:
                 with self._condition:
                     if self._retained_bytes + len(record) > self._max_journal_bytes:
                         raise OSError('journal retention limit reached; checkpoint must recover before restart')
-                commit_journal(self._handle, record)
+                prepared_ns = time.monotonic_ns()
+                committed = commit_journal(self._handle, record)
                 # Publish only AFTER durable commit; checkpoint sees immutable roots.
                 self._root, self._sequence = root, sequence
                 self._record_bytes = len(record)
@@ -339,8 +366,16 @@ class JournalWriter:
                     self._retained_bytes += len(record)
                 self._written += len(batch)
                 self._coalesced += len(batch) - 1
-                receipt = Receipt(batch[-1][0].reservations, time.monotonic_ns(), time.time()*1000,
-                                  started_ns, started_ms)
+                completed_ns, completed_ms = time.monotonic_ns(), time.time()*1000
+                receipt = Receipt(batch[-1][0].reservations, completed_ns, completed_ms,
+                    started_ns, started_ms, prepared_ns,
+                    committed.written_ns if committed else 0, committed.synced_ns if committed else 0)
+                self._prepare_ms = (prepared_ns-started_ns)/1e6
+                if committed:
+                    self._write_ms = (committed.written_ns-prepared_ns)/1e6
+                    self._sync_ms = (committed.synced_ns-committed.written_ns)/1e6
+                    self._receipt_ms = (completed_ns-committed.synced_ns)/1e6
+                    self._sync_method = committed.sync_method
                 for _, future in batch:
                     future.set_result(receipt)
                 if sequence - self._checkpoint_sequence >= self._checkpoint_every:
@@ -415,6 +450,8 @@ class JournalWriter:
                 written=self._written, coalesced=self._coalesced, failures=self._failures,
                 error=self._error, last_write_ms=round(self._last_ms, 3),
                 queue_wait_ms=round(self._queue_wait_ms, 3), record_bytes=self._record_bytes,
+                prepare_ms=round(self._prepare_ms, 3), write_ms=round(self._write_ms, 3),
+                sync_ms=round(self._sync_ms, 3), receipt_ms=round(self._receipt_ms, 3), sync_method=self._sync_method,
                 retained_bytes=self._retained_bytes,
                 commit_sequence=self._sequence, checkpoint_sequence=self._checkpoint_sequence,
                 checkpoint_ms=round(self._checkpoint_ms, 3), checkpoint_error=self._checkpoint_error,

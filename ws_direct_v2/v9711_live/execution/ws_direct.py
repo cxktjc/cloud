@@ -84,7 +84,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261123-frozen-entry-market-exit-v13', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261123-durable-gap-v14', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
@@ -305,6 +305,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         quote = self.market.entry_quote(symbol)
         context.update(self.market.entry_timing(symbol, quote.get('source')))
         context.update(self._batch_event_contexts.get(symbol) or getattr(self, '_event_timing_context', {}) or {})
+        context['admission_price'] = quote.get('selected')
         detail = qualify_quote(quote, self._finite(row.get('limit_price')), ceiling,
                                following=bool(row.get('signal_follow')))
         if detail['entry_qualified_by'] == 'none':
@@ -551,7 +552,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                                    else (time.monotonic_ns(), time.time()*1000))
         self._event_timing_context = dict(event_received_epoch_ms=tick.received_epoch_ms,
             _event_received_ns=tick.received_ns, dequeued_epoch_ms=dequeued_ms,
-            _dequeued_ns=dequeued_ns, trigger_source=tick.source, trigger_symbol=tick.symbol)
+            _dequeued_ns=dequeued_ns, trigger_source=tick.source, trigger_symbol=tick.symbol,
+            trigger_price=self._finite(tick.price), trigger_exchange_time_ms=tick.exchange_ms)
         self._quote_segments, self._quote_route, self._quote_tail = {}, 'full', 'screening'
         try:
             with self.ledger.batch_saves():
@@ -583,7 +585,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 self._batch_event_contexts[event.symbol] = dict(
                     event_received_epoch_ms=event.received_epoch_ms, _event_received_ns=event.received_ns,
                     dequeued_epoch_ms=stamp_ms, _dequeued_ns=stamp_ns,
-                    trigger_source=event.source, trigger_symbol=event.symbol)
+                    trigger_source=event.source, trigger_symbol=event.symbol,
+                    trigger_price=self._finite(event.price), trigger_exchange_time_ms=event.exchange_ms)
                 price = self.market.entry_prices([event.symbol]).get(event.symbol, float('inf'))
                 self._update_rank(event.symbol, price)
                 return False

@@ -1,5 +1,8 @@
 # 冻结入场依据与到期 MARKET 平仓：2026-11-23
 
+本文保留 v13 历史验证。v14 继续这些执行规则，并优化保存、增加触发价差诊断，
+见 [VALIDATION_DURABILITY_GAP_V14.md](VALIDATION_DURABILITY_GAP_V14.md)。
+
 运行标识：`20261123-frozen-entry-market-exit-v13`。改动仅在 cloud 仓库 `ws_direct_v2`。
 测试全部使用临时账本、离线交易所和假 socket，没有发出真实订单或修改生产状态。
 

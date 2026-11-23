@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -69,7 +70,27 @@ def entry_timing_lines(timing):
         ('trigger_to_send', '触发行情→发送'), ('quote_to_send', '依据报价→发送')) if key in delays)
     trigger = (f'触发={timing["trigger_symbol"]}/{timing.get("trigger_source")} '
                if timing.get('trigger_symbol') else '')
+    quote_lines = []
+    if timing and ('order_limit_price' in timing or 'trigger_price' in timing):
+        def number(value, *, percent=False):
+            try:
+                value = float(value)
+                if math.isfinite(value) and (percent or value > 0):
+                    return f'{value:+.4%}' if percent else f'{value:.10g}'
+            except (TypeError, ValueError, OverflowError):
+                pass
+            return '未记录'
+        cross_symbol = timing.get('trigger_symbol') and timing['trigger_symbol'] != timing.get('symbol')
+        trigger_gap = '不适用（跨币触发）' if cross_symbol else number(timing.get('trigger_gap'), percent=True)
+        quote_lines = [f'      报价与挂单: {trigger}触发价={number(timing.get("trigger_price"))} '
+                       f'挂单价={number(timing.get("order_limit_price"))} 触发价差={trigger_gap} '
+                       f'准入价={number(timing.get("admission_price"))} '
+                       f'准入价差={number(timing.get("admission_gap"), percent=True)}']
+    save_parts = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
+        ('journal_prepare', '准备'), ('journal_write', '写入'),
+        ('journal_sync', '同步'), ('journal_receipt', '回执')) if key in delays)
     return [line]+([stages] if timing else [])+([f'      分段耗时: {details}'] if details else [])+(
+        [f'      保存细分: {save_parts}'] if save_parts else [])+quote_lines+(
         [f'      入场链路: {trigger}{extra}'] if extra else [])
 
 
@@ -268,6 +289,11 @@ class TradeTerminalView:
                         lines.insert(-1, '保存细分P95(ms): 登记→开始保存='
                                      f'{(stages.get("registered_to_write_started") or {}).get("p95_ms")} '
                                      f'开始保存→回执={stages["write_started_to_persisted"].get("p95_ms")}')
+                    if (stages.get('journal_sync') or {}).get('samples'):
+                        pieces = [f'{label}={(stages.get(key) or {}).get("p95_ms")}' for key, label in (
+                            ('journal_prepare', '准备'), ('journal_write', '写入'),
+                            ('journal_sync', '同步'), ('journal_receipt', '回执'))]
+                        lines.insert(-1, '日志保存分段P95(ms): '+' '.join(pieces)+'；各段分位数不可相加')
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
                 lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '
@@ -288,6 +314,9 @@ class TradeTerminalView:
                            f'{(durability.get("file_write_ms") or {}).get("state", 0):.3f}ms ')
                 if durability.get('incremental_journal'):
                     storage = (f'增量日志={durability.get("record_bytes", 0)}B '
+                               f'同步={durability.get("sync_method", "fsync")} '
+                               f'准备/写入/同步={durability.get("prepare_ms", 0):.3f}/'
+                               f'{durability.get("write_ms", 0):.3f}/{durability.get("sync_ms", 0):.3f}ms '
                                f'序号={durability.get("commit_sequence", 0)} '
                                f'检查点={durability.get("checkpoint_sequence", 0)} '
                                f'检查点错误={durability.get("checkpoint_error") or "无"} ')

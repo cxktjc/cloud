@@ -368,6 +368,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 quote_routes=dict(getattr(trade, '_quote_routes', {})),
                 stages={name: None for name in ('queue_wait', 'dequeued_to_decision', 'decision_to_registered',
                                                'registered_to_worker', 'worker_to_durable', 'registered_to_persisted',
+                                               'journal_prepare', 'journal_write', 'journal_sync', 'journal_receipt',
                                                'persisted_to_durable', 'durable_to_send', 'worker_to_send')})
             # Timing rows survive retirement, use their exact CIDs for all sends.
             pressure['stages'] = {name: summary([row['latencies_ms'][name]

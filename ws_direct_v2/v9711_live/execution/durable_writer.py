@@ -36,6 +36,9 @@ class Receipt:
     completed_epoch_ms: float = 0.
     write_started_ns: int = 0
     write_started_epoch_ms: float = 0.
+    prepared_ns: int = 0
+    written_ns: int = 0
+    synced_ns: int = 0
 
 
 class DurableWriter:

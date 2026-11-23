@@ -613,7 +613,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             'sizing_target_notional': self._finite(prepared.get('target_notional'), notional),
         }
         client_id = plan_id if following else self.ledger.reserve_entry_client_id(symbol, bar_ms)
-        self.session_entries.timings.register(symbol, client_id, row,
+        self.session_entries.timings.register(symbol, client_id, dict(row, **sizing_details),
             session_id=(self._io_signal[0] or {}).get('signal_session_id'))
         # Persist BOTH exact identity and its occupied physical slot before I/O.
         # A process interruption between send and ACK must not lose this slot.
