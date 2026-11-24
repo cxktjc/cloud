@@ -18,7 +18,7 @@ import time
 from typing import Any, Callable
 
 from .. import config as cfg
-from .submit_errors import ConfirmedSubmitRejection
+from .submit_errors import ConfirmedSubmitRejection, EntrySendGateRejection
 from .entry_quotes import QUOTE_FIELDS
 from .signal_follow import follow_send_allowed, FOLLOW_POSITION_CAP
 from .cancel_pacing import (EntryCancelPacing, ENTRY_CANCEL_INTERVAL_SECONDS,
@@ -241,13 +241,28 @@ class NetworkIO(EntryCancelPacing):
             0.0 < due - now <= gate.get('bar_length_ms', 0) / 1000.0
             for due in gate.get('position_exit_due_epochs', ())
         )
-        if (self._closed or not gate.get('ready') or gate.get('bar_ms') != bar_ms
-                or not bar_ms <= now * 1000 < bar_ms + gate.get('bar_length_ms', 0)
-                or now > gate.get('expires', 0) or now - gate.get('generated', 0) > gate.get('ttl', 0)
-                or now - gate.get('refreshed', 0) > gate.get('ttl', 0)
-                or (gate.get('held', 0) >= gate.get('position_cap', 0) and not final_exit_bar)
-                or cid not in gate.get('allowed', ())):
-            raise ConfirmedSubmitRejection('queued entry no longer valid/full/expired before send; request never sent')
+        now_ms = now * 1000
+        close_ms = bar_ms + gate.get('bar_length_ms', 0)
+        if self._closed:
+            raise EntrySendGateRejection('entry_worker_closed')
+        if not gate.get('ready'):
+            raise EntrySendGateRejection('account_gate' if gate.get('signal_status') == 'account_not_ready'
+                                         else 'entry_signal_not_ready', gate.get('signal_status', ''))
+        if not bar_ms <= now_ms < close_ms:
+            if gate.get('admitted_entry_quotes', {}).get(cid, {}).get('signal_follow'):
+                raise EntrySendGateRejection('entry_follow_not_allowed_at_send')
+            raise EntrySendGateRejection('entry_bar_ended_at_send' if now_ms >= close_ms else 'entry_bar_not_started',
+                                         f'order_bar_ms={bar_ms}, close_ms={close_ms}, check_ms={now_ms:.3f}')
+        if gate.get('bar_ms') != bar_ms:
+            raise EntrySendGateRejection('entry_plan_bar_changed',
+                                         f'order_bar_ms={bar_ms}, plan_bar_ms={gate.get("bar_ms")}')
+        ttl = gate.get('ttl', 0)
+        if now > gate.get('expires', 0) or now - gate.get('generated', 0) > ttl or now - gate.get('refreshed', 0) > ttl:
+            raise EntrySendGateRejection('entry_plan_stale_at_send')
+        if gate.get('held', 0) >= gate.get('position_cap', 0) and not final_exit_bar:
+            raise EntrySendGateRejection('entry_position_cap_at_send', f'held={gate.get("held", 0)}')
+        if cid not in gate.get('allowed', ()):
+            raise EntrySendGateRejection(gate.get('entry_blocks', {}).get(cid, 'entry_id_not_allowed'))
         return False
 
     def health(self) -> dict[str, Any]:
@@ -398,7 +413,23 @@ class NetworkTradeMixin:
         now = time.time()
         follow_entries = (self._follow_gate_entries(snapshot, now=now)
                           if hasattr(self, '_follow_gate_entries') and len(self.positions) < FOLLOW_POSITION_CAP else {})
+        allowed = set(follow_entries)
+        blocked = {}
+        expected_weight = cfg.SLOT_WEIGHTS[min(len(self.positions), 2)]
+        for row in self.tracked.values():
+            if row.get('signal_follow'):
+                continue
+            cid = str(row.get('client_order_id'))
+            if row.get('cancel_requested'):
+                blocked[cid] = 'entry_cancel_pending_at_send'
+            elif row.get('sizing_weight') not in (None, expected_weight):
+                blocked[cid] = 'entry_sizing_changed_at_send'
+            elif self._forced_entry_blocked(str(row.get('symbol') or ''), now=now):
+                blocked[cid] = 'entry_forced_close_at_send'
+            else:
+                allowed.add(cid)
         gate = dict(ready=status == 'valid' and bool(snapshot.get('signal_ready')),
+            signal_status=status,
             bar_ms=int(self._finite(snapshot.get('bar_open_ms'))), bar_length_ms=cfg.BAR_MS,
             generated=self._finite(snapshot.get('generated_at_epoch')),
             expires=self._finite(snapshot.get('expires_at_epoch')), ttl=cfg.DESIRED_TTL_SECONDS,
@@ -407,18 +438,15 @@ class NetworkTradeMixin:
             entry_gap_limits={str(row.get('client_order_id')): row.get('entry_gap_ceiling', cfg.CANCEL_GAP)
                               for row in self.tracked.values() if not row.get('signal_follow')},
             admitted_entry_quotes={str(row.get('client_order_id')):
-                dict(symbol=symbol, submitted_limit_price=row.get('submitted_limit_price', row.get('limit_price')),
+                dict(symbol=symbol, signal_follow=bool(row.get('signal_follow')),
+                     submitted_limit_price=row.get('submitted_limit_price', row.get('limit_price')),
                      **{key: row[key] for key in QUOTE_FIELDS if key in row})
                 for symbol, row in self.tracked.items()},
             # Only the owner reads positions. Workers receive a normalized,
             # immutable snapshot, never signal targets or a mutable ledger.
             position_exit_due_epochs=tuple(self._finite(pos.get('exit_due_epoch'))
                                            for pos in self.positions.values()),
-            allowed=frozenset(follow_entries) | frozenset(str(p.get('client_order_id')) for p in self.tracked.values()
-                              if not p.get('signal_follow') and not p.get('cancel_requested')
-                              and (p.get('sizing_weight') is None
-                                   or p.get('sizing_weight') == cfg.SLOT_WEIGHTS[min(len(self.positions), 2)])
-                              and not self._forced_entry_blocked(str(p.get('symbol') or ''), now=now)))
+            entry_blocks=blocked, allowed=frozenset(allowed))
         self.client.entry_gate = gate
         if io is not None:
             io.set_entry_gate(gate)

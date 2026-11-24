@@ -485,12 +485,31 @@ class TradeTerminalView:
                     skip = attempts.get('last_skip')
                     if skip:
                         block.append(f'      最近一次登记前拦截：{REASONS.get(skip, skip)}')
-                    error = attempts.get('last_error') or (latest if latest.get('submit_error') else None)
-                    if error:
-                        kind = '补挂' if error.get('signal_follow') else '普通单'
-                        block.append(f'      最近提交异常（{kind}）：{entry_error_line(error)}')
+                    if 'ordinary' in attempts:
+                        for kind, stage in (('普通单', 'ordinary'), ('补挂单', 'follow')):
+                            group = attempts.get(stage) or {}
+                            if not group.get('registered'):
+                                block.append(f'      {kind}：未见匹配的登记记录')
+                                continue
+                            sent = group.get('first_send_ms')
+                            block.append(f'      {kind}：登记={group["registered"]} 实际发送={group["sent"]} '
+                                         f'首次登记={iso_ms(group.get("first_registration_ms"))} '
+                                         f'首次发送={iso_ms(sent) if sent is not None else "无"} '
+                                         f'最近状态={group.get("latest_status") or "待确认"} '
+                                         f'单号={group.get("latest_id")}')
+                            error = group.get('last_error')
+                            if error:
+                                block.append(f'        最近异常={iso_ms(error.get("submit_error_epoch_ms"))} '
+                                             f'{entry_error_line(error)} 单号={error["client_order_id"]}')
+                    else:
+                        error = attempts.get('last_error') or (latest if latest.get('submit_error') else None)
+                        if error:
+                            kind = '补挂' if error.get('signal_follow') else '普通单'
+                            block.append(f'      最近提交异常（{kind}）：{entry_error_line(error)}')
                     timing = row.get('first_order_timing')
                     if timing:
+                        kind = '补挂单' if timing.get('signal_follow') else '普通单'
+                        block.append(f'      下单耗时对应：{kind} {timing.get("client_order_id") or ""}')
                         block.extend(entry_timing_lines(timing))
                     else:
                         block.append('      该笔signal尚无匹配的下单时间记录；不使用其他入场bar的记录代填。')

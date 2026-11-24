@@ -40,6 +40,14 @@ class EntryQuoteUnavailable(ConfirmedSubmitRejection):
         self.quote_watermarks = dict(quote_watermarks) if quote_watermarks is not None else None
 
 
+class EntrySendGateRejection(ConfirmedSubmitRejection):
+    """The order never reached the transport; retain the exact gate reason."""
+
+    def __init__(self, reason, detail=''):
+        super().__init__(f'pre-send entry gate: {reason}; request never sent' + (f' ({detail})' if detail else ''))
+        self.reason = reason
+
+
 _TRANSPORT = (
     'network', 'ssl', 'eof', 'connection', 'timeout', 'timed out',
     'remote end closed', 'no close frame', 'broken pipe',

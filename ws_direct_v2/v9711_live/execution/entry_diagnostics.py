@@ -1,6 +1,6 @@
 """Attribute missed entries from exact evidence without changing execution decisions."""
 from ..exchange.binance_futures_trade_ws import APIError
-from .submit_errors import (ConfirmedSubmitRejection, EntryQuoteUnavailable,
+from .submit_errors import (ConfirmedSubmitRejection, EntryQuoteUnavailable, EntrySendGateRejection,
                             ExchangeSubmitRejected, ExchangeSubmitResponseError,
                             _exception_chain, entry_permission_rejection_reason)
 
@@ -26,6 +26,8 @@ def submission_diagnostic(exc, *, rejected, disabled=False):
         category = 'local_not_sent'
         if isinstance(exc, EntryQuoteUnavailable):
             detail['submit_error_reason'] = 'account_gate' if exc.retry_gate == 'account' else 'quote_gate'
+        elif isinstance(exc, EntrySendGateRejection):
+            detail['submit_error_reason'] = exc.reason
     else:
         category = 'result_unknown' if not rejected else 'rejected_source_unknown'
     return dict(detail, submit_error_category=category)
@@ -47,6 +49,18 @@ REASONS = {
     'symbol_reduce_only': '币对触发仓位风控，当前方向只允许减仓',
     'quote_gate': '发单前报价未通过检查',
     'account_gate': '发单前账户状态未就绪',
+    'entry_worker_closed': '发单线程已关闭',
+    'entry_signal_not_ready': '发单前 Signal 未就绪',
+    'entry_bar_ended_at_send': '轮到发送时普通入场 bar 已结束',
+    'entry_bar_not_started': '轮到发送时普通入场 bar 尚未开始',
+    'entry_plan_bar_changed': '发送时 Signal 计划与委托的 bar 不一致',
+    'entry_plan_stale_at_send': '发送时 Signal 计划或发送许可已过期',
+    'entry_position_cap_at_send': '发送时持仓容量已满',
+    'entry_cancel_pending_at_send': '发送前已安排撤销该委托',
+    'entry_sizing_changed_at_send': '发送前资金档位已变化',
+    'entry_forced_close_at_send': '该币对正在强制平仓处理',
+    'entry_follow_not_allowed_at_send': '发送时该委托没有有效的补挂许可',
+    'entry_id_not_allowed': '该委托已不在当前发送许可中',
     'signal_follow_agreement_rejected_for_position': '本笔补挂已被交易所拒绝：账户未签署 TradFi 合约协议',
     'signal_follow_symbol_reduce_only': '本笔补挂已被交易所拒绝：币对触发仓位风控，当前方向只允许减仓',
     'signal_follow_position_cap': '实际持仓已达补挂上限',

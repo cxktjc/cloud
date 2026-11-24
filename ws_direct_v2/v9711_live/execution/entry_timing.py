@@ -157,11 +157,24 @@ class EntryTimings:
             key = entry['symbol'], entry['entry_bar_open_ms'], entry['signal_session_id']
             latest_error = max((row for row in matches if row.get('submit_error_category')),
                                key=lambda row: row.get('submit_error_epoch_ms', 0), default=None)
+            def by_kind(follow):
+                rows = [row for row in matches if row['signal_follow'] == follow]
+                sent = [row for row in rows if '_send_ns' in row]
+                first_sent = min(sent, key=lambda row: row['_send_ns'], default={})
+                error = max((row for row in rows if row.get('submit_error_category')),
+                            key=lambda row: row.get('submit_error_epoch_ms', 0), default={})
+                latest = rows[-1] if rows else {}
+                return dict(registered=len(rows), sent=len(sent),
+                            first_registration_ms=rows[0].get('registered_epoch_ms') if rows else None,
+                            first_send_ms=first_sent.get('send_epoch_ms'),
+                            latest_status=latest.get('status'), latest_id=latest.get('client_order_id'),
+                            last_error={k: error[k] for k in _ERROR_FIELDS if k in error})
             return dict(registered=len(matches), sent=sum('_send_ns' in row for row in matches),
                         last_skip=self._skips.get((*key, entry['position_id'])) or self._skips.get((*key, '')),
                         latest=self._public(matches[-1]) if matches else {},
                         last_error={k: latest_error[k] for k in _ERROR_FIELDS if k in latest_error}
-                        if latest_error else {})
+                        if latest_error else {},
+                        ordinary=by_kind(False), follow=by_kind(True))
 
     def recent_errors(self, limit=6):
         if limit <= 0:

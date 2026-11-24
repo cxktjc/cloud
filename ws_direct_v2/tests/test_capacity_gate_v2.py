@@ -7,7 +7,7 @@ from tests import test_signal_follow_v2 as fixtures
 from v9711_live import config as cfg
 from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.nonblocking_io import NetworkIO
-from v9711_live.execution.submit_errors import ConfirmedSubmitRejection
+from v9711_live.execution.submit_errors import ConfirmedSubmitRejection, EntrySendGateRejection
 
 
 class CapacityGateTests(unittest.TestCase):
@@ -32,6 +32,33 @@ class CapacityGateTests(unittest.TestCase):
         io = object.__new__(NetworkIO)
         io._entry_gate, io._closed = self.trade.client.entry_gate, False
         return io
+
+    def test_worker_gate_distinguishes_bar_end_plan_rollover_and_sizing_change(self):
+        self.ordinary_plan()
+        self.event('N0USDT')
+        io = self.worker_gate()
+        cid = self.trade.tracked['N0USDT']['client_order_id']
+        gate = io._entry_gate
+        self.assertFalse(io.check_entry('N0USDT', cid, self.bar))
+        for now, update, reason in (
+            ((self.bar + cfg.BAR_MS)/1000, {'bar_ms': self.bar+cfg.BAR_MS}, 'entry_bar_ended_at_send'),
+            (self.now, {'bar_ms': self.bar+cfg.BAR_MS}, 'entry_plan_bar_changed'),
+            (self.now, {'held': cfg.SLOTS}, 'entry_position_cap_at_send'),
+        ):
+            with self.subTest(reason=reason):
+                prior, self.now = self.now, now
+                try:
+                    io._entry_gate = dict(gate, **update)
+                    with self.assertRaises(EntrySendGateRejection) as rejection:
+                        io.check_entry('N0USDT', cid, self.bar)
+                    self.assertEqual(rejection.exception.reason, reason)
+                finally:
+                    self.now = prior
+        self.trade.tracked['N0USDT']['sizing_weight'] = cfg.SLOT_WEIGHTS[1]
+        self.trade._publish_entry_gate()
+        with self.assertRaises(EntrySendGateRejection) as rejection:
+            self.worker_gate().check_entry('N0USDT', cid, self.bar)
+        self.assertEqual(rejection.exception.reason, 'entry_sizing_changed_at_send')
 
     def test_three_positions_outside_final_bar_block_all_new_ordinary_orders(self):
         self.held(3)

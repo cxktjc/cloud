@@ -9,7 +9,8 @@ from tests import test_book_ticker_v2 as fixtures
 from v9711_live import config as cfg
 from v9711_live.exchange.binance_futures_trade_ws import APIError, BinanceFuturesTradeWS
 from v9711_live.execution.entry_diagnostics import submission_diagnostic, unfilled_diagnosis
-from v9711_live.execution.submit_errors import EntryQuoteUnavailable, require_submit_ack, submit_error_is_ambiguous
+from v9711_live.execution.submit_errors import (EntryQuoteUnavailable, EntrySendGateRejection,
+    require_submit_ack, submit_error_is_ambiguous)
 from v9711_live.execution.entry_timing import EntrySendProbe, EntryTimings
 from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.nonblocking_io import NetworkIO
@@ -299,6 +300,30 @@ class EntryLatencyTests(unittest.TestCase):
         self.timing.outcome('retry', status='NEW', order_id='live', executed_qty=0)
         self.assertEqual(self.observe_signal()['unfilled_reason'], 'resting_unfilled')
         self.assertEqual(self.stats.snapshot()['recent_entry_errors'][0]['current_status'], 'NEW')
+
+    def test_ordinary_local_reject_is_not_hidden_by_sent_follow(self):
+        self.register('ordinary')
+        self.timing.mark('ordinary', 'registered')
+        self.timing.outcome('ordinary', status='SUBMIT_REJECTED', **submission_diagnostic(
+            EntrySendGateRejection('entry_bar_ended_at_send'), rejected=True))
+        self.advance(20)
+        self.timing.register('THEUSDT', 'follow', dict(order_bar_open_ms=self.bar, signal_follow=True),
+                             session_id='book')
+        self.timing.mark('follow', 'registered')
+        self.timing.mark('follow', 'send')
+        self.timing.outcome('follow', status='CANCELED', order_id='live', executed_qty=0,
+                            cancel_reason='signal_follow_ended')
+        entry = self.observe_signal()
+        self.assertEqual(entry['unfilled_reason'], 'ended_unfilled')
+        self.assertEqual(entry['first_order_timing']['client_order_id'], 'follow')
+        comparison = compute_comparison(actual_positions={}, open_orders={}, signal_portfolio={},
+            target_positions=[self.target], price_map={}, realized_balance=15)
+        output = TradeTerminalView()._format(dict(comparison=comparison, clock_utc='test',
+            session_entry_stats=self.stats.snapshot()))
+        self.assertIn('普通单：登记=1 实际发送=0', output)
+        self.assertIn('轮到发送时普通入场 bar 已结束', output)
+        self.assertIn('补挂单：登记=1 实际发送=1', output)
+        self.assertIn('下单耗时对应：补挂单 follow', output)
 
     def test_raw_batch_member_error_keeps_code_and_unknown_error_stays_unknown(self):
         for code, text, expected in ((-2019, 'Margin is insufficient.', 'exchange_rejected'),
