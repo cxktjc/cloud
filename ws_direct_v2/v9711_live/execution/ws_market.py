@@ -325,7 +325,7 @@ class DirectMarket:
     def write_mirror(self):
         atomic_write_json(self.output, self.snapshot())
 
-    def metrics(self, *, fresh_prices=None):
+    def metrics(self, *, fresh_prices=None, decision_percentiles=True):
         with self._lock:
             now = time.monotonic()
             previous, counts = self._rate_sample
@@ -335,7 +335,8 @@ class DirectMarket:
             counts, rates = dict(self.counts), dict(self._rates)
             counts['enqueued'] += self.events.replayed.get(self.source, 0)
             counts['screened_replayed'] = self.events.replayed.get(self.source, 0)
-            samples, admissions = list(self.latencies_us), list(self.admission_latencies_us[-64:])
+            samples = list(self.latencies_us) if decision_percentiles else ()
+            admissions = list(self.admission_latencies_us[-64:])
             received_symbols, peak = len(self.processed), max(self.queue_peak, self.events.peak)
         # Diagnostics must not hold the ingress lock while sorting samples or
         # evaluating the quote map. Receivers keep draining during this work.
@@ -352,7 +353,7 @@ class DirectMarket:
                         receive_to_decision_us_p50=percentile(.5),
                         receive_to_decision_us_p95=percentile(.95),
                         receive_to_decision_us_p99=percentile(.99),
-                        receive_to_decision_us_max=max(values) if values else None,
+                        receive_to_decision_us_max=values[-1] if values else None,
                         admission_dispatch_us_samples=admissions,
                         note='includes decision+durable intent+dispatch, not exchange ACK; rolling samples')
 
@@ -648,12 +649,12 @@ class DualMarket(DirectMarket):
 
     def metrics(self):
         ticks, bids, entries = self.price_maps()
-        result = super().metrics(fresh_prices=ticks)
+        result = super().metrics(fresh_prices=ticks, decision_percentiles=False)
         values = sorted(self.latencies_us + self.book.latencies_us)
         for suffix, fraction in (('p50', .5), ('p95', .95), ('p99', .99)):
             result['receive_to_decision_us_'+suffix] = values[int((len(values)-1)*fraction)] if values else None
-        result['receive_to_decision_us_max'] = max(values, default=None)
-        book_metrics = self.book.metrics(fresh_prices=bids)
+        result['receive_to_decision_us_max'] = values[-1] if values else None
+        book_metrics = self.book.metrics(fresh_prices=bids, decision_percentiles=False)
         for key in ('received', 'decided', 'rejected_old', 'rejected_backlog', 'overflow',
                     'enqueued', 'unchanged', 'overload_discarded', 'screened_far'):
             result[key] += book_metrics[key]

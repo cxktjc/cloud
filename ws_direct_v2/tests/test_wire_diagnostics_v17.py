@@ -104,6 +104,28 @@ class ActivityTests(unittest.TestCase):
         self.assertNotIn('触发价差=', panel)
 
 
+    def test_latency_maxima_report_the_actual_orders_and_missing_wake(self):
+        timings = EntryTimings()
+        timings.register('OLDUSDT', 'older-quote', dict(_entry_timing_context=dict(
+            _received_ns=1_000_000, _decision_ns=1_650_000_000)))
+        timings.register('WAKEUSDT', 'slow-wake', dict(_entry_timing_context=dict(
+            _received_ns=1_600_000_000, _event_received_ns=1_620_000_000,
+            _dequeued_ns=1_680_000_000, _decision_ns=1_700_000_000)))
+        timings.mark_at('older-quote', 'send', 1_677_000_000, 1677.)
+        timings.mark_at('slow-wake', 'send', 1_761_000_000, 1761.)
+        summary = timings.summary()
+        self.assertEqual(summary['max_ms'], 1676.)
+        self.assertEqual(summary['max_order']['symbol'], 'OLDUSDT')
+        self.assertEqual(summary['max_order']['latencies_ms']['decision_to_send'], 27.)
+        self.assertNotIn('trigger_to_send', summary['max_order']['latencies_ms'])
+        self.assertEqual(summary['trigger']['max_order']['symbol'], 'WAKEUSDT')
+        self.assertEqual(summary['trigger']['max_order']['latencies_ms']['queue_wait'], 60.)
+        self.assertEqual(summary['trigger']['max_ms'], 141.)
+        self.assertEqual(timings.summary(), summary)
+        timings.mark_at('older-quote', 'persisted', 1_660_000_000, 1660.)
+        self.assertIsNot(timings.summary(), summary)
+
+
 class WireTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.broker = BinanceFuturesTradeWS('fake-key', 'fake-secret')

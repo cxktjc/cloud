@@ -14,6 +14,7 @@ class EntryTimings:
         self._plans = {}
         self._recent = deque(maxlen=512)
         self._skips = OrderedDict()
+        self._summary_cache = None
         self.revision = 0
 
     def register(self, symbol, cid, row, *, session_id=''):
@@ -89,6 +90,7 @@ class EntryTimings:
                  ('dequeued_to_decision', 'dequeued', 'decision'),
                  ('trigger_to_send', 'event_received', 'send'),
                  ('quote_to_send', 'received', 'send'),
+                 ('decision_to_send', 'decision', 'send'),
                  ('decision_to_registered', 'decision', 'registered'),
                  ('registered_to_worker', 'registered', 'worker'),
                  ('worker_to_durable', 'worker', 'durable'),
@@ -164,22 +166,39 @@ class EntryTimings:
                   'socket_entered', 'socket_ready', 'checked', 'encoded', 'send')
         keys = tuple('_'+name+'_ns' for name in fields)
         with self._lock:
+            revision = self.revision
+            if self._summary_cache is not None and self._summary_cache[0] == revision:
+                return self._summary_cache[1]
             # Copy only bounded timestamp fields, then sort outside the lock.
             # Aggregation runs during feedback, never inside quote selection.
-            rows = [tuple(r.get(key) for key in keys)
+            rows = [(*map(r.get, keys), r['client_order_id'])
                     for r in (self._rows[cid] for cid in self._recent)]
-        def summarize(start, end='send'):
+        send = fields.index('send')
+        def summarize(start, end='send', *, identify_max=False):
             first, last = fields.index(start), fields.index(end)
-            values = sorted((r[last]-r[first])/1e6 for r in rows
-                            if r[-1] is not None and r[first] is not None
-                            and r[last] is not None and r[last] >= r[first])
-            return dict(samples=len(values), within_10ms=sum(v <= 10 for v in values),
+            if identify_max:
+                ranked = sorted((row[last]-row[first], row[-1]) for row in rows
+                                if row[send] is not None and row[first] is not None and row[last] >= row[first])
+                values = [span/1e6 for span, _ in ranked]
+                worst_cid = ranked[-1][1] if ranked else None
+            else:
+                values = sorted((row[last]-row[first])/1e6 for row in rows
+                                if row[send] is not None and row[first] is not None
+                                and row[last] is not None and row[last] >= row[first])
+                worst_cid = None
+            metrics = dict(samples=len(values), within_10ms=sum(v <= 10 for v in values),
                 p50_ms=round(values[int((len(values)-1)*.5)], 3) if values else None,
                 p95_ms=round(values[int((len(values)-1)*.95)], 3) if values else None,
                 p99_ms=round(values[int((len(values)-1)*.99)], 3) if values else None,
-                max_ms=round(max(values), 3) if values else None)
-        result = summarize('received')
-        result['trigger'] = summarize('event_received')
+                max_ms=round(values[-1], 3) if values else None)
+            if worst_cid is not None:
+                detail = self.order(worst_cid)
+                metrics['max_order'] = {key: detail[key] for key in (
+                    'symbol', 'client_order_id', 'signal_follow', 'trigger_symbol', 'trigger_source',
+                    'quote_source', 'received_epoch_ms', 'send_epoch_ms', 'latencies_ms') if key in detail}
+            return metrics
+        result = summarize('received', identify_max=True)
+        result['trigger'] = summarize('event_received', identify_max=True)
         result['stages'] = {name: summarize(start, end) for name, start, end in (
             ('queue_wait', 'event_received', 'dequeued'),
             ('dequeued_to_decision', 'dequeued', 'decision'),
@@ -201,6 +220,9 @@ class EntryTimings:
             ('sign_encode', 'checked', 'encoded'),
             ('encoded_to_send', 'encoded', 'send'),
             ('worker_to_send', 'worker', 'send'))}
+        with self._lock:
+            if self.revision == revision:
+                self._summary_cache = (revision, result)
         return result
 
 

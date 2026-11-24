@@ -293,6 +293,18 @@ class TradeTerminalView:
                 lines.insert(-1, f'本机依据报价→发送(ms，最近最多512次登记): P50={latency.get("p50_ms")} '
                              f'P95={latency.get("p95_ms")} P99={latency.get("p99_ms")} '
                              f'最大={latency.get("max_ms")} ≤10ms={latency.get("within_10ms")}/{latency.get("samples")}')
+                for label, stats in (('报价', latency), ('唤醒', trigger_latency)):
+                    worst = stats.get('max_order') or {}
+                    if not worst or stats['max_ms'] < 100:
+                        continue
+                    details = worst.get('latencies_ms') or {}
+                    segments = ' '.join(f'{name}={details[key]:.3f}ms' for key, name in (
+                        ('quote_to_decision', '报价→判断'), ('quote_age_at_wake', '唤醒时报价已存在'),
+                        ('queue_wait', '排队'), ('trigger_to_send', '唤醒→发送'),
+                        ('decision_to_send', '判断→发送')) if key in details)
+                    kind = '补挂' if worst.get('signal_follow') else '普通'
+                    lines.insert(-1, f'  {label}最慢单: {worst["symbol"]} {kind} {worst["client_order_id"]} '
+                                 f'发送={iso_ms(worst.get("send_epoch_ms"))} {segments}')
                 stages = latency.get('stages') or {}
                 if stages:
                     edges = (
