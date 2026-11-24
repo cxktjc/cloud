@@ -343,6 +343,8 @@ class ExchangeClient(BatchEntryMixin):
         self.price_file = Path(price_file)
         self.network_io = None
         self.entry_timings = None
+        from .request_activity import RequestActivity
+        self.request_activity = RequestActivity()  # Shared by shallow-copied worker lanes.
         self._transport_local = threading.local()
         self._transport_lock = threading.Lock()
         self._transport_lanes = {}
@@ -370,6 +372,7 @@ class ExchangeClient(BatchEntryMixin):
             if not key or not secret:
                 raise DisabledExchange('BINANCE_API_KEY/BINANCE_API_SECRET not available')
             self._broker = ws.BinanceWSBroker(key, secret, dry_run=self.dry_run)
+            self._broker._broker.request_activity = self.request_activity
         return self._broker
 
     def _ready_broker(self) -> Any:
@@ -702,14 +705,13 @@ class ExchangeClient(BatchEntryMixin):
                     order_bar_open_ms > 0
                     and order_bar_open_ms <= time.time() * 1000 < order_bar_open_ms + cfg.BAR_MS):
                 raise ConfirmedSubmitRejection('entry order bar expired/not active before send')
-            if detail != send_quote:
-                self._log_entry_quote(symbol.upper(), client_order_id, detail)
             send_quote = detail
         result = self._broker_call(
             'place_order', symbol.upper(), 'BUY', qty_text,
             price=price_text, position_side='LONG',
             client_order_id=client_order_id,
             before_send=EntrySendProbe(check_bar, self.entry_timings, client_order_id))
+        self._log_entry_quote(symbol.upper(), client_order_id, send_quote)
         return dict(result, _entry_send_quote=send_quote) if send_quote and isinstance(result, Mapping) else result
 
     def cancel(self, *, symbol: str, order_id: Any = None,

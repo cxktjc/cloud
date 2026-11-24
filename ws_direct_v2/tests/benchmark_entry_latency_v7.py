@@ -199,6 +199,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             def require_broker(inner):
                 if inner._broker is None:
                     inner._broker = BinanceWSBroker('offline-key', 'offline-secret', ws_url='wss://offline.invalid')
+                    inner._broker._broker.request_activity = inner.request_activity
                 return inner._broker
             case.stack.enter_context(patch.object(lifecycle.websockets, 'connect', side_effect=connect))
             case.stack.enter_context(patch.object(ExchangeClient, '_require_broker', require_broker))
@@ -381,6 +382,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 send['admission_recheck_gap'] = audit.get('entry_recheck_gap')
             pressure['sent_check_counts'] = {key: sum(s.get('send_quote_check') == key for s in sends+background_sends)
                 for key in ('near_skipped', 'far_passed', 'far_rejected', 'follow_skipped')}
+            pressure['request_activity'] = trade.client.request_activity.snapshot()
             values = [s['ms'] for s in sends]
         elif blocked:
             # One resting exact order is queried while another symbol crosses.

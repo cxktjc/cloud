@@ -662,11 +662,11 @@ class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
             started, release = asyncio.Event(), asyncio.Event()
             calls, sent = [], []
             async def consume(group, state, **kw):
-                calls.append((kw['stream_kind'], time.monotonic()))
+                calls.append((kw['stream_kind'], time.perf_counter()))
                 if len(calls) == 1:
                     started.set()
                     await release.wait()  # Handshake/subscription still pending.
-                sent.append(time.monotonic())
+                sent.append(time.perf_counter())
                 kw['startup_done'].set()
                 if len(calls) == 2:
                     kw['stop'].set()

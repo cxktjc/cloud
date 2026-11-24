@@ -84,9 +84,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261123-retry-evidence-v16', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261124-wire-diagnostics-v17', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
+        self.market.request_activity = self.market.book.request_activity = self.client.request_activity
         self._desired_path_display = str(cfg.DESIRED_FILE.resolve())
         self.client.entry_account_guard = self._account_send_allowed
         self.client.entry_quote_guard = self._entry_quote_send_allowed
@@ -709,6 +710,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._entry_diagnostics['ws_direct']['quote_routes'] = dict(self._quote_routes)
         self._entry_diagnostics['ws_direct']['runtime'] = self._runtime_source
         self._entry_diagnostics['ws_direct']['entry_latency'] = self.session_entries.timings.summary()
+        self._entry_diagnostics['ws_direct']['request_activity'] = self.client.request_activity.snapshot()
         if self.ledger._background is not None:
             self._entry_diagnostics['ws_direct']['durability_writer'] = self.ledger._background.health()
             self._entry_diagnostics['ws_direct']['durability_writer']['gil_switch_ms'] = sys.getswitchinterval()*1000

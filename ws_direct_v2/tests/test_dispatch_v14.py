@@ -141,7 +141,10 @@ class GapEvidenceTests(unittest.TestCase):
         row = self.register(trigger='BTCUSDT', price=90000.).order('cid')
         self.assertIsNone(row['trigger_gap'])
         self.assertAlmostEqual(row['admission_gap'], .005)
-        self.assertIn('不适用（跨币触发）', '\n'.join(entry_timing_lines(row)))
+        panel = '\n'.join(entry_timing_lines(row))
+        self.assertIn('币对=XUSDT 本币准入价=1.005', panel)
+        self.assertIn('跨币仅唤醒评估，不参与本币比价', panel)
+        self.assertNotIn('触发价差=', panel)
 
     def test_negative_and_missing_quotes_are_distinguished(self):
         row = self.register(price=.99).order('cid')

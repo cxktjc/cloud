@@ -123,13 +123,15 @@ class BatchEntryMixin:
             except Exception as exc:
                 outcome[cid]=(None,exc)
             return outcome
-        for row,wire in current:
-            self._log_entry_quote(wire['symbol'], wire['newClientOrderId'], quotes[wire['newClientOrderId']])
         if self.dry_run or not self.enabled:
             replies=[dict(_simulated=True,symbol=w['symbol'],clientOrderId=w['newClientOrderId'],
                 orderId='simbatch-'+w['newClientOrderId'],status='NEW',executedQty='0',avgPrice='0',
                 price=w['price'],origQty=w['quantity']) for _,w in current]
         else:
+            activity = getattr(self, 'request_activity', None)
+            attempt = activity.begin('entry', transport='REST_BATCH', members=len(current),
+                                     symbols=[wire['symbol'] for _, wire in current]) if activity else None
+            failure = None
             try:
                 if timings is not None:
                     for row, wire in current:
@@ -139,12 +141,17 @@ class BatchEntryMixin:
                     for row, wire in current:
                         timings.mark(wire['newClientOrderId'], 'response')
             except Exception as exc:
+                failure = exc
                 self._record_rate_limit(exc)
                 for row,wire in current:
                     outcome[str(row['client_order_id'])]=(None,exc)
                 return outcome
+            finally:
+                if activity:
+                    activity.finish(attempt, error=failure)
         for i,(row,wire) in enumerate(current):
             cid=wire['newClientOrderId']
+            self._log_entry_quote(wire['symbol'], cid, quotes[cid])
             try:
                 if not isinstance(replies,list):
                     raise RuntimeError('batch response is not a list; exact fate unknown')
@@ -161,6 +168,9 @@ class BatchEntryMixin:
                 else:
                     raise RuntimeError('batch member identity/result missing; exact fate unknown')
                 self._record_rate_limit(result)
+                activity = getattr(self, 'request_activity', None)
+                if activity and isinstance(result, Mapping) and int(result.get('code', 0) or 0) < 0:
+                    activity.member_reject(result['code'])
                 result=require_submit_ack(result,symbol=wire['symbol'],client_order_id=cid)
                 if quotes[cid]:
                     result=dict(result, _entry_send_quote=quotes[cid])

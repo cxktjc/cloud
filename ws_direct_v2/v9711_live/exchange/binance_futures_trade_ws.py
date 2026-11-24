@@ -389,12 +389,25 @@ class BinanceFuturesTradeWS(TradeWSLifecycle):
         await self.close()
 
     async def _request(self, method, params, *, signed, before_send=None):
+        probe = getattr(before_send, 'stage', None)
+        if probe:
+            probe('socket_entered')
         async with self._lock:
             await self._ensure_connected()
+            if probe:
+                probe('socket_ready')
             # Revalidate AFTER a reconnect/lock wait and BEFORE signing/sending.
             # An expired or withdrawn plan must not be sent from the old queue.
             if before_send is not None:
-                before_send()
+                try:
+                    before_send()
+                except Exception:
+                    activity = getattr(self, 'request_activity', None)
+                    if activity:
+                        activity.local_reject()
+                    raise
+            if probe:
+                probe('checked')
             request_params = {k:_normalize_param_value(v) for k,v in dict(params or {}).items() if v is not None}
             request_params.setdefault('apiKey', self.api_key)
             if signed:
@@ -404,8 +417,15 @@ class BinanceFuturesTradeWS(TradeWSLifecycle):
                 request_params['signature'] = _ws_sign(request_params, self.api_secret)
             request_id = str(uuid.uuid4())
             payload = dict(id=request_id, method=method, params=request_params)
+            activity = getattr(self, 'request_activity', None)
+            attempt = None
             try:
                 wire = json.dumps(payload, separators=(',', ':'))
+                if probe:
+                    probe('encoded')
+                if activity:
+                    from ..execution.request_activity import request_kind
+                    attempt = activity.begin(request_kind(method, params or {}), (params or {}).get('symbol', ''))
                 on_send = getattr(before_send, 'wire_sent', None)
                 if callable(on_send):
                     on_send()
@@ -414,11 +434,22 @@ class BinanceFuturesTradeWS(TradeWSLifecycle):
                 on_reply = getattr(before_send, 'reply_received', None)
                 if callable(on_reply):
                     on_reply()
-            except (Exception, asyncio.CancelledError):
+            except (Exception, asyncio.CancelledError) as exc:
+                if activity and attempt is not None:
+                    activity.finish(attempt, error=exc)
                 # Sending may already have succeeded. Recover the CONNECTION
                 # only; exact intent/query/stream reconciliation resolves fate.
                 await self._invalidate_locked()
                 raise
+            else:
+                if activity and attempt is not None:
+                    try:
+                        status = int(response.get('status', 0))
+                        code = (response.get('error') or {}).get('code', status) if status not in (200, 201, 204) else None
+                    except Exception as exc:
+                        activity.finish(attempt, error=exc)
+                        raise  # Malformed ACK remains unknown; do not leak an in-flight counter.
+                    activity.finish(attempt, code=code)
         status = int(response.get('status', 0))
         if status not in (200, 201, 204):
             error = response.get('error') or {}

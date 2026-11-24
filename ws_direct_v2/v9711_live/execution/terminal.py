@@ -43,6 +43,7 @@ def iso_ms(ms: Any) -> str:
 
 def entry_timing_lines(timing):
     timing = timing or {}
+    cross_symbol = bool(timing.get('trigger_symbol') and timing['trigger_symbol'] != timing.get('symbol'))
     line = (f'      首次下单={iso_ms(timing.get("send_epoch_ms"))} '
             f'收到行情={iso_ms(timing.get("received_epoch_ms"))} '
             f'来源={timing.get("quote_source", "未记录")} '
@@ -60,6 +61,9 @@ def entry_timing_lines(timing):
                   ('send_to_response', '发送→回包'), ('response_to_owner', '回包→主线程确认'))
     details = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in labels if key in delays
                       and (key != 'worker_to_send' or 'durable_to_send' not in delays))
+    if cross_symbol:
+        line = line.replace('收到行情=', '本币报价接收=')
+        details = details.replace('收行情→判断=', '本币报价→判断=')
     stages = (f'      该单登记={iso_ms(timing.get("registered_epoch_ms"))} '
               +(f'落盘完成={iso_ms(timing.get("persisted_epoch_ms") or timing["durable_epoch_ms"])} '
                 if timing.get('persisted_epoch_ms') or timing.get('durable_epoch_ms') else '')
@@ -70,6 +74,9 @@ def entry_timing_lines(timing):
         ('trigger_to_send', '触发行情→发送'), ('quote_to_send', '依据报价→发送')) if key in delays)
     trigger = (f'触发={timing["trigger_symbol"]}/{timing.get("trigger_source")} '
                if timing.get('trigger_symbol') else '')
+    if cross_symbol:
+        extra = extra.replace('触发行情', '唤醒行情')
+        trigger = f'评估唤醒={timing["trigger_symbol"]}/{timing.get("trigger_source")} '
     quote_lines = []
     if timing and ('order_limit_price' in timing or 'trigger_price' in timing):
         def number(value, *, percent=False):
@@ -80,12 +87,20 @@ def entry_timing_lines(timing):
             except (TypeError, ValueError, OverflowError):
                 pass
             return '未记录'
-        cross_symbol = timing.get('trigger_symbol') and timing['trigger_symbol'] != timing.get('symbol')
-        trigger_gap = '不适用（跨币触发）' if cross_symbol else number(timing.get('trigger_gap'), percent=True)
+        trigger_gap = number(timing.get('trigger_gap'), percent=True)
         quote_lines = [f'      报价与挂单: {trigger}触发价={number(timing.get("trigger_price"))} '
                        f'挂单价={number(timing.get("order_limit_price"))} 触发价差={trigger_gap} '
                        f'准入价={number(timing.get("admission_price"))} '
                        f'准入价差={number(timing.get("admission_gap"), percent=True)}']
+        if cross_symbol:
+            quote_lines = [f'      报价与挂单: 币对={timing.get("symbol")} '
+                           f'本币准入价={number(timing.get("admission_price"))} '
+                           f'挂单价={number(timing.get("order_limit_price"))} '
+                           f'准入价差={number(timing.get("admission_gap"), percent=True)}',
+                           f'      {trigger}唤醒价={number(timing.get("trigger_price"))} '
+                           '（跨币仅唤醒评估，不参与本币比价）']
+        if 'quote_age_at_wake' in delays:
+            quote_lines.append(f'      本币报价在唤醒时已存在={delays["quote_age_at_wake"]:.3f}ms（报价年龄，非排队耗时）')
     save_parts = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
         ('journal_prepare', '准备'), ('journal_write', '写入'),
         ('journal_sync', '同步'), ('journal_receipt', '回执')) if key in delays)
@@ -95,8 +110,12 @@ def entry_timing_lines(timing):
               'far_rejected': '准入距离>1.5%，二次行情检查拒绝'}
     check = timing.get('entry_send_check')
     check_lines = [f'      发送检查: {checks.get(check, check)}'] if check else []
+    prepare = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
+        ('durable_to_socket', '续发→socket协程'), ('socket_wait', 'socket等待/连接'),
+        ('send_guard', '发送检查'), ('sign_encode', '签名编码'), ('encoded_to_send', '编码后→发送')) if key in delays)
     return [line]+([stages] if timing else [])+([f'      分段耗时: {details}'] if details else [])+(
-        [f'      保存细分: {save_parts}'] if save_parts else [])+quote_lines+check_lines+(
+        [f'      保存细分: {save_parts}'] if save_parts else [])+(
+        [f'      发送准备细分: {prepare}'] if prepare else [])+quote_lines+check_lines+(
         [f'      入场链路: {trigger}{extra}'] if extra else [])
 
 
@@ -267,7 +286,7 @@ class TradeTerminalView:
             latency = ws.get('entry_latency') or {}
             trigger_latency = latency.get('trigger') or {}
             if trigger_latency.get('samples'):
-                lines.insert(-1, f'本机触发行情→发送(ms): P50={trigger_latency.get("p50_ms")} '
+                lines.insert(-1, f'本机评估唤醒→发送(ms，含跨币唤醒): P50={trigger_latency.get("p50_ms")} '
                              f'P95={trigger_latency.get("p95_ms")} P99={trigger_latency.get("p99_ms")} '
                              f'最大={trigger_latency.get("max_ms")} ≤10ms={trigger_latency.get("within_10ms")}/{trigger_latency.get("samples")}')
             if latency.get('samples'):
@@ -300,6 +319,26 @@ class TradeTerminalView:
                             ('journal_prepare', '准备'), ('journal_write', '写入'),
                             ('journal_sync', '同步'), ('journal_receipt', '回执'))]
                         lines.insert(-1, '日志保存分段P95(ms): '+' '.join(pieces)+'；各段分位数不可相加')
+                    if (stages.get('socket_wait') or {}).get('samples'):
+                        pieces = [f'{label}={(stages.get(key) or {}).get("p95_ms")}' for key, label in (
+                            ('durable_to_socket', '续发→socket协程'), ('socket_wait', 'socket等待/连接'),
+                            ('send_guard', '发送检查'), ('sign_encode', '签名编码'), ('encoded_to_send', '编码后→发送'))]
+                        lines.insert(-1, '发送准备分段P95(ms): '+' '.join(pieces)+'；各段分位数不可相加')
+            activity = ws.get('request_activity') or {}
+            windows = activity.get('windows') or {}
+            if windows:
+                parts = [f'{label}='+ '/'.join(str(windows.get(w, {}).get(key, 0)) for w in ('1', '10', '60'))
+                         for key, label in (('entry', '入场'), ('close', '平仓'), ('cancel', '撤单'), ('query', '查询'))]
+                ten, minute = windows.get('10', {}), windows.get('60', {})
+                lines.insert(-1, '交易请求尝试（最近1/10/60秒，非成交数）: '+' '.join(parts)+
+                             f' 在途={activity.get("inflight", 0)} 峰值在途={activity.get("peak_inflight", 0)}')
+                lines.insert(-1, f'交易/接收诊断: 10秒请求失败={ten.get("failed", 0)} 批次成员拒绝={ten.get("member_rejected", 0)} '
+                             f'本地未发拒绝={ten.get("local_rejected", 0)} '
+                             f'限频回包={ten.get("rate_limited", 0)} 错误={ten.get("errors", {})} '
+                             f'60秒请求峰值={minute.get("peak_requests_per_second", 0)}/s '
+                             f'接收循环延迟最大={minute.get("loop_lag_max_ms", 0)}ms '
+                             f'请求最多币对={minute.get("top_symbols", {})} '
+                             f'累计socket故障={ws.get("socket_failures", {})}')
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
                 lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '
@@ -347,6 +386,13 @@ class TradeTerminalView:
                     status = '已恢复' if row.get('recovered') else '未恢复'
                     block.append(f'  {iso(row["last_epoch"]*1000)} {row["source"]} group={row["group"]} '
                                  f'次数={row["count"]} [{status}] {row["error"]}')
+                    before = row.get('activity_before_failure')
+                    if before is not None:
+                        block.append(f'    断线前10秒: 入场={before.get("entry", 0)} 平仓={before.get("close", 0)} '
+                                     f'撤单={before.get("cancel", 0)} 查询={before.get("query", 0)} '
+                                     f'请求失败={before.get("failed", 0)} 限频={before.get("rate_limited", 0)} '
+                                     f'接收循环延迟最大={before.get("loop_lag_max_ms", 0)}ms '
+                                     f'在途={before.get("inflight", 0)} 行情积压={before.get("queue", 0)}')
                 block.append(f'完整日志: {cfg.TRADE_LOG_FILE}')
                 block.append('-' * 116)
                 lines[4:4] = block

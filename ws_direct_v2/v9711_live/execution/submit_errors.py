@@ -36,6 +36,7 @@ _UNCERTAIN = _TRANSPORT + (
 # Only recognizable request/validation rejection messages. Never infer rejection
 # from an arbitrary negative API code, HTTP 5xx, or the bare word "rejected".
 _REJECTED = (
+    'please sign tradfi-perps agreement contract',
     'price not increased by tick size', 'quantity not increased by step size',
     'quantity less than min quantity', 'quantity greater than max quantity',
     'price less than min price', 'price greater than max price',
@@ -70,6 +71,13 @@ def is_transport_error(exc: BaseException) -> bool:
     return any(isinstance(error, (TimeoutError, ConnectionError, OSError))
                or any(marker in str(error).lower() for marker in _TRANSPORT)
                for error in _exception_chain(exc))
+
+
+def is_agreement_rejection(exc: BaseException) -> bool:
+    # Explicit permission refusal only; a timeout/wrapper never proves absence.
+    return (not is_transport_error(exc) and any(
+        'please sign tradfi-perps agreement contract' in ' '.join(str(error).lower().split())
+        for error in _exception_chain(exc)))
 
 
 def submit_error_is_ambiguous(exc: BaseException) -> bool:

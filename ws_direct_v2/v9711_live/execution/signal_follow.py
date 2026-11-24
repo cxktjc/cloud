@@ -7,7 +7,7 @@ import time
 from typing import Mapping
 
 from .. import config as cfg
-from .submit_errors import EntryQuoteUnavailable
+from .submit_errors import EntryQuoteUnavailable, is_agreement_rejection
 
 FOLLOW_ORDER_CAP = cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS
 FOLLOW_POSITION_CAP = cfg.SIGNAL_FOLLOW_POSITION_STOP
@@ -122,6 +122,9 @@ class SignalFollowMixin:
                 # Known not sent: the next fresh quote can restore a follow
                 # immediately. Keep the advanced identity, never reuse its ID.
                 retry_after.pop(identity, None)
+            elif is_agreement_rejection(exc):
+                self.ledger.state.setdefault('signal_follow_permission_blocks', {})[identity] = dict(
+                    symbol=row.get('symbol'), error=str(exc)[:300], rejected_epoch=time.time())
             else:
                 retry_after[identity] = time.time() + 10.0
         return super()._reject_entry_submission(row, cid, exc)
@@ -145,6 +148,13 @@ class SignalFollowMixin:
         targets = self._follow_targets(snapshot, now=now)
         complete = self._follow_snapshot_complete(snapshot, targets)
         if fresh_signal and complete:
+            blocks = self.ledger.state.get('signal_follow_permission_blocks', {})
+            active = {row['position_id'] for row in targets.values()}
+            removed = [identity for identity in blocks if identity not in active]
+            for identity in removed:
+                blocks.pop(identity)
+            if removed:
+                self.ledger.save()
             self._promote_signal_follow_orders(snapshot, now=now)
         follows = [(s, r) for s, r in self.tracked.items() if r.get('signal_follow')]
         for index, (symbol, row) in enumerate(follows):
@@ -172,6 +182,9 @@ class SignalFollowMixin:
                         self._request_cancel(symbol, old, 'signal_follow_different_entry')
                     continue
                 if now < self._finite(self.ledger.state.get('signal_follow_retry_after', {}).get(target['position_id'])):
+                    continue
+                if target['position_id'] in self.ledger.state.get('signal_follow_permission_blocks', {}):
+                    self._submit_skip_reasons[symbol] = 'signal_follow_agreement_rejected_for_position'
                     continue
                 price = self._finite(prices.get(symbol))
                 if price <= 0:

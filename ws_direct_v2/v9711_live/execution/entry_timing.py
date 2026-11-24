@@ -27,6 +27,7 @@ class EntryTimings:
                 pass
             return None
         context.update(order_limit_price=limit, signal_limit_price=row.get('limit_price'),
+            quote_symbol=symbol, signal_follow=bool(row.get('signal_follow')),
             admission_gap=gap(context.get('admission_price')),
             trigger_gap=gap(context.get('trigger_price')) if context.get('trigger_symbol') == symbol else None)
         with self._lock:
@@ -82,6 +83,7 @@ class EntryTimings:
     def _public(row):
         result = {k: v for k, v in row.items() if not k.startswith('_')}
         edges = (('quote_to_decision', 'received', 'decision'),
+                 ('quote_age_at_wake', 'received', 'event_received'),
                  ('queue_wait', 'event_received', 'dequeued'),
                  ('dequeued_to_decision', 'dequeued', 'decision'),
                  ('trigger_to_send', 'event_received', 'send'),
@@ -98,6 +100,11 @@ class EntryTimings:
                  ('journal_receipt', 'synced', 'persisted'),
                  ('persisted_to_durable', 'persisted', 'durable'),
                  ('durable_to_send', 'durable', 'send'),
+                 ('durable_to_socket', 'durable', 'socket_entered'),
+                 ('socket_wait', 'socket_entered', 'socket_ready'),
+                 ('send_guard', 'socket_ready', 'checked'),
+                 ('sign_encode', 'checked', 'encoded'),
+                 ('encoded_to_send', 'encoded', 'send'),
                  ('worker_to_send', 'worker', 'send'),
                  ('send_to_response', 'send', 'response'),
                  ('response_to_owner', 'response', 'owner_ack'))
@@ -133,7 +140,8 @@ class EntryTimings:
 
     def summary(self):
         fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker',
-                  'write_started', 'prepared', 'written', 'synced', 'persisted', 'durable', 'send')
+                  'write_started', 'prepared', 'written', 'synced', 'persisted', 'durable',
+                  'socket_entered', 'socket_ready', 'checked', 'encoded', 'send')
         keys = tuple('_'+name+'_ns' for name in fields)
         with self._lock:
             # Copy only bounded timestamp fields, then sort outside the lock.
@@ -167,6 +175,11 @@ class EntryTimings:
             ('journal_receipt', 'synced', 'persisted'),
             ('persisted_to_durable', 'persisted', 'durable'),
             ('durable_to_send', 'durable', 'send'),
+            ('durable_to_socket', 'durable', 'socket_entered'),
+            ('socket_wait', 'socket_entered', 'socket_ready'),
+            ('send_guard', 'socket_ready', 'checked'),
+            ('sign_encode', 'checked', 'encoded'),
+            ('encoded_to_send', 'encoded', 'send'),
             ('worker_to_send', 'worker', 'send'))}
         return result
 
@@ -178,6 +191,10 @@ class EntrySendProbe:
 
     def __call__(self):
         return self.guard()
+
+    def stage(self, name):
+        if self.timings is not None:
+            self.timings.mark(self.cid, name)
 
     def wire_sent(self):
         if self.timings is not None:

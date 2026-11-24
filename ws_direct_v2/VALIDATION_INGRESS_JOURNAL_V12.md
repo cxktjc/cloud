@@ -5,6 +5,7 @@
 保存优化、触发价差和当前 v14 验证见 [VALIDATION_DURABILITY_GAP_V14.md](VALIDATION_DURABILITY_GAP_V14.md)。
 当前 v15 的 1.5% 分级二次检查见 [VALIDATION_TIERED_RECHECK_V15.md](VALIDATION_TIERED_RECHECK_V15.md)。
 拒绝后重复登记修复及当前 v16 验证见 [VALIDATION_RETRY_EVIDENCE_V16.md](VALIDATION_RETRY_EVIDENCE_V16.md)。
+当前 v17 的面板归因、发送准备分段及断线前请求统计见 [VALIDATION_WIRE_DIAGNOSTICS_V17.md](VALIDATION_WIRE_DIAGNOSTICS_V17.md)。
 下文的发送前报价复核及限价平仓描述不再作为当前执行规则。
 
 运行标识：`20261123-ingress-journal-v12`。仅改 cloud 仓库 `ws_direct_v2`。

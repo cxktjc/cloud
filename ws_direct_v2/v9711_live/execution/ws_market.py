@@ -76,6 +76,8 @@ class DirectMarket:
         self._threads = []
         self._loop = self._async_stop = None
         self._last_wire_ns = 0
+        self.request_activity = None
+        self.socket_failures = 0
 
     def _wake(self):
         try:
@@ -93,7 +95,16 @@ class DirectMarket:
         self._wake()
 
     def group_failed(self, index, message):
+        socket_failure = (message not in ('scheduled reconnect', 'collector stopped')
+                          and not str(message).startswith('WS owner queue overflow;'))
+        context = None
+        if socket_failure and self.request_activity is not None:
+            context = self.request_activity.snapshot()
+            context = dict(context['windows']['10'], inflight=context['inflight'], queue=self.events.qsize())
+            LOG.warning('WS failure context source=%s group=%s prior10s=%s', self.source, index, context)
         with self._lock:
+            if socket_failure:
+                self.socket_failures += 1
             self.receipts.pop(index, None)
             self._recovered_since.pop(index, None)
             self.errors[index] = str(message)
@@ -106,6 +117,8 @@ class DirectMarket:
                 else:
                     previous = dict(group=index, error=detail, count=0, first_epoch=time.time())
                 previous.update(count=previous['count']+1, last_epoch=time.time())
+                if context is not None:
+                    previous['activity_before_failure'] = context
                 self.error_history.append(previous)
                 del self.error_history[:-5]
         self._wake()
@@ -347,7 +360,9 @@ class DirectMarket:
         await self._receive_feeds(((self, 'aggTrade', ticker_ws.WS_BASE),))
 
     async def _startup_pause(self):
-        await asyncio.sleep(1.0)
+        deadline = time.perf_counter()+1.
+        while (remaining := deadline-time.perf_counter()) > 0:
+            await asyncio.sleep(remaining)  # Windows event-loop clocks may wake a timer early.
 
     async def _launch_receivers(self, feeds, tasks):
         specs = [(feed, stream, base, index, group)
@@ -372,6 +387,7 @@ class DirectMarket:
             self._async_stop.set()
         startup = asyncio.create_task(self._launch_receivers(feeds, tasks))
         stopping = asyncio.create_task(self._async_stop.wait())
+        monitor = asyncio.create_task(self._monitor_loop())
         try:
             completed, _ = await asyncio.wait((startup, stopping), return_when=asyncio.FIRST_COMPLETED)
             if startup in completed:
@@ -380,10 +396,19 @@ class DirectMarket:
         finally:
             startup.cancel()
             stopping.cancel()
-            await asyncio.gather(startup, stopping, return_exceptions=True)
+            monitor.cancel()
+            await asyncio.gather(startup, stopping, monitor, return_exceptions=True)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _monitor_loop(self):
+        # One probe per receiver loop, ten times/second, never per market frame.
+        while not self._async_stop.is_set():
+            expected = time.monotonic()+.1
+            await asyncio.sleep(.1)
+            if self.request_activity is not None:
+                self.request_activity.observe_loop_lag(time.monotonic()-expected)
 
     def start(self):
         def receive():
@@ -644,6 +669,7 @@ class DualMarket(DirectMarket):
         result['depth_endpoint'] = ticker_ws.BOOK_WS_BASE
         result['recent_errors'] = sorted(self.recent_errors()+self.book.recent_errors(),
                                          key=lambda row: row['last_epoch'], reverse=True)[:5]
+        result['socket_failures'] = dict(tick=self.socket_failures, depth=self.book.socket_failures)
         return result
 
     async def _receive(self):
