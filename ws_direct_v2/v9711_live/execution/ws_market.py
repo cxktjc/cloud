@@ -447,6 +447,9 @@ class DirectMarket:
     def entry_prices(self, symbols=None):
         return self.prices(symbols)
 
+    def entry_price(self, symbol):
+        return self.entry_prices([symbol]).get(symbol)
+
     def entry_quote(self, symbol):
         price = self.entry_prices([symbol]).get(symbol)
         return dict(tick=price, bid0=None, selected=price, source='tick' if price is not None else None)
@@ -526,6 +529,9 @@ class DualMarket(DirectMarket):
                    for symbol in self.symbols for feed in (self, self.book))
 
     def order_allowed(self, symbol):
+        return self.entry_price(symbol) is not None
+
+    def entry_price(self, symbol):
         clock = self._quote_clock()
         tick = self._quote(self, symbol, clock=clock)
         bid = self._quote(self.book, symbol, clock=clock)
@@ -533,7 +539,7 @@ class DualMarket(DirectMarket):
         if cutoffs:
             tick = self._post_rejection_price(self, symbol, tick, cutoffs['tick'])
             bid = self._post_rejection_price(self.book, symbol, bid, cutoffs['bid0'])
-        return tick is not None or bid is not None
+        return bid if tick is None else tick if bid is None else min(tick, bid)
 
     def prices(self, symbols=None):
         # Deliberately keep tick-only valuation and the signal price mirror.

@@ -256,6 +256,10 @@ async def consume_group(
                 def reject(reason):
                     rejected[reason] = rejected.get(reason, 0) + 1
                 while not stop.is_set():
+                    if raw_count and raw_count % 64 == 0:
+                        await asyncio.sleep(0)
+                        if stop.is_set():
+                            break
                     now_mono = time.monotonic()
                     if now_mono - connected_at >= reconnect_before:
                         state.group_failed(group_index, "scheduled reconnect")
@@ -279,10 +283,6 @@ async def consume_group(
                             f"valid={valid_count} rejected={rejected} waiting_for={'next_data' if received else 'first_data'}") from exc
                     wire_ns = time.monotonic_ns()
                     raw_count += 1
-                    if raw_count % 64 == 0:
-                        # recv() may complete synchronously from a full buffer.
-                        # Give other groups, pings and reconnects a fair turn.
-                        await asyncio.sleep(0)
                     message = json.loads(raw)
                     if not isinstance(message, dict):
                         raise ValueError("expected JSON object from combined stream")
@@ -317,8 +317,6 @@ async def consume_group(
                         reject('stale_or_future_timestamp')
                         continue
                     if hasattr(state, '_last_wire_ns'):
-                        # Set immediately before update: another group may
-                        # have run during the explicit fairness yield above.
                         state._last_wire_ns = wire_ns
                     try:
                         accepted = (state.update_book(symbol, data.get('b'), data.get('B'), stamp, data.get('u'))
@@ -349,15 +347,17 @@ async def consume_group(
             lifetime = time.monotonic()-connected_at if connected_at is not None else 0.
             if received and lifetime >= STABLE_CONNECTION_SECONDS:
                 retry = 1.0
+            slot = ((group_index - 1) * 2 + int(stream_kind != 'bookTicker')) % 32
+            delay = retry + slot / 32
             LOG.warning("market stream=%s group=%s disconnected endpoint=%s proxy=disabled/direct "
                         "lifetime=%.3fs messages=%d valid=%d retry=%.1fs error=%s",
-                        stream_kind, group_index, selected_base, lifetime, raw_count, valid_count, retry, detail)
+                        stream_kind, group_index, selected_base, lifetime, raw_count, valid_count, delay, detail)
             state.group_failed(group_index, detail)
             if startup_done is not None:
                 startup_done.set()  # A failed first attempt must not starve later groups.
             if not received:
                 endpoint_index += 1
-            await asyncio.sleep(retry)
+            await asyncio.sleep(delay)
             retry = min(retry * 2.0, 30.0)
 
 

@@ -206,12 +206,14 @@ class ReceiverRecoveryTests(unittest.IsolatedAsyncioTestCase):
             async def __aenter__(self): return Socket()
             async def __aexit__(self, *args): pass
         async def witness():
-            witnessed.append(frames[0])
+            witnessed.append((frames[0], state.update_book.call_count))
         task = asyncio.create_task(witness())
         await self.consume(state, lambda *args, **kwargs: Connection(), stop)
         await task
         self.assertEqual(len(witnessed), 1)
-        self.assertLess(witnessed[0], 128)
+        read, processed = witnessed[0]
+        self.assertLess(read, 128)
+        self.assertEqual(read, processed)
         self.assertEqual(state.update_book.call_count, 128)
 
     async def test_stable_connection_resets_backoff(self):

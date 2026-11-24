@@ -456,6 +456,11 @@ class TradeTerminalView:
                         block.append('      该笔signal尚无匹配的下单时间记录；不使用其他入场bar的记录代填。')
                     attempts = row.get('order_attempts') or {}
                     latest = attempts.get('latest') or {}
+                    if not attempts.get('sent'):
+                        if attempts.get('last_skip'):
+                            block.append(f'      未见发送；最近一次登记前拦截：{attempts["last_skip"]}')
+                        elif not latest:
+                            block.append('      未见登记或发送；没有绑定到这笔信号的拦截证据，具体原因未知。')
                     if latest:
                         reasons = {'order_bar_expired': '入场bar结束', 'entry_gap_too_far': '距离超过撤单门槛',
                                    'replaced_by_closer': '被更近候选替换', 'position_capacity_full': '持仓容量已满',

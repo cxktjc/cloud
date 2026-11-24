@@ -557,14 +557,18 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         with self.ledger.batch_saves():
             return self._place_order_recorded(row)
 
+    def _record_entry_skip(self, symbol, row, reason):
+        if not hasattr(self, '_submit_skip_reasons'):
+            self._submit_skip_reasons = {}
+        self._submit_skip_reasons[symbol or '<missing-symbol>'] = reason
+        self.session_entries.timings.skipped(symbol, row, (self._io_signal[0] or {}).get('signal_session_id'), reason)
+
     def _place_order_recorded(self, row: Mapping[str, Any]) -> None:
         if hasattr(self, '_entry_sizing_row'):
             row = self._entry_sizing_row(row)
         symbol = str(row.get('symbol') or '').upper()
         def skipped(reason: str) -> None:
-            if not hasattr(self, '_submit_skip_reasons'):
-                self._submit_skip_reasons = {}
-            self._submit_skip_reasons[symbol or '<missing-symbol>'] = reason
+            self._record_entry_skip(symbol, row, reason)
 
         if not symbol or symbol in self.tracked or symbol in self.positions:
             return skipped('missing_symbol_or_already_tracked_or_held')

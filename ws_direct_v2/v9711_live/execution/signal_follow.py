@@ -169,12 +169,17 @@ class SignalFollowMixin:
                           else 'signal_follow_forced_block' if forced
                           else 'signal_follow_order_cap')
                 self._request_cancel(symbol, row, reason)
-        if status == 'valid' and complete and len(self.positions) < FOLLOW_POSITION_CAP:
-            prices = self.refresh_entry_prices(now=now)
+        if status == 'valid' and complete and targets:
+            prices = None
             for symbol, target in sorted(targets.items(), key=lambda p: (p[1]['order_bar_open_ms'], p[0])):
+                if len(self.positions) >= FOLLOW_POSITION_CAP:
+                    self._record_entry_skip(symbol, target, 'signal_follow_position_cap')
+                    continue
                 if sum(bool(r.get('signal_follow')) for r in self.tracked.values()) >= FOLLOW_ORDER_CAP:
-                    break  # unresolved cancels also occupy an extra slot
+                    self._record_entry_skip(symbol, target, 'signal_follow_order_cap')
+                    continue
                 if symbol in self.positions:
+                    self._record_entry_skip(symbol, target, 'signal_follow_symbol_already_held')
                     continue
                 old = self.tracked.get(symbol)
                 if old:
@@ -182,12 +187,16 @@ class SignalFollowMixin:
                         self._request_cancel(symbol, old, 'signal_follow_different_entry')
                     continue
                 if now < self._finite(self.ledger.state.get('signal_follow_retry_after', {}).get(target['position_id'])):
+                    self._record_entry_skip(symbol, target, 'signal_follow_retry_wait')
                     continue
                 if target['position_id'] in self.ledger.state.get('signal_follow_permission_blocks', {}):
-                    self._submit_skip_reasons[symbol] = 'signal_follow_agreement_rejected_for_position'
+                    self._record_entry_skip(symbol, target, 'signal_follow_agreement_rejected_for_position')
                     continue
+                if prices is None:
+                    prices = self.refresh_entry_prices(now=now)
                 price = self._finite(prices.get(symbol))
                 if price <= 0:
+                    self._record_entry_skip(symbol, target, 'signal_follow_no_valid_quote')
                     continue
                 row = dict(target, observed_price=price, gap=(price - target['limit_price']) / target['limit_price'],
                            signal_follow_position_id=target['position_id'])

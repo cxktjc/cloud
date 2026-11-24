@@ -52,6 +52,17 @@ class SignalFollowTests(unittest.TestCase):
                     quantity=5., notional=5., exit_due_epoch=(entry+5*cfg.BAR_MS)/1000,
                     exit_due_ms=entry+5*cfg.BAR_MS)
 
+    def test_missing_follow_quote_has_exact_signal_skip_evidence(self):
+        self.trade.market.processed.pop('AUSDT')
+        self.event('N0USDT')
+        entry = dict(self.targets[0], signal_session_id='session')
+        attempts = self.trade.session_entries.timings.attempts_for(entry)
+        self.assertEqual(attempts['last_skip'], 'signal_follow_no_valid_quote')
+        self.assertEqual(attempts['sent'], 0)
+        for other in (dict(position_id='other'), dict(signal_session_id='other'),
+                      dict(entry_bar_open_ms=self.bar)):
+            self.assertIsNone(self.trade.session_entries.timings.attempts_for(dict(entry, **other))['last_skip'])
+
     def make_trade(self):
         self.trade = DirectTrade(enabled=False, nonblocking_io=False)
         self.trade.market.group_connected(1)

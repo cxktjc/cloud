@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 import math
-from collections import deque
+from collections import OrderedDict, deque
 
 
 class EntryTimings:
@@ -13,6 +13,7 @@ class EntryTimings:
         self._rows = {}
         self._plans = {}
         self._recent = deque(maxlen=512)
+        self._skips = OrderedDict()
         self.revision = 0
 
     def register(self, symbol, cid, row, *, session_id=''):
@@ -135,8 +136,27 @@ class EntryTimings:
     def attempts_for(self, entry):
         with self._lock:
             matches = self._matches(entry)
+            key = entry['symbol'], entry['entry_bar_open_ms'], entry['signal_session_id']
             return dict(registered=len(matches), sent=sum('_send_ns' in row for row in matches),
+                        last_skip=self._skips.get((*key, entry['position_id'])) or self._skips.get((*key, '')),
                         latest=self._public(matches[-1]) if matches else {})
+
+    def skipped(self, symbol, row, session, reason):
+        try:
+            bar = int(row.get('order_bar_open_ms') or 0)
+        except (ValueError, TypeError, OverflowError):
+            return
+        key = symbol, bar, session, str(row.get('position_id') or '')
+        if not all(key[:3]):
+            return
+        with self._lock:
+            if self._skips.get(key) == reason:
+                return
+            self._skips[key] = reason
+            self._skips.move_to_end(key)
+            if len(self._skips) > 8192:
+                self._skips.popitem(last=False)
+            self.revision += 1
 
     def summary(self):
         fields = ('received', 'event_received', 'dequeued', 'decision', 'registered', 'worker',

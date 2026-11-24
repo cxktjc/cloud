@@ -510,6 +510,13 @@ class NetworkTradeMixin:
                     raise ConfirmedSubmitRejection('durable reservation superseded; request never sent')
                 for item in identities:
                     if item[0] == 'entry':
+                        timings.mark(item[2], 'durable')
+                try:
+                    return original_work()
+                finally:
+                    for item in identities:
+                        if item[0] != 'entry':
+                            continue
                         if receipt.write_started_ns:
                             timings.mark_at(item[2], 'write_started', receipt.write_started_ns, receipt.write_started_epoch_ms)
                         if receipt.completed_ns:
@@ -519,8 +526,6 @@ class NetworkTradeMixin:
                             if stamp:
                                 epoch_ms = receipt.completed_epoch_ms-(receipt.completed_ns-stamp)/1e6
                                 timings.mark_at(item[2], stage, stamp, epoch_ms)
-                        timings.mark(item[2], 'durable')
-                return original_work()  # Account/identity gates and tiered quotes, after durability.
         if self._network_io is None:
             try:
                 result = work()

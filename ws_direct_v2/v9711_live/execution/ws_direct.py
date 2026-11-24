@@ -84,7 +84,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261124-wire-diagnostics-v17', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261124-entry-path-v18', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self.market.request_activity = self.market.book.request_activity = self.client.request_activity
@@ -328,7 +328,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def _place_order(self, row):
         symbol = str(row.get('symbol') or '').upper()
         if not self._account_send_allowed():
-            self._submit_skip_reasons[symbol] = 'account_not_ready_before_registration'
+            self._record_entry_skip(symbol, row, 'account_not_ready_before_registration')
             return
         ceiling = row.get('entry_gap_ceiling', GapPolicy().admission_gap(self._ordinary_pending_count()))
         context = dict(decision_epoch_ms=time.time()*1000, _decision_ns=time.monotonic_ns())
@@ -339,7 +339,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         detail = qualify_quote(quote, self._finite(row.get('limit_price')), ceiling,
                                following=bool(row.get('signal_follow')))
         if detail['entry_qualified_by'] == 'none':
-            self._submit_skip_reasons[symbol] = 'admission_quote_not_qualified'
+            self._record_entry_skip(symbol, row, 'admission_quote_not_qualified')
             return
         detail['entry_quote_policy'] = 'tiered_admission'
         return super()._place_order(dict(row, **detail, _entry_timing_context=context))
@@ -417,7 +417,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                             or self._entry_submission_blocked(self._entry_sizing_row(row))))
 
     def _fast_snapshot(self, snapshot, tick, now):
-        effective = self.market.entry_prices([tick.symbol]).get(tick.symbol, float('inf'))
+        effective = self.market.entry_price(tick.symbol) or float('inf')
         self._update_rank(tick.symbol, effective)
         target_symbols = set(self._target_positions(snapshot))
         selected, restore = set(self.tracked) | target_symbols, []
@@ -427,10 +427,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             gap, symbol, version = item
             if self._eligible.get(symbol) != item:
                 continue
-            if not self.market.order_allowed(symbol):
+            effective = self.market.entry_price(symbol)
+            if effective is None:
                 self._eligible.pop(symbol, None)
                 continue
-            effective = self.market.entry_prices([symbol]).get(symbol, float('inf'))
             limit = float(self._templates[symbol]['limit_price'])
             if (effective-limit)/limit != gap:
                 self._update_rank(symbol, effective)
@@ -477,7 +477,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                     heapq.heappop(self._rank_heap)
                     self._eligible.pop(symbol, None)
                     continue
-                effective = self.market.entry_prices([symbol]).get(symbol)
+                effective = self.market.entry_price(symbol)
                 if effective is None:
                     heapq.heappop(self._rank_heap)
                     self._eligible.pop(symbol, None)
@@ -617,7 +617,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                     dequeued_epoch_ms=stamp_ms, _dequeued_ns=stamp_ns,
                     trigger_source=event.source, trigger_symbol=event.symbol,
                     trigger_price=self._finite(event.price), trigger_exchange_time_ms=event.exchange_ms)
-                price = self.market.entry_prices([event.symbol]).get(event.symbol, float('inf'))
+                price = self.market.entry_price(event.symbol) or float('inf')
                 self._update_rank(event.symbol, price)
                 return False
             try:
