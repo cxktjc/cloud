@@ -516,9 +516,13 @@ class TradeTerminalView:
                          f'按绝对相对价差近→远，前笔返回后间隔{pacing["interval_seconds"]:g}s；'
                          '不阻塞下单/信号/平仓，平仓撤单不排此队列。')
             if queued:
-                parts = [f'{row["symbol"]} 距离={row["distance_pct"]:.4f}%'
-                         if row['distance_pct'] is not None else f'{row["symbol"]} 距离=未知'
-                         for row in queued[:self.max_rows]]
+                parts = []
+                for row in queued[:self.max_rows]:
+                    distance = row['distance_pct']
+                    label = f'{row["symbol"]} 距离=' + (f'{distance:.4f}%' if distance is not None else '未知')
+                    if wait := row.get('min_age_wait_seconds'):
+                        label += f'（挂单未满15s，还需{wait:.1f}s）'
+                    parts.append(label)
                 lines.insert(-1, '  待撤顺序: ' + ' → '.join(parts))
         closes = f.get('close_orders') or {}
         if closes:

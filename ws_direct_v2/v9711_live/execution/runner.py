@@ -44,7 +44,7 @@ from ..entry_policy import GapPolicy
 from .close_ladder import CloseLongMixin
 from . import close_ladder as close_policy
 from .stats import compute_comparison
-from .cancel_pacing import exact_entry_cancel_key
+from .cancel_pacing import ENTRY_CANCEL_MIN_AGE_SECONDS, exact_entry_cancel_key
 from .session_entries import SessionEntryStats
 from .nonblocking_io import NetworkTradeMixin
 from .submit_errors import require_submit_ack, submit_error_is_ambiguous, EntryQuoteUnavailable
@@ -220,6 +220,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             status = str(order.get('status') or '').upper()
             if row.get('signal_follow') and not self._follow_fill_evidence(row, order):
                 continue
+            if status in {'NEW', 'PARTIALLY_FILLED'} and recovered_id:
+                self._entry_cancel_delay(row)
             qty = self._finite(order.get('executedQty'))
             avg = self._finite(order.get('avgPrice'))
             row['last_status'] = status
@@ -306,7 +308,19 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                            order_id=row.get('order_id'))
         LOG.info('retire tracked order symbol=%s reason=%s', symbol, reason)
 
-    def _request_cancel(self, symbol: str, row: Mapping[str, Any], reason: str) -> bool:
+    def _entry_cancel_delay(self, row: dict[str, Any]) -> float:
+        if not self.client.enabled or self.client.dry_run:
+            return 0.
+        now = time.time()
+        confirmed = self._finite(row.get('entry_confirmed_at_epoch'))
+        if confirmed <= 0 or confirmed > now:
+            timing = row.get('entry_timing') or {}
+            response = self._finite(timing.get('response_epoch_ms')) / 1000
+            confirmed = response if 0 < response <= now else now
+            row['entry_confirmed_at_epoch'] = confirmed
+        return max(0., confirmed + ENTRY_CANCEL_MIN_AGE_SECONDS - now)
+
+    def _request_cancel(self, symbol: str, row: dict[str, Any], reason: str) -> bool:
         cid = str(row.get('client_order_id') or '')
         oid = row.get('order_id')
         if not self.ledger.owns_order(symbol, oid, cid):
@@ -336,7 +350,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         row['cancel_requested'] = True
         row['cancel_requested_epoch'] = time.time()
         row['cancel_reason'] = reason
+        delay = self._entry_cancel_delay(row)
         self.ledger.save()
+        if delay > 0 and self._network_io is None:
+            return False
         attempts[attempt_key] = time.time()
         def complete(result, error):
             current = self.tracked.get(symbol)
@@ -371,7 +388,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             LOG.info('cancel requested symbol=%s order=%s reason=%s', symbol, oid or cid, reason)
         self._run_network(exact_entry_cancel_key(symbol, cid, oid),
             lambda: self.client.cancel(symbol=symbol, order_id=oid, client_order_id=cid),
-            complete, priority=30, entry_cancel=True)
+            complete, priority=30, entry_cancel=True, entry_cancel_delay=delay)
         return True
 
     @staticmethod
@@ -705,6 +722,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             if isinstance(send_quote, Mapping) and send_quote.get('entry_qualified_by'):
                 current['entry_send_quote'] = {k: send_quote[k] for k in QUOTE_FIELDS if k in send_quote}
             current.update(order_id=order_id, fate_unknown=False)
+            if order_id:
+                self._entry_cancel_delay(current)
             if self._finite(place_result.get('executedQty')) >= self._finite(current.get('confirmed_filled_qty')):
                 current['last_status'] = str(place_result.get('status') or 'NEW').upper()
             self.session_entries.timings.outcome(client_id, order_id=order_id,

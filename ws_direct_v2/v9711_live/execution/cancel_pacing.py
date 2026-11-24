@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable, Mapping
 
 ENTRY_CANCEL_INTERVAL_SECONDS = 1.5
+ENTRY_CANCEL_MIN_AGE_SECONDS = 15.0
 
 
 def exact_entry_cancel_key(symbol: str, client_order_id: Any, order_id: Any) -> tuple:
@@ -90,20 +91,24 @@ class EntryCancelPacing:
         if any(job.entry_cancel and job.state in {'running', 'done'}
                for job in self._jobs.values()):
             return None  # wait only this cancel lane, never unrelated network work
-        if self._entry_cancel_clock() < self._entry_cancel_after:
+        now = self._entry_cancel_clock()
+        if now < self._entry_cancel_after:
             return None
         queued = [job for job in self._jobs.values()
-                  if job.entry_cancel and job.state == 'queued']
+                  if job.entry_cancel and job.state == 'queued' and job.cancel_not_before <= now]
         return min(queued, key=self._entry_cancel_key) if queued else None
 
     def _entry_cancel_timeout(self) -> float | None:
-        if self._entry_cancel_hold or not any(
-                job.entry_cancel and job.state == 'queued' for job in self._jobs.values()):
+        if self._entry_cancel_hold:
             return None
         if any(job.entry_cancel and job.state in {'running', 'done'}
                for job in self._jobs.values()):
             return None
-        delay = self._entry_cancel_after - self._entry_cancel_clock()
+        earliest = min((job.cancel_not_before for job in self._jobs.values()
+                        if job.entry_cancel and job.state == 'queued'), default=None)
+        if earliest is None:
+            return None
+        delay = max(self._entry_cancel_after, earliest) - self._entry_cancel_clock()
         return delay if delay > 0 else None
 
     def _entry_cancel_completed(self, job) -> None:
@@ -111,14 +116,17 @@ class EntryCancelPacing:
             self._entry_cancel_after = self._entry_cancel_clock() + self._entry_cancel_interval
 
     def _entry_cancel_health(self) -> dict[str, Any]:
+        now = self._entry_cancel_clock()
         queued = sorted((j for j in self._jobs.values()
-                         if j.entry_cancel and j.state == 'queued'), key=self._entry_cancel_key)
+                         if j.entry_cancel and j.state == 'queued'),
+                        key=lambda job: (max(0., job.cancel_not_before - now), self._entry_cancel_key(job)))
         return {
             'interval_seconds': self._entry_cancel_interval,
             'policy': 'absolute_relative_distance; serial; interval_after_response',
             'active': [str(j.key[1]) for j in self._jobs.values()
                        if j.entry_cancel and j.state in {'running', 'done'}],
             'queued': [dict(symbol=str(j.key[1]), client_order_id=str(j.key[2]),
+                            min_age_wait_seconds=max(0., j.cancel_not_before - now),
                             distance_pct=(100 * self._entry_cancel_distance(j)
                                           if math.isfinite(self._entry_cancel_distance(j)) else None))
                        for j in queued],

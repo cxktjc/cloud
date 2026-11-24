@@ -470,7 +470,9 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.assertEqual((rebound.symbol, rebound.price), ('N1USDT', '1.03'))
         self.trade.market.decide(rebound, self.trade.on_tick)
         self.trade.market.events.task_done()
-        self.wait_done()
+        queued = self.trade._network_io.health()['entry_cancel_pacing']['queued']
+        self.assertEqual([row['symbol'] for row in queued], ['N1USDT'])
+        self.assertGreater(queued[0]['min_age_wait_seconds'], 0.)
         self.assertEqual(len(self.sent), 2)
         self.assertEqual({self.trade.session_entries.timings.order(cid)['symbol'] for cid in self.sent},
                          {'N0USDT', 'N1USDT'})

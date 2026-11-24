@@ -43,6 +43,7 @@ class _Job:
     value: Any = None
     error: BaseException | None = None
     ready: Any = None
+    cancel_not_before: float = float('-inf')
 
 
 class NetworkIO(EntryCancelPacing):
@@ -104,7 +105,7 @@ class NetworkIO(EntryCancelPacing):
     def submit(self, key: tuple, work: Callable[[], Any], *, priority: int,
                done: Callable[[Any, BaseException | None], None] | None = None,
                aliases: tuple[tuple, ...] = (), entry_cancel: bool = False,
-               ready: Any = None) -> bool:
+               ready: Any = None, entry_cancel_delay: float = 0.) -> bool:
         self._assert_owner()
         with self._condition:
             if key in self._jobs or key in self._aliases:
@@ -120,7 +121,9 @@ class NetworkIO(EntryCancelPacing):
             identities = aliases or (key,)
             symbols = frozenset(str(k[2] if k[0] == 'query' else k[1]) for k in identities)
             self._jobs[key] = _Job(key, work, done, priority, symbols, aliases,
-                                   entry_cancel=bool(entry_cancel), ready=ready)
+                                   entry_cancel=bool(entry_cancel), ready=ready,
+                                   cancel_not_before=(self._entry_cancel_clock() + entry_cancel_delay
+                                                      if entry_cancel and entry_cancel_delay > 0 else float('-inf')))
             if key[0] == 'query':
                 self._valid_query_keys = None
                 self._query_keys.add(key)
@@ -482,7 +485,8 @@ class NetworkTradeMixin:
     def _run_network(self, key: tuple, work: Callable[[], Any],
                      done: Callable[[Any, BaseException | None], None], *, priority: int,
                      entry_request: dict[str, Any] | None = None,
-                     aliases: tuple[tuple, ...] = (), entry_cancel: bool = False) -> None:
+                     aliases: tuple[tuple, ...] = (), entry_cancel: bool = False,
+                     entry_cancel_delay: float = 0.) -> None:
         if entry_request is not None and self._entry_plan_buffer is not None:
             self._entry_plan_buffer.append((key, work, done, dict(entry_request)))
             return
@@ -541,7 +545,8 @@ class NetworkTradeMixin:
                 self._publish_entry_gate()
         try:
             self._network_io.submit(key, work, priority=priority, done=complete,
-                                    aliases=aliases, entry_cancel=entry_cancel, ready=barrier)
+                                    aliases=aliases, entry_cancel=entry_cancel, ready=barrier,
+                                    entry_cancel_delay=entry_cancel_delay)
         except ConfirmedSubmitRejection as exc:
             complete(None, exc)
 

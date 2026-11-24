@@ -187,6 +187,24 @@ class IndependentRotationTests(unittest.TestCase):
         self.assertIn('OLD7', waiting.cancel)
         self.assertLessEqual(len(tracked)+len(waiting.place), 8)
 
+    def test_minimum_age_does_not_block_an_older_cancel(self):
+        now = [100.]
+        io = NetworkIO(workers=1, cancel_clock=lambda: now[0])
+        self.addCleanup(io.shutdown)
+        young = ('cancel', 'YOUNG', 'young', '1')
+        older = ('cancel', 'OLDER', 'older', '2')
+        canceled = threading.Event()
+        io.hold_entry_cancels()
+        io.submit(young, lambda: self.fail('young order must wait'), priority=30,
+                  entry_cancel=True, entry_cancel_delay=15.)
+        io.submit(older, canceled.set, priority=30, entry_cancel=True)
+        io.update_entry_cancels({young: dict(price=1., limit_price=1.),
+                                 older: dict(price=1.01, limit_price=1.)})
+        io.release_entry_cancels()
+        self.assertTrue(canceled.wait(1))
+        queued = io.health()['entry_cancel_pacing']['queued']
+        self.assertEqual([(order['symbol'], order['min_age_wait_seconds']) for order in queued], [('YOUNG', 15.)])
+
     def test_legacy_five_to_four_reservation_keeps_original_improvement(self):
         tracked = {f'OLD{i}': row(f'OLD{i}', .01) for i in range(4)}
         pending = dict(victim='OLD4', victim_client_order_id='exact_OLD4',
@@ -509,6 +527,53 @@ class FlashOwnerTests(unittest.TestCase):
             self.assertEqual(self.trade._ordinary_pending_count(), 8)
         finally:
             self.trade.shutdown_io()
+
+    def test_replacement_sends_before_minimum_age_then_old_order_cancels(self):
+        self.plans(8)
+        self.event('N0USDT', 1.01)
+        clock = [100.]
+        io = NetworkIO(workers=2, cancel_clock=lambda: clock[0])
+        self.trade._network_io = self.trade.client.network_io = io
+        self.addCleanup(self.trade.shutdown_io)
+        replacement_sent, old_canceled = threading.Event(), threading.Event()
+
+        def place(**kwargs):
+            result = self.place(**kwargs)
+            if kwargs['symbol'] == 'N8USDT':
+                replacement_sent.set()
+            return result
+
+        def cancel(**kwargs):
+            result = self.cancel(**kwargs)
+            old_canceled.set()
+            return result
+
+        self.trade.client.place_limit_for_bar = Mock(side_effect=place)
+        self.trade.client.cancel = Mock(side_effect=cancel)
+        with patch.object(self.trade, '_entry_cancel_delay', return_value=15.):
+            self.plans(9)
+            self.event('N8USDT', .99)
+        self.assertTrue(replacement_sent.wait(1))
+        self.assertEqual(len(self.trade.tracked), 9)
+        self.assertFalse(old_canceled.is_set())
+        clock[0] = 114.99
+        self.trade._refresh_entry_cancel_plan()
+        self.assertGreater(io.health()['entry_cancel_pacing']['queued'][0]['min_age_wait_seconds'], 0)
+        self.assertFalse(old_canceled.is_set())
+        clock[0] = 115.
+        self.trade._refresh_entry_cancel_plan()
+        self.assertTrue(old_canceled.wait(1))
+        self.assertEqual([call['symbol'] for call in self.cancels], ['N7USDT'])
+
+    def test_live_minimum_age_uses_ack_not_registration_and_survives_recovery(self):
+        self.trade.client.enabled, self.trade.client.dry_run = True, False
+        order = dict(placed_at_epoch=self.now - 60, entry_timing={'response_epoch_ms': self.now * 1000})
+        self.assertEqual(self.trade._entry_cancel_delay(order), 15.)
+        self.now += 14
+        self.assertEqual(self.trade._entry_cancel_delay(dict(order)), 1.)
+        self.now += 1
+        self.assertEqual(self.trade._entry_cancel_delay(dict(order)), 0.)
+        self.assertEqual(self.trade._entry_cancel_delay({'placed_at_epoch': self.now - 60}), 15.)
 
     def test_full_eight_can_overlap_two_cancels_then_restart_without_duplicate(self):
         self.plans(8)

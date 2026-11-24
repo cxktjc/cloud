@@ -413,6 +413,9 @@ class LostAckLedgerTests(unittest.TestCase):
         self.trade.ledger.register(symbol='TESTUSDT',client_order_id=cid,order_id=777,kind='entry',qty=5)
         self.broker.cancel_order = Mock(side_effect=ConnectionError('cancel ACK lost'))
         self.trade._request_cancel('TESTUSDT',row,'rotation')
+        self.broker.cancel_order.assert_not_called()
+        with patch('time.time', return_value=self.now+15):
+            self.trade._request_cancel('TESTUSDT',row,'rotation')
         self.assertIn('TESTUSDT', self.trade.tracked)
         self.assertTrue(self.trade.ledger.owns_order('TESTUSDT',777,cid))
         self.assertTrue(row['cancel_requested'])
@@ -420,7 +423,7 @@ class LostAckLedgerTests(unittest.TestCase):
         self.assertEqual(recovered.tracked['TESTUSDT']['client_order_id'], cid)
         recovered.client.query_exact_order = Mock(return_value=(dict(status='FILLED',orderId=777,
             clientOrderId=cid,executedQty='5',avgPrice='1.1'),True))
-        recovered.reconcile_orders(now=self.now+8)
+        recovered.reconcile_orders(now=self.now+23)
         self.assertEqual(recovered.positions['TESTUSDT']['quantity'], 5.)
         self.assertNotIn('TESTUSDT', recovered.tracked)
         self.broker.cancel_order.assert_called_once()
