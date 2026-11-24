@@ -6,6 +6,9 @@ import time
 import math
 from collections import OrderedDict, deque
 
+_ERROR_FIELDS = ('symbol', 'client_order_id', 'signal_follow', 'submit_error_category',
+                 'submit_error_reason', 'submit_error_code', 'submit_error', 'submit_error_epoch_ms')
+
 
 class EntryTimings:
     def __init__(self):
@@ -13,6 +16,7 @@ class EntryTimings:
         self._rows = {}
         self._plans = {}
         self._recent = deque(maxlen=512)
+        self._errors = OrderedDict()
         self._skips = OrderedDict()
         self._summary_cache = None
         self.revision = 0
@@ -70,6 +74,18 @@ class EntryTimings:
             if all(row.get(key) == value for key, value in fields.items()):
                 return
             row.update(fields, outcome_updated_epoch_ms=time.time()*1000)
+            if fields.get('status') == 'REJECTED' and not fields.get('submit_error_category'):
+                fields = dict(fields, submit_error_category='exchange_rejected', submit_error='订单状态 REJECTED')
+            if fields.get('submit_error_category'):
+                # Replace older error evidence, including optional fields such as code.
+                for key in ('submit_error_code', 'submit_error_reason'):
+                    row.pop(key, None)
+                row.update({k: v for k, v in fields.items() if k.startswith('submit_error')})
+                row['submit_error_epoch_ms'] = row['outcome_updated_epoch_ms']
+                self._errors[cid] = {k: row[k] for k in _ERROR_FIELDS if k in row}
+                self._errors.move_to_end(cid)
+                if len(self._errors) > 64:
+                    self._errors.popitem(last=False)
             self.revision += 1
 
     def quote_check(self, cid, detail):
@@ -139,9 +155,27 @@ class EntryTimings:
         with self._lock:
             matches = self._matches(entry)
             key = entry['symbol'], entry['entry_bar_open_ms'], entry['signal_session_id']
+            latest_error = max((row for row in matches if row.get('submit_error_category')),
+                               key=lambda row: row.get('submit_error_epoch_ms', 0), default=None)
             return dict(registered=len(matches), sent=sum('_send_ns' in row for row in matches),
                         last_skip=self._skips.get((*key, entry['position_id'])) or self._skips.get((*key, '')),
-                        latest=self._public(matches[-1]) if matches else {})
+                        latest=self._public(matches[-1]) if matches else {},
+                        last_error={k: latest_error[k] for k in _ERROR_FIELDS if k in latest_error}
+                        if latest_error else {})
+
+    def recent_errors(self, limit=6):
+        if limit <= 0:
+            return []
+        with self._lock:
+            errors = []
+            for cid in reversed(self._errors):
+                error = self._errors[cid]
+                row = self._rows[cid]
+                errors.append(dict(error, current_status=row.get('status'),
+                                   executed_qty=row.get('executed_qty')))
+                if len(errors) >= limit:
+                    break
+            return errors
 
     def skipped(self, symbol, row, session, reason):
         try:

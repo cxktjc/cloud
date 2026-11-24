@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, Mock, patch
 from tests.test_trade_ws_keepalive import FakeSocket
 from tests import test_book_ticker_v2 as fixtures
 from v9711_live import config as cfg
-from v9711_live.exchange.binance_futures_trade_ws import BinanceFuturesTradeWS
+from v9711_live.exchange.binance_futures_trade_ws import APIError, BinanceFuturesTradeWS
+from v9711_live.execution.entry_diagnostics import submission_diagnostic, unfilled_diagnosis
+from v9711_live.execution.submit_errors import EntryQuoteUnavailable, require_submit_ack, submit_error_is_ambiguous
 from v9711_live.execution.entry_timing import EntrySendProbe, EntryTimings
 from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.nonblocking_io import NetworkIO
@@ -261,6 +263,53 @@ class EntryLatencyTests(unittest.TestCase):
             session_entry_stats=self.stats.snapshot()))
         self.assertIn('最近状态=CANCELED', output)
         self.assertIn('撤销/终结原因=被更近候选替换', output)
+
+    def test_recent_error_is_visible_without_signal_and_remains_history_after_retry(self):
+        self.register()
+        self.timing.mark('first', 'send', transport='WS')
+        self.timing.outcome('first', status='SUBMIT_REJECTED', **submission_diagnostic(
+            APIError(-999, 'Please sign TradFi-Perps agreement contract fapi.'), rejected=True))
+        snapshot = self.stats.snapshot()
+        self.assertEqual(snapshot['recent_unfilled_entries'], [])
+        self.assertEqual(snapshot['recent_entry_errors'][0]['submit_error_code'], -999)
+        self.advance(20)
+        self.register('retry')
+        self.timing.outcome('retry', status='NEW', order_id='live', executed_qty=0)
+        detail = self.observe_signal()
+        self.assertEqual(detail['unfilled_reason'], 'resting_unfilled')
+        comparison = compute_comparison(actual_positions={}, open_orders={}, signal_portfolio={},
+            target_positions=[self.target], price_map={}, realized_balance=15)
+        output = TradeTerminalView()._format(dict(comparison=comparison, clock_utc='test',
+            session_entry_stats=self.stats.snapshot()))
+        self.assertIn('最近入场异常', output)
+        self.assertIn('账户未签署 TradFi 合约协议', output)
+        self.assertIn('未成交归因：交易所已接单，尚未成交', output)
+
+    def test_known_local_rejection_vs_unknown_api_fate_and_late_ack(self):
+        self.register()
+        self.timing.outcome('first', status='SUBMIT_REJECTED', **submission_diagnostic(
+            EntryQuoteUnavailable('neither tick nor bid0 qualifies'), rejected=True))
+        self.assertEqual(self.observe_signal()['unfilled_reason'], 'local_not_sent')
+        self.advance(20)
+        self.register('retry')
+        self.timing.mark('retry', 'send', transport='WS')
+        self.timing.outcome('retry', status='UNKNOWN', **submission_diagnostic(
+            APIError(-1007, 'Timeout waiting for response; execution status unknown'), rejected=False))
+        self.assertEqual(self.observe_signal()['unfilled_reason'], 'result_unknown')
+        self.timing.outcome('retry', status='NEW', order_id='live', executed_qty=0)
+        self.assertEqual(self.observe_signal()['unfilled_reason'], 'resting_unfilled')
+        self.assertEqual(self.stats.snapshot()['recent_entry_errors'][0]['current_status'], 'NEW')
+
+    def test_raw_batch_member_error_keeps_code_and_unknown_error_stays_unknown(self):
+        for code, text, expected in ((-2019, 'Margin is insufficient.', 'exchange_rejected'),
+                                     (-999, 'unexpected reply', 'result_unknown')):
+            with self.subTest(code=code), self.assertRaises(RuntimeError) as failure:
+                require_submit_ack(dict(code=code, msg=text), symbol='THEUSDT', client_order_id='first')
+            error = failure.exception
+            diagnostic = submission_diagnostic(error, rejected=not submit_error_is_ambiguous(error))
+            self.assertEqual(diagnostic['submit_error_code'], code)
+            self.assertEqual(diagnostic['submit_error_category'], expected)
+        self.assertEqual(unfilled_diagnosis({'last_skip': 'signal_follow_order_cap'}), 'local_not_sent')
 
     def test_audit_revision_changes_only_when_outcome_changes_and_never_rewinds_fill(self):
         self.register()

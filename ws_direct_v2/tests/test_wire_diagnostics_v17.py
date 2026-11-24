@@ -216,6 +216,10 @@ class PermissionTests(unittest.TestCase):
         self.event()
         self.assertEqual(len(self.submits), 1)
         self.assertFalse(self.trade.tracked)
+        error, = self.trade.session_entries.snapshot()['recent_entry_errors']
+        self.assertTrue(error['signal_follow'])
+        self.assertEqual(error['submit_error_category'], 'exchange_rejected')
+        self.assertEqual(error['submit_error_reason'], 'tradfi_agreement_required')
         self.now += 11
         self.publish()
         self.make_trade()

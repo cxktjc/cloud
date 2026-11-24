@@ -15,6 +15,22 @@ class ConfirmedSubmitRejection(RuntimeError):
     """An exact submission response explicitly rejected without any fills."""
 
 
+class ExchangeSubmitRejected(ConfirmedSubmitRejection):
+    """An explicit exchange REJECTED reply with zero executed quantity."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class ExchangeSubmitResponseError(RuntimeError):
+    """Raw exchange error reply; the message still determines rejection vs uncertain fate."""
+
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
 class EntryQuoteUnavailable(ConfirmedSubmitRejection):
     """No request sent; a fresh qualifying quote may retry the same signal plan."""
 
@@ -120,10 +136,13 @@ def require_submit_ack(result: Any, *, symbol: str,
         except (TypeError, ValueError):
             filled = float('nan')
         if math.isfinite(filled) and filled == 0.0:
-            raise ConfirmedSubmitRejection(str(result.get('msg') or 'explicit REJECTED submission'))
+            raise ExchangeSubmitRejected(str(result.get('msg') or 'explicit REJECTED submission'), result.get('code'))
         raise RuntimeError('REJECTED submission has uncertain fills; exact fate unknown')
     if str(result.get('orderId') or '') in ('', '0'):
         # Raw API errors are classified by the same conservative message list.
         # Generic errors still retain exact identity; no synthetic order IDs.
+        code = result.get('code')
+        if isinstance(code, (int, str)) and str(code).startswith('-') and str(code)[1:].isdigit():
+            raise ExchangeSubmitResponseError(str(result.get('msg') or 'submission response missing orderId; exact fate unknown'), code)
         raise RuntimeError(str(result.get('msg') or 'submission response missing orderId; exact fate unknown'))
     return result

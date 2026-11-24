@@ -48,6 +48,7 @@ from .cancel_pacing import ENTRY_CANCEL_MIN_AGE_SECONDS, exact_entry_cancel_key
 from .session_entries import SessionEntryStats
 from .nonblocking_io import NetworkTradeMixin
 from .submit_errors import require_submit_ack, submit_error_is_ambiguous, EntryQuoteUnavailable
+from .entry_diagnostics import submission_diagnostic
 from .order_identity import matches_order_identity, exact_entry_fill_time_ms
 from .entry_quotes import QUOTE_FIELDS
 from .stream import StreamUnavailable
@@ -541,7 +542,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
     def _reject_entry_submission(self, row: Mapping[str, Any], cid: str,
                                  exc: BaseException) -> None:
         self.session_entries.timings.outcome(cid, status='SUBMIT_REJECTED',
-            submit_error=str(exc)[:300], retryable=isinstance(exc, EntryQuoteUnavailable))
+            retryable=isinstance(exc, EntryQuoteUnavailable),
+            **submission_diagnostic(exc, rejected=True, disabled=isinstance(exc, DisabledExchange)))
         symbol = str(row.get('symbol') or '').upper()
         current = self.tracked.get(symbol)
         if current and str(current.get('client_order_id') or '') == cid:
@@ -713,7 +715,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     return
                 LOG.warning('place uncertain symbol=%s err=%s; exact identity retained', symbol, exc)
                 current.update(last_status='UNKNOWN', submit_failed_at_epoch=time.time())
-                self.session_entries.timings.outcome(client_id, status='UNKNOWN', submit_error=str(exc)[:300])
+                self.session_entries.timings.outcome(client_id, status='UNKNOWN',
+                    **submission_diagnostic(exc, rejected=False))
                 self.ledger.save()
                 return
             order_id = str(place_result.get('orderId') or '')
@@ -1057,6 +1060,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                         key = (symbol, limit, item.get('notional'), str(prepared.get('reason')))
                         if key not in self._rejected_preflight:
                             self._rejected_preflight.add(key)
+                            self._record_entry_skip(symbol, item, 'preflight: ' + str(prepared.get('reason')))
                             LOG.warning('candidate not executable; no rotation symbol=%s reason=%s',
                                         symbol, prepared.get('reason'))
                         filtered_entries[symbol] = 'preflight: ' + str(prepared.get('reason'))

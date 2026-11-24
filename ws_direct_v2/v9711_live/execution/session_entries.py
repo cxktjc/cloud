@@ -14,6 +14,7 @@ from typing import Any
 from .. import config as cfg
 from .position_identity import is_manual_position
 from .entry_timing import EntryTimings
+from .entry_diagnostics import unfilled_diagnosis
 
 
 def positive(value: Any) -> float:
@@ -159,6 +160,7 @@ class SessionEntryStats:
     def _detail(self, entry):
         result = dict(entry, first_order_timing=self.timings.first_for(entry),
                       order_attempts=self.timings.attempts_for(entry))
+        result['unfilled_reason'] = unfilled_diagnosis(result['order_attempts'])
         current = self._current_trade_positions.get(entry['symbol'])
         if current:
             # Context only: a same-symbol position must never fabricate a
@@ -191,6 +193,7 @@ class SessionEntryStats:
             'active_unfilled_entries': active,
             'ended_unfilled_entries': len(missing) - active,
             'recent_unfilled_entries': [self._detail(entry) for entry in missing[:limit]],
+            'recent_entry_errors': self.timings.recent_errors(),
             'details_truncated': len(missing) > limit,
         }
         self._cache_limit = limit

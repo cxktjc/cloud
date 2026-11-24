@@ -16,6 +16,15 @@ from decimal import Decimal
 from typing import Any, Mapping
 
 from .. import config as cfg
+from .entry_diagnostics import LABELS, REASONS, unfilled_diagnosis
+
+
+def entry_error_line(row):
+    category = LABELS.get(row.get('submit_error_category'), '异常来源未确定')
+    reason = REASONS.get(row.get('submit_error_reason'))
+    code = row.get('submit_error_code')
+    return (f'{category}' + (f'（{reason}）' if reason else '')
+            + (f' code={code}' if code is not None else '') + f'：{row["submit_error"]}')
 
 
 class MarketConsoleFilter(logging.Filter):
@@ -454,6 +463,14 @@ class TradeTerminalView:
                 f'  未成交分项: signal仍持仓={session["active_unfilled_entries"]}  '
                 f'signal已结束/撤回={session["ended_unfilled_entries"]}',
             ]
+            errors = session.get('recent_entry_errors') or []
+            if errors:
+                block.append('  最近入场异常（本次启动，普通单和补挂单）:')
+                for error in errors[:self.max_rows]:
+                    kind = '补挂' if error.get('signal_follow') else '普通'
+                    status = error.get('current_status') or '待确认'
+                    block.append(f'    {iso_ms(error["submit_error_epoch_ms"])} {error["symbol"]}[{kind}] '
+                                 f'{entry_error_line(error)}；当前状态={status} 单号={error["client_order_id"]}')
             rows = session['recent_unfilled_entries'][:self.max_rows]
             if rows:
                 block.append(f'  未成交明细（最近{len(rows)}笔；按入场确认时间倒序）:')
@@ -461,18 +478,22 @@ class TradeTerminalView:
                     state = 'signal仍持仓' if row['signal_active'] else 'signal已结束/撤回'
                     block.append(f'    {row["symbol"]} 入场bar={iso(row["entry_bar_open_ms"])} '
                                  f'确认={iso(row["entry_available_ms"])} [{state}]')
+                    attempts = row.get('order_attempts') or {}
+                    latest = attempts.get('latest') or {}
+                    cause = row.get('unfilled_reason') or unfilled_diagnosis(attempts)
+                    block.append(f'      未成交归因：{LABELS.get(cause, LABELS["no_evidence"])}')
+                    skip = attempts.get('last_skip')
+                    if skip:
+                        block.append(f'      最近一次登记前拦截：{REASONS.get(skip, skip)}')
+                    error = attempts.get('last_error') or (latest if latest.get('submit_error') else None)
+                    if error:
+                        kind = '补挂' if error.get('signal_follow') else '普通单'
+                        block.append(f'      最近提交异常（{kind}）：{entry_error_line(error)}')
                     timing = row.get('first_order_timing')
                     if timing:
                         block.extend(entry_timing_lines(timing))
                     else:
                         block.append('      该笔signal尚无匹配的下单时间记录；不使用其他入场bar的记录代填。')
-                    attempts = row.get('order_attempts') or {}
-                    latest = attempts.get('latest') or {}
-                    if not attempts.get('sent'):
-                        if attempts.get('last_skip'):
-                            block.append(f'      未见发送；最近一次登记前拦截：{attempts["last_skip"]}')
-                        elif not latest:
-                            block.append('      未见登记或发送；没有绑定到这笔信号的拦截证据，具体原因未知。')
                     if latest:
                         reasons = {'order_bar_expired': '入场bar结束', 'entry_gap_too_far': '距离超过撤单门槛',
                                    'replaced_by_closer': '被更近候选替换', 'position_capacity_full': '持仓容量已满',
@@ -483,8 +504,6 @@ class TradeTerminalView:
                                      f'最近状态={latest.get("status") or "待确认"} '
                                      f'累计成交量={latest.get("executed_qty", "未确认")} '
                                      f'撤销/终结原因={reasons.get(reason, reason) or "尚未记录"}')
-                        if latest.get('submit_error'):
-                            block.append(f'      最近提交异常：{latest["submit_error"]}')
                     current = row.get('same_symbol_trade')
                     if current:
                         reason = ('入场bar不同' if current.get('mismatch_reason') == 'different_entry_bar'
