@@ -43,6 +43,12 @@ class EntryQuoteUnavailable(ConfirmedSubmitRejection):
 class EntrySendGateRejection(ConfirmedSubmitRejection):
     """The order never reached the transport; retain the exact gate reason."""
 
+    RECOVERABLE_ORDINARY = frozenset({
+        'account_gate', 'entry_signal_not_ready', 'entry_plan_bar_changed',
+        'entry_plan_stale_at_send', 'entry_position_cap_at_send',
+        'entry_sizing_changed_at_send',
+    })
+
     def __init__(self, reason, detail=''):
         super().__init__(f'pre-send entry gate: {reason}; request never sent' + (f' ({detail})' if detail else ''))
         self.reason = reason

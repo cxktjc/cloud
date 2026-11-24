@@ -47,7 +47,8 @@ from .stats import compute_comparison
 from .cancel_pacing import ENTRY_CANCEL_MIN_AGE_SECONDS, exact_entry_cancel_key
 from .session_entries import SessionEntryStats
 from .nonblocking_io import NetworkTradeMixin
-from .submit_errors import require_submit_ack, submit_error_is_ambiguous, EntryQuoteUnavailable
+from .submit_errors import (require_submit_ack, submit_error_is_ambiguous,
+                            EntryQuoteUnavailable, EntrySendGateRejection)
 from .entry_diagnostics import submission_diagnostic
 from .order_identity import matches_order_identity, exact_entry_fill_time_ms
 from .entry_quotes import QUOTE_FIELDS
@@ -84,6 +85,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             path=cfg.EXECUTION_INTENT_FILE,
             state_path=cfg.EXECUTION_LEDGER_FILE)
         self.ledger.state.setdefault('entry_submit_rejections', {})
+        self._entry_gate_retries: dict[str, tuple[int, int, float]] = {}
         self.ledger.state.setdefault('entry_recovery', {})
         self.ledger.state.setdefault('pending_rotation', None)
         self.ledger.state.setdefault('rotated_out_plans', {})
@@ -507,6 +509,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             recovery = self.ledger.state['entry_recovery'].get(cid) or {}
             return (previous.get('plan_signature') == signature
                     or self._finite(recovery.get('confirmed_absences')) > cfg.ENTRY_RECOVERY_MAX_RETRIES)
+        retry = self._entry_gate_retries.get(symbol)
+        if retry and retry[0] == signature[1] and time.monotonic() < retry[2]:
+            return True
         # Guard the signal plan, not a physical send ID. New IDs must not reset
         # rotation suppression, definitive rejection, or bounded absence retry.
         cache = getattr(self, '_entry_block_cache', None)
@@ -533,6 +538,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         # Keep current-bar physical-ID evidence across restart, while bounding
         # history and preserving plan-level suppression across new send IDs.
         if bar_ms > 0:
+            self._entry_gate_retries = {s: r for s, r in self._entry_gate_retries.items()
+                                        if r[0] >= bar_ms}
             for name in ('entry_submit_rejections', 'entry_recovery', 'rotated_out_plans'):
                 records = self.ledger.state[name]
                 for cid, record in list(records.items()):
@@ -541,11 +548,23 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
 
     def _reject_entry_submission(self, row: Mapping[str, Any], cid: str,
                                  exc: BaseException) -> None:
-        self.session_entries.timings.outcome(cid, status='SUBMIT_REJECTED',
-            retryable=isinstance(exc, EntryQuoteUnavailable),
-            **submission_diagnostic(exc, rejected=True, disabled=isinstance(exc, DisabledExchange)))
         symbol = str(row.get('symbol') or '').upper()
         current = self.tracked.get(symbol)
+        bar_ms = int(self._finite(row.get('order_bar_open_ms')))
+        now = time.time()
+        gate_retry = (isinstance(exc, EntrySendGateRejection)
+                      and exc.reason in EntrySendGateRejection.RECOVERABLE_ORDINARY
+                      and not (row.get('signal_follow') or (current or {}).get('signal_follow'))
+                      and bar_ms > 0 and bar_ms <= now*1000 < bar_ms + cfg.BAR_MS)
+        retryable = isinstance(exc, EntryQuoteUnavailable) or gate_retry
+        if gate_retry:
+            # Only errors proven to be before any wire attempt may use this
+            # path. Slow down repeated gate flaps without blacklisting the bar.
+            prev = self._entry_gate_retries.get(symbol)
+            failures = min(5, prev[1] + 1) if prev and prev[0] == bar_ms else 0
+            self._entry_gate_retries[symbol] = (bar_ms, failures, time.monotonic() + .25 * 2**failures)
+        self.session_entries.timings.outcome(cid, status='SUBMIT_REJECTED', retryable=retryable,
+            **submission_diagnostic(exc, rejected=True, disabled=isinstance(exc, DisabledExchange)))
         if current and str(current.get('client_order_id') or '') == cid:
             self._note_rotation_terminal(symbol, current, 'confirmed_submission_rejected')
             origin = current.get('rotation_origin')
@@ -559,17 +578,18 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 retry_rejected(symbol, exc)
         self.ledger.state['entry_submit_rejections'][cid] = {
             'symbol': symbol, 'client_order_id': cid,
-            'order_bar_open_ms': int(self._finite(row.get('order_bar_open_ms'))),
+            'order_bar_open_ms': bar_ms,
             'plan_signature': self._entry_plan_signature(row),
             'rejected_at_epoch': time.time(), 'error': str(exc),
-            'retryable': isinstance(exc, EntryQuoteUnavailable),
+            'retryable': retryable,
         }
         self.stats['entry_rejected'] += 1
         # Only called for a newly registered submission known not to be accepted.
         # Never forget a previously ambiguous or acknowledged order here.
         self.ledger.forget(symbol=symbol, client_order_id=cid)
         LOG.warning('entry rejected; slot released symbol=%s id=%s err=%s; %s', symbol, cid, exc,
-                    'fresh qualifying quote may retry' if isinstance(exc, EntryQuoteUnavailable)
+                    'temporary send gate; eligible for same-bar reevaluation after backoff' if gate_retry
+                    else 'fresh qualifying quote may retry' if retryable
                     else 'same signal plan suppressed until changed/new bar')
 
     def _place_order(self, row: Mapping[str, Any]) -> None:

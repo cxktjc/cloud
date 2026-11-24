@@ -421,7 +421,9 @@ class NetworkTradeMixin:
                 continue
             cid = str(row.get('client_order_id'))
             if row.get('cancel_requested'):
-                blocked[cid] = 'entry_cancel_pending_at_send'
+                blocked[cid] = ('entry_sizing_changed_at_send'
+                                if row.get('cancel_reason') == 'position_count_sizing_changed'
+                                else 'entry_cancel_pending_at_send')
             elif row.get('sizing_weight') not in (None, expected_weight):
                 blocked[cid] = 'entry_sizing_changed_at_send'
             elif self._forced_entry_blocked(str(row.get('symbol') or ''), now=now):

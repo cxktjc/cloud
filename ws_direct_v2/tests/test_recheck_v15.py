@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from tests import test_book_ticker_v2 as fixtures
 from tests import test_durable_writer_v2 as durable
+from v9711_live import config as cfg
 from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.entry_quotes import admission_gap, SEND_RECHECK_GAP
 from v9711_live.execution.submit_errors import ConfirmedSubmitRejection, EntryQuoteUnavailable
@@ -147,6 +148,46 @@ class DurableTieredTests(unittest.TestCase):
         self.trade._service_pending_quotes(limit=64, budget_seconds=.05)
         self.wait_done()
         self.assertEqual(len(self.sent), 1)
+
+    def test_stale_send_gate_does_not_suppress_the_rest_of_the_bar(self):
+        started = self.block_disk()
+        old = self.first_far_entry(price='1.01')
+        self.assertTrue(started.wait(1))
+        io = self.trade._network_io
+        io.set_entry_gate(dict(io._entry_gate, expires=self.case.now-1))
+        self.release.set()
+        self.wait_done()
+        cid = old['client_order_id']
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.trade.ledger.owns_client(cid))
+        self.assertEqual(self.trade.session_entries.timings.order(cid)['submit_error_reason'],
+                         'entry_plan_stale_at_send')
+        self.assertTrue(self.trade.ledger.state['entry_submit_rejections'][cid]['retryable'])
+        _, _, deadline = self.trade._entry_gate_retries['N0USDT']
+        with patch('time.monotonic', return_value=deadline-.01):
+            self.assertTrue(self.trade._entry_submission_blocked(self.case.templates[0]))
+        self.case.now += .3
+        self.case.publish()
+        with patch('time.monotonic', return_value=deadline+.01):
+            self.trade.market.update('N0USDT', '1.009', int(self.case.now*1000))
+            self.trade._service_pending_quotes(limit=64, budget_seconds=.05)
+            self.wait_done()
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotEqual(self.sent[0], cid)
+
+    def test_bar_closed_before_send_never_retries_the_expired_order(self):
+        started = self.block_disk()
+        old = self.first_far_entry(price='1.01')
+        self.assertTrue(started.wait(1))
+        self.case.now = (self.case.bar + cfg.BAR_MS)/1000
+        self.trade._account_deadline = self.case.now+10
+        self.release.set()
+        self.wait_done()
+        cid = old['client_order_id']
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.trade.session_entries.timings.order(cid)['submit_error_reason'],
+                         'entry_bar_ended_at_send')
+        self.assertFalse(self.trade.ledger.state['entry_submit_rejections'][cid]['retryable'])
 
     def test_far_valid_depth_is_checked_after_socket_readiness(self):
         stages = []
