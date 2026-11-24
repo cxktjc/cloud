@@ -7,7 +7,7 @@ import time
 from typing import Mapping
 
 from .. import config as cfg
-from .submit_errors import EntryQuoteUnavailable, is_agreement_rejection
+from .submit_errors import EntryQuoteUnavailable, entry_permission_rejection_reason
 
 FOLLOW_ORDER_CAP = cfg.SIGNAL_FOLLOW_MAX_PENDING_ORDERS
 FOLLOW_POSITION_CAP = cfg.SIGNAL_FOLLOW_POSITION_STOP
@@ -114,7 +114,7 @@ class SignalFollowMixin:
 
     def _reject_entry_submission(self, row, cid, exc):
         current = self.tracked.get(str(row.get('symbol') or '').upper())
-        if current and current.get('signal_follow'):
+        if current and current.get('signal_follow') and current.get('client_order_id') == cid:
             self._advance_signal_follow(current)
             identity = str(current.get('signal_follow_position_id') or current.get('position_id'))
             retry_after = self.ledger.state.setdefault('signal_follow_retry_after', {})
@@ -122,9 +122,9 @@ class SignalFollowMixin:
                 # Known not sent: the next fresh quote can restore a follow
                 # immediately. Keep the advanced identity, never reuse its ID.
                 retry_after.pop(identity, None)
-            elif is_agreement_rejection(exc):
+            elif (reason := entry_permission_rejection_reason(exc)):
                 self.ledger.state.setdefault('signal_follow_permission_blocks', {})[identity] = dict(
-                    symbol=row.get('symbol'), error=str(exc)[:300], rejected_epoch=time.time())
+                    symbol=row.get('symbol'), reason=reason, error=str(exc)[:300], rejected_epoch=time.time())
             else:
                 retry_after[identity] = time.time() + 10.0
         return super()._reject_entry_submission(row, cid, exc)
@@ -186,11 +186,15 @@ class SignalFollowMixin:
                     if not old.get('signal_follow'):
                         self._request_cancel(symbol, old, 'signal_follow_different_entry')
                     continue
+                permission = self.ledger.state.get('signal_follow_permission_blocks', {}).get(target['position_id'])
+                if permission is not None:
+                    reduce_only = isinstance(permission, Mapping) and permission.get('reason') == 'symbol_reduce_only'
+                    reason = ('signal_follow_symbol_reduce_only' if reduce_only
+                              else 'signal_follow_agreement_rejected_for_position')
+                    self._record_entry_skip(symbol, target, reason)
+                    continue
                 if now < self._finite(self.ledger.state.get('signal_follow_retry_after', {}).get(target['position_id'])):
                     self._record_entry_skip(symbol, target, 'signal_follow_retry_wait')
-                    continue
-                if target['position_id'] in self.ledger.state.get('signal_follow_permission_blocks', {}):
-                    self._record_entry_skip(symbol, target, 'signal_follow_agreement_rejected_for_position')
                     continue
                 if prices is None:
                     prices = self.refresh_entry_prices(now=now)

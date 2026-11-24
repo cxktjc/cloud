@@ -49,6 +49,11 @@ _UNCERTAIN = _TRANSPORT + (
     'status of the execution is unknown', 'duplicate', 'duplicated',
     'does not exist', 'not found', 'service unavailable', 'internal error',
 )
+_SYMBOL_REDUCE_ONLY_MESSAGES = (
+    'symbol is under position risk control, only reduce-only order is allowed',
+    'symbol is under position risk control, buy order can only works with reduce-only',
+    'symbol is under position risk control, sell order can only works with reduce-only',
+)
 # Only recognizable request/validation rejection messages. Never infer rejection
 # from an arbitrary negative API code, HTTP 5xx, or the bare word "rejected".
 _REJECTED = (
@@ -68,7 +73,7 @@ _REJECTED = (
     'api-key format invalid', 'invalid api-key, ip, or permissions',
     # These are raised locally by this package's adapter before submission.
     'aligned price below tick size', 'close quantity below step size',
-)
+) + _SYMBOL_REDUCE_ONLY_MESSAGES
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -94,6 +99,18 @@ def is_agreement_rejection(exc: BaseException) -> bool:
     return (not is_transport_error(exc) and any(
         'please sign tradfi-perps agreement contract' in ' '.join(str(error).lower().split())
         for error in _exception_chain(exc)))
+
+
+def entry_permission_rejection_reason(exc: BaseException) -> str | None:
+    """Reason to stop retrying the same entry after an explicit permission refusal."""
+    if submit_error_is_ambiguous(exc):
+        return None
+    if is_agreement_rejection(exc):
+        return 'tradfi_agreement_required'
+    if any(marker in ' '.join(str(error).lower().split()) for error in _exception_chain(exc)
+           for marker in _SYMBOL_REDUCE_ONLY_MESSAGES):
+        return 'symbol_reduce_only'
+    return None
 
 
 def submit_error_is_ambiguous(exc: BaseException) -> bool:

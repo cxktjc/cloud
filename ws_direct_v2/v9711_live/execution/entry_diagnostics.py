@@ -2,7 +2,7 @@
 from ..exchange.binance_futures_trade_ws import APIError
 from .submit_errors import (ConfirmedSubmitRejection, EntryQuoteUnavailable,
                             ExchangeSubmitRejected, ExchangeSubmitResponseError,
-                            _exception_chain, is_agreement_rejection)
+                            _exception_chain, entry_permission_rejection_reason)
 
 
 def submission_diagnostic(exc, *, rejected, disabled=False):
@@ -15,11 +15,11 @@ def submission_diagnostic(exc, *, rejected, disabled=False):
         detail['submit_error_code'] = code
     elif isinstance(code, str) and len(code) <= 12 and code.lstrip('-').isdigit():
         detail['submit_error_code'] = code
-    agreement = rejected and is_agreement_rejection(exc)
-    if rejected and (reply is not None or agreement):
+    permission = entry_permission_rejection_reason(exc) if rejected else None
+    if rejected and (reply is not None or permission):
         category = 'exchange_rejected'
-        if agreement:
-            detail['submit_error_reason'] = 'tradfi_agreement_required'
+        if permission:
+            detail['submit_error_reason'] = permission
     elif reply is None and (disabled or (rejected and isinstance(exc, ConfirmedSubmitRejection))
                              or error in ('trade broker rate limit cooldown; no request sent',
                                           'trade WS reconnect cooldown; no request sent')):
@@ -44,9 +44,11 @@ LABELS = {
 }
 REASONS = {
     'tradfi_agreement_required': '账户未签署 TradFi 合约协议',
+    'symbol_reduce_only': '币对触发仓位风控，当前方向只允许减仓',
     'quote_gate': '发单前报价未通过检查',
     'account_gate': '发单前账户状态未就绪',
     'signal_follow_agreement_rejected_for_position': '本笔补挂已被交易所拒绝：账户未签署 TradFi 合约协议',
+    'signal_follow_symbol_reduce_only': '本笔补挂已被交易所拒绝：币对触发仓位风控，当前方向只允许减仓',
     'signal_follow_position_cap': '实际持仓已达补挂上限',
     'signal_follow_order_cap': '补挂名额已满',
     'signal_follow_capacity_full': '补挂容量已满',

@@ -11,7 +11,9 @@ from tests.test_trade_ws_keepalive import FakeSocket
 from v9711_live.execution.client import ExchangeClient
 from v9711_live.execution.entry_timing import EntryTimings, EntrySendProbe
 from v9711_live.execution.request_activity import RequestActivity
-from v9711_live.execution.submit_errors import submit_error_is_ambiguous, is_agreement_rejection
+from v9711_live.execution.entry_diagnostics import submission_diagnostic
+from v9711_live.execution.submit_errors import (entry_permission_rejection_reason,
+    is_agreement_rejection, require_submit_ack, submit_error_is_ambiguous)
 from v9711_live.execution.terminal import entry_timing_lines
 from v9711_live.execution.ws_market import DualMarket
 from v9711_live.exchange.binance_futures_trade_ws import BinanceFuturesTradeWS, APIError
@@ -236,6 +238,44 @@ class PermissionTests(unittest.TestCase):
         error.__cause__ = OSError('connection lost')
         self.assertTrue(submit_error_is_ambiguous(error))
         self.assertFalse(is_agreement_rejection(error))
+
+    def test_symbol_reduce_only_stops_follow_retries_for_the_same_signal(self):
+        self.submit_error = APIError(-4106, 'Symbol is under position risk control, buy order can only works with reduce-only.')
+        self.event()
+        self.assertFalse(self.trade.tracked)
+        error, = self.trade.session_entries.snapshot()['recent_entry_errors']
+        self.assertEqual((error['submit_error_category'], error['submit_error_reason'],
+                          error['submit_error_code'], error['current_status']),
+                         ('exchange_rejected', 'symbol_reduce_only', -4106, 'SUBMIT_REJECTED'))
+        for _ in range(3):
+            self.now += 6
+            self.publish()
+            self.event()
+        self.make_trade()
+        self.event()
+        self.assertEqual(len(self.submits), 1)
+        self.targets[0]['position_id'] += ':new'
+        self.submit_error = None
+        self.publish()
+        self.event()
+        self.assertEqual(len(self.submits), 2)
+
+    def test_reduce_only_raw_submit_errors_and_transport_uncertainty(self):
+        for code, msg in (
+            (-4105, 'Symbol is under position risk control, only reduce-only order is allowed.'),
+            (-4106, 'Symbol is under position risk control, buy order can only works with reduce-only.'),
+            (-4107, 'Symbol is under position risk control, sell order can only works with reduce-only.'),
+        ):
+            with self.subTest(code=code):
+                with self.assertRaises(RuntimeError) as raised:
+                    require_submit_ack(dict(code=code, msg=msg), symbol='AUSDT', client_order_id='cid')
+                error = raised.exception
+                self.assertFalse(submit_error_is_ambiguous(error))
+                self.assertEqual(entry_permission_rejection_reason(error), 'symbol_reduce_only')
+                self.assertEqual(submission_diagnostic(error, rejected=True)['submit_error_code'], code)
+                error.__cause__ = TimeoutError('connection lost')
+                self.assertTrue(submit_error_is_ambiguous(error))
+                self.assertIsNone(entry_permission_rejection_reason(error))
 
     def test_follow_cross_wake_keeps_own_symbol_price_and_limit(self):
         self.event('N0USDT')
