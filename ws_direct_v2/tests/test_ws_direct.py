@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from v9711_live import config as cfg
-from v9711_live.execution.ws_market import DirectMarket, Tick
+from v9711_live.execution.ws_market import DirectMarket, DualMarket, Tick
 from v9711_live.execution.ws_direct import DirectTrade
 from v9711_live.market_data import PriceReader
 from v9711_live.publisher import DesiredPublisher
@@ -178,7 +178,7 @@ class DirectAdmissionTests(unittest.TestCase):
 
     def test_incremental_shortlist_matches_full_selector_with_rotation(self):
         symbols = ['S%02dUSDT'%i for i in range(30)]
-        self.trade.market = DirectMarket(symbols,cfg.PRICE_FILE)
+        self.trade.market = DualMarket(symbols,cfg.PRICE_FILE)
         self.trade.market.group_connected(1)
         self.trade.market.events.get_nowait()
         self.payload['candidate_templates'] = [dict(self.payload['candidate_templates'][0],
@@ -218,7 +218,7 @@ class DirectAdmissionTests(unittest.TestCase):
         randomizer = random.Random(20261116)
         symbols = ['R%02dUSDT'%i for i in range(32)]
         for scenario in range(50):
-            self.trade.market = DirectMarket(symbols,cfg.PRICE_FILE)
+            self.trade.market = DualMarket(symbols,cfg.PRICE_FILE)
             self.trade.market.group_connected(1)
             self.trade.market.events.get_nowait()
             rows = [dict(self.payload['candidate_templates'][0],symbol=symbol,limit_price=1.)

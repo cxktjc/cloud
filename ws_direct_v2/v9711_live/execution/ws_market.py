@@ -3,7 +3,8 @@
 Receiver and snapshot writer are independent of the execution state owner.
 Actionable price/validity changes are queued, including crossings/rebounds.
 Provably irrelevant unowned far prices may finish comparison on ingress.
-Identical consecutive book prices only refresh receipt/quantity freshness.
+Identical consecutive book prices refresh receipt/quantity freshness; a
+freshness gap re-enables owner admission even at the same book price.
 Overflow, stale backlog, reconnect generations and silence fail closed.
 """
 from __future__ import annotations
@@ -187,8 +188,9 @@ class DirectMarket:
             self.receipts[group] = (receipt_time, now)
             self.errors.pop(group, None)
             if (self.dedupe_unchanged and not self.overloaded and old and old.generation == generation
-                    and old.valid == valid and float(old.price) == value):
-                # Only consecutive identical decision inputs are redundant.
+                    and old.valid == valid and float(old.price) == value
+                    and (received_ns-old.received_ns)/1e9 <= cfg.WS_MAX_QUEUE_AGE_SECONDS):
+                # An identical quote after a gap can make a stale entry eligible again.
                 # A->B->A is always three events; zero quantity is a change.
                 self.counts['unchanged'] += 1
                 return True
@@ -510,11 +512,12 @@ class DualMarket(DirectMarket):
     def _quote_clock():
         return time.monotonic(), time.time(), time.monotonic_ns()
 
-    def _quote(self, feed, symbol, tick=None, *, clock=None):
+    def _quote(self, feed, symbol, tick=None, *, clock=None, refresh=True):
         mono, epoch, nano = self._quote_clock() if clock is None else clock
         with feed._lock:
             tick = feed.processed.get(symbol) if tick is None else tick
-            tick = feed.quote_tick(symbol, tick)
+            if refresh:
+                tick = feed.quote_tick(symbol, tick)
             if (self._closing.is_set() or feed.overloaded or -1 in self.errors or not tick or not tick.valid
                     or tick.group in feed.errors or tick.group not in feed.receipts
                     or tick.generation != feed.generation[tick.group]
@@ -548,7 +551,7 @@ class DualMarket(DirectMarket):
         return {symbol: price for symbol in (self.symbols if symbols is None else symbols)
                 if (price := self._quote(self, symbol, clock=clock)) is not None}
 
-    def price_maps(self, symbols=None):
+    def price_maps(self, symbols=None, *, admissions=None, admission_events=None):
         """One owner-cycle view; send guards always re-read live feed health."""
         clock = self._quote_clock()
         ticks, bids, entries = {}, {}, {}
@@ -564,7 +567,12 @@ class DualMarket(DirectMarket):
                 bid = self._post_rejection_price(self.book, symbol, bid, cutoffs['bid0'])
             if bid is not None:
                 bids[symbol] = bid
-            selected = bid if entry_tick is None else entry_tick if bid is None else min(entry_tick, bid)
+            if admissions is not None and symbol in admissions:
+                quote = admissions[symbol] = self.admission_quote(symbol, clock=clock,
+                    event=admission_events.get(symbol) if admission_events else None)
+                selected = quote['selected']
+            else:
+                selected = bid if entry_tick is None else entry_tick if bid is None else min(entry_tick, bid)
             if selected is not None:
                 entries[symbol] = selected
         return ticks, bids, entries
@@ -607,6 +615,59 @@ class DualMarket(DirectMarket):
         selected, source = min(((p, s) for s, p in prices.items() if p is not None), default=(None, None))
         return dict(prices, selected=selected, source=source, bid_quantity=quantity,
                     observed_watermarks=watermarks)
+
+    def _admission_evidence(self, feed, symbol, cutoff, clock, event):
+        with feed._lock:
+            latest = feed.latest_ingress.get(symbol)
+            if (event is not None and event.symbol == symbol and event.source == feed.source and event.receive_seq > cutoff
+                    and event.generation == feed.generation[event.group]
+                    and (clock[2]-event.received_ns)/1e9 <= cfg.WS_MAX_QUEUE_AGE_SECONDS):
+                # Preserve fresh ordered crossings even if a later rebound is
+                # already waiting on ingress. Keep the chosen price and clock paired.
+                latest = feed.quote_tick(symbol, event)
+            if latest is None or latest.receive_seq <= cutoff:
+                return None, None, False
+            price = self._quote(feed, symbol, latest, clock=clock, refresh=False)
+            if price is not None and (clock[2]-latest.received_ns)/1e9 > cfg.WS_MAX_QUEUE_AGE_SECONDS:
+                return None, None, True
+            return price, latest, False
+
+    def admission_price(self, symbol, *, event=None):
+        clock = self._quote_clock()
+        cutoffs = self._entry_reject_cutoffs.get(symbol, {})
+        tick, _, _ = self._admission_evidence(self, symbol, cutoffs.get('tick', 0), clock, event)
+        bid, _, _ = self._admission_evidence(self.book, symbol, cutoffs.get('bid0', 0), clock, event)
+        return bid if tick is None else tick if bid is None else min(tick, bid)
+
+    def admission_quote(self, symbol, *, clock=None, event=None):
+        """Capture the price and its evidence together, before selecting a new ordinary order."""
+        if clock is None:
+            clock = self._quote_clock()
+        cutoffs = self._entry_reject_cutoffs.get(symbol, {})
+        tick_price, trade, trade_expired = self._admission_evidence(self, symbol, cutoffs.get('tick', 0), clock, event)
+        bid_price, bid, bid_expired = self._admission_evidence(self.book, symbol, cutoffs.get('bid0', 0), clock, event)
+        if bid_price is not None and (tick_price is None or bid_price < tick_price
+                or bid_price == tick_price and bid.received_ns >= trade.received_ns):
+            selected, source, tick = bid_price, 'bid0', bid
+        elif tick_price is not None:
+            selected, source, tick = tick_price, 'tick', trade
+        else:
+            selected, source, tick = None, None, None
+        timing = (dict(quote_source='depth' if source == 'bid0' else 'tick',
+                       exchange_time_ms=tick.exchange_ms, received_epoch_ms=tick.received_epoch_ms,
+                       _received_ns=tick.received_ns) if tick is not None else {})
+        if tick is not None:
+            reason = None
+        elif trade_expired or bid_expired:
+            reason = 'admission_quote_expired'
+        elif cutoffs:
+            reason = 'quote_waiting_fresh_after_send_rejection'
+        elif trade is None and bid is None:
+            reason = 'quote_waiting_first_tick'
+        else:
+            reason = 'quote_stale_or_disconnected_both_sources'
+        return dict(tick=tick_price, bid0=bid_price, selected=selected, source=source, timing=timing,
+                    missing_reason=reason)
 
     def entry_prices(self, symbols=None):
         return self.price_maps(symbols)[2]
