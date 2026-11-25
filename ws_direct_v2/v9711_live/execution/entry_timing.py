@@ -45,6 +45,19 @@ class EntryTimings:
             key = (symbol, int(row.get('order_bar_open_ms') or 0), str(session_id or ''))
             self._plans.setdefault(key, []).append(cid)
             self._recent.append(cid)
+            # Bound process-local timing history; old rows are no longer
+            # needed for the 512-sample panel and otherwise accumulate forever.
+            while len(self._rows) > 2048 and self._recent:
+                old = self._recent.popleft()
+                if old == cid or old not in self._rows:
+                    continue
+                self._rows.pop(old, None)
+                for plan_key, ids in tuple(self._plans.items()):
+                    if old in ids:
+                        ids.remove(old)
+                        if not ids:
+                            self._plans.pop(plan_key, None)
+            self.revision += 1
             self.revision += 1
 
     def mark(self, cid, stage, *, transport=None):

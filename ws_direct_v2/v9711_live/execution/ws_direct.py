@@ -827,6 +827,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         metadata_sync = MetadataSync(cfg.EXCHANGE_INFO_CACHE_FILE)
         metadata_sync.start()
         next_maintenance = time.monotonic()
+        last_full_maintenance = 0.0
         try:
             self.market.start()
             while True:
@@ -843,12 +844,20 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 # close IDs continue normal reconciliation, without spinning.
                 next_maintenance = min(next_maintenance,
                     now_mono+self._next_exit_wake_delay(now=time.time()))
-                if now_mono >= next_maintenance:
+                queued_quotes = self.market.events.qsize()
+                maintenance_due = now_mono >= next_maintenance
+                maintenance_forced = now_mono - last_full_maintenance >= .25
+                if maintenance_due and queued_quotes and not maintenance_forced:
+                    self._service_pending_quotes(limit=96, budget_seconds=.003)
+                    next_maintenance = time.monotonic() + .001
+                    continue
+                if maintenance_due:
                     # Exact fill/forced exit/close timers remain bounded even
                     # under continuous WS load; never wait for an exchange ACK.
                     try:
                         self._service_pending_quotes()
                         self.step()
+                        last_full_maintenance = time.monotonic()
                     except Exception:
                         self._account_deadline = 0
                         self._publish_entry_gate()
@@ -865,6 +874,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                         self._publish_entry_gate()
                     else:
                         self.market.decide(tick, self.on_tick)
+                        if self.market.events.qsize():
+                            self._service_pending_quotes(limit=24, budget_seconds=.0015)
                 except Exception:
                     self._account_deadline = 0
                     self._publish_entry_gate()
