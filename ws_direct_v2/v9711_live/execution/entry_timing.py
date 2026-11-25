@@ -168,6 +168,8 @@ class EntryTimings:
                             first_registration_ms=rows[0].get('registered_epoch_ms') if rows else None,
                             first_send_ms=first_sent.get('send_epoch_ms'),
                             latest_status=latest.get('status'), latest_id=latest.get('client_order_id'),
+                            latest_end_reason=latest.get('cancel_reason') or latest.get('retired_reason'),
+                            latest_executed_qty=latest.get('executed_qty'),
                             last_error={k: error[k] for k in _ERROR_FIELDS if k in error})
             return dict(registered=len(matches), sent=sum('_send_ns' in row for row in matches),
                         last_skip=self._skips.get((*key, entry['position_id'])) or self._skips.get((*key, '')),

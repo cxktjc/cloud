@@ -34,7 +34,12 @@ class BatchEntryMixin:
         if callable(capture):
             detail = capture(symbol, cid, limit)
             if detail['entry_qualified_by'] == 'none':
-                raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send',
+                def gap(key):
+                    value = detail.get(key)
+                    return f'{value:+.4%}' if value is not None else 'unavailable'
+                raise EntryQuoteUnavailable('neither tick nor bid0 qualifies before send '
+                    f'(tick={gap("entry_tick_gap")}, bid0={gap("entry_depth_gap")}, '
+                    f'ceiling={gap("entry_gap_ceiling")})',
                                             quote_watermarks=detail.get('entry_recheck_watermarks'))
             return detail
         guard = getattr(self, 'entry_quote_guard', None)

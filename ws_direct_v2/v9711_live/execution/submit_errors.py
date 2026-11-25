@@ -49,9 +49,10 @@ class EntrySendGateRejection(ConfirmedSubmitRejection):
         'entry_sizing_changed_at_send',
     })
 
-    def __init__(self, reason, detail=''):
+    def __init__(self, reason, detail='', *, cancel_reason=None):
         super().__init__(f'pre-send entry gate: {reason}; request never sent' + (f' ({detail})' if detail else ''))
         self.reason = reason
+        self.cancel_reason = cancel_reason
 
 
 _TRANSPORT = (

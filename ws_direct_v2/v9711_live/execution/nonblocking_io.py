@@ -262,7 +262,10 @@ class NetworkIO(EntryCancelPacing):
         if gate.get('held', 0) >= gate.get('position_cap', 0) and not final_exit_bar:
             raise EntrySendGateRejection('entry_position_cap_at_send', f'held={gate.get("held", 0)}')
         if cid not in gate.get('allowed', ()):
-            raise EntrySendGateRejection(gate.get('entry_blocks', {}).get(cid, 'entry_id_not_allowed'))
+            reason = gate.get('entry_blocks', {}).get(cid, 'entry_id_not_allowed')
+            cancel_reason = gate.get('entry_cancel_reasons', {}).get(cid)
+            raise EntrySendGateRejection(reason, f'cancel_reason={cancel_reason}' if cancel_reason else '',
+                                         cancel_reason=cancel_reason)
         return False
 
     def health(self) -> dict[str, Any]:
@@ -414,13 +417,15 @@ class NetworkTradeMixin:
         follow_entries = (self._follow_gate_entries(snapshot, now=now)
                           if hasattr(self, '_follow_gate_entries') and len(self.positions) < FOLLOW_POSITION_CAP else {})
         allowed = set(follow_entries)
-        blocked = {}
+        blocked, cancel_reasons = {}, {}
         expected_weight = cfg.SLOT_WEIGHTS[min(len(self.positions), 2)]
         for row in self.tracked.values():
             if row.get('signal_follow'):
                 continue
             cid = str(row.get('client_order_id'))
             if row.get('cancel_requested'):
+                if row.get('cancel_reason'):
+                    cancel_reasons[cid] = row['cancel_reason']
                 blocked[cid] = ('entry_sizing_changed_at_send'
                                 if row.get('cancel_reason') == 'position_count_sizing_changed'
                                 else 'entry_cancel_pending_at_send')
@@ -448,7 +453,7 @@ class NetworkTradeMixin:
             # immutable snapshot, never signal targets or a mutable ledger.
             position_exit_due_epochs=tuple(self._finite(pos.get('exit_due_epoch'))
                                            for pos in self.positions.values()),
-            entry_blocks=blocked, allowed=frozenset(allowed))
+            entry_blocks=blocked, entry_cancel_reasons=cancel_reasons, allowed=frozenset(allowed))
         self.client.entry_gate = gate
         if io is not None:
             io.set_entry_gate(gate)

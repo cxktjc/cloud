@@ -189,6 +189,39 @@ class DurableTieredTests(unittest.TestCase):
                          'entry_bar_ended_at_send')
         self.assertFalse(self.trade.ledger.state['entry_submit_rejections'][cid]['retryable'])
 
+    def assert_unsent_cancel(self, reason, retryable):
+        started = self.block_disk()
+        old = self.first_far_entry(price='1.01')
+        self.assertTrue(started.wait(1))
+        cid = old['client_order_id']
+        self.trade._request_cancel('N0USDT', self.trade.tracked['N0USDT'], reason)
+        self.release.set()
+        self.wait_done()
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.trade.ledger.owns_client(cid))
+        timing = self.trade.session_entries.timings.order(cid)
+        self.assertEqual(timing['submit_error_reason'], 'entry_cancel_pending_at_send')
+        self.assertIn(f'cancel_reason={reason}', timing['submit_error'])
+        self.assertEqual(self.trade.ledger.state['entry_submit_rejections'][cid]['retryable'], retryable)
+        if retryable:
+            _, _, deadline = self.trade._entry_gate_retries['N0USDT']
+            self.case.now += .3
+            self.case.publish()
+            with patch('time.monotonic', return_value=deadline+.01):
+                self.trade.market.update('N0USDT', '1.009', int(self.case.now*1000))
+                self.trade._service_pending_quotes(limit=64, budget_seconds=.05)
+                self.wait_done()
+            self.assertEqual(len(self.sent), 1)
+            self.assertNotEqual(self.sent[0], cid)
+        else:
+            self.assertTrue(self.trade._entry_submission_blocked(self.trade._entry_sizing_row(self.case.templates[0])))
+
+    def test_unsent_entry_after_gap_recovery_can_retry(self):
+        self.assert_unsent_cancel('entry_gap_too_far', True)
+
+    def test_intentionally_replaced_unsent_entry_stays_suppressed(self):
+        self.assert_unsent_cancel('replaced_by_closer', False)
+
     def test_far_valid_depth_is_checked_after_socket_readiness(self):
         stages = []
         original = self.trade.client._broker_call

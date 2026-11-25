@@ -339,6 +339,9 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             row['cancel_requested_epoch'] = time.time()
             row['cancel_reason'] = reason
             self._publish_entry_gate()
+            if row.get('unacked_cancel_reason_logged') != reason:
+                row['unacked_cancel_reason_logged'] = reason
+                LOG.info('cancel marked without exchange order id symbol=%s id=%s reason=%s', symbol, cid, reason)
             return False
         attempts = getattr(self, '_cancel_attempts', None)
         if attempts is None:
@@ -553,7 +556,10 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         bar_ms = int(self._finite(row.get('order_bar_open_ms')))
         now = time.time()
         gate_retry = (isinstance(exc, EntrySendGateRejection)
-                      and exc.reason in EntrySendGateRejection.RECOVERABLE_ORDINARY
+                      and (exc.reason in EntrySendGateRejection.RECOVERABLE_ORDINARY or
+                           (exc.reason == 'entry_cancel_pending_at_send' and
+                            exc.cancel_reason in ('entry_gap_too_far', 'position_capacity_full',
+                                                  'position_capacity_full_cancel_all')))
                       and not (row.get('signal_follow') or (current or {}).get('signal_follow'))
                       and bar_ms > 0 and bar_ms <= now*1000 < bar_ms + cfg.BAR_MS)
         retryable = isinstance(exc, EntryQuoteUnavailable) or gate_retry

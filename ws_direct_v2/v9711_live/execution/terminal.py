@@ -27,6 +27,14 @@ def entry_error_line(row):
             + (f' code={code}' if code is not None else '') + f'：{row["submit_error"]}')
 
 
+ENTRY_END_REASONS = {'order_bar_expired': '入场bar结束', 'entry_gap_too_far': '距离超过撤单门槛',
+                     'replaced_by_closer': '被更近候选替换', 'position_capacity_full': '持仓容量已满',
+                     'position_capacity_full_cancel_all': '持仓容量已满', 'order_plan_changed': 'Signal计划变化',
+                     'already_held': '同币已有持仓', 'pending_order_overflow': '普通挂单超额',
+                     'position_count_sizing_changed': '持仓数变化，资金档位调整',
+                     'signal_follow_ended': 'signal持仓结束'}
+
+
 class MarketConsoleFilter(logging.Filter):
     """Collector chatter stays in trade.log; sticky errors live in the panel."""
     def filter(self, record):
@@ -312,8 +320,10 @@ class TradeTerminalView:
                         ('queue_wait', '排队'), ('trigger_to_send', '唤醒→发送'),
                         ('decision_to_send', '判断→发送')) if key in details)
                     kind = '补挂' if worst.get('signal_follow') else '普通'
+                    wake = (f' 唤醒源={worst["trigger_symbol"]}/{worst.get("trigger_source") or "?"}'
+                            if worst.get('trigger_symbol') else ' 无行情唤醒记录')
                     lines.insert(-1, f'  {label}最慢单: {worst["symbol"]} {kind} {worst["client_order_id"]} '
-                                 f'发送={iso_ms(worst.get("send_epoch_ms"))} {segments}')
+                                 f'发送={iso_ms(worst.get("send_epoch_ms"))}{wake} {segments}')
                 stages = latency.get('stages') or {}
                 if stages:
                     edges = (
@@ -449,8 +459,9 @@ class TradeTerminalView:
                 lines.insert(-1, f'  entry skipped {symbol}: {reason}')
         rejections = sorted((f.get('entry_rejections') or {}).values(),
                             key=lambda row: row.get('rejected_at_epoch', 0), reverse=True)
-        for row in rejections[:3]:
-            lines.insert(-1, f'  ENTRY REJECTED {row.get("symbol")}: {row.get("error")}')
+        if f.get('session_entry_stats') is None:
+            for row in rejections[:3]:
+                lines.insert(-1, f'  ENTRY REJECTED {row.get("symbol")}: {row.get("error")}')
         session = f.get('session_entry_stats')
         if session is not None:
             block = [
@@ -492,11 +503,15 @@ class TradeTerminalView:
                                 block.append(f'      {kind}：未见匹配的登记记录')
                                 continue
                             sent = group.get('first_send_ms')
+                            reason = group.get('latest_end_reason')
+                            qty = group.get('latest_executed_qty')
                             block.append(f'      {kind}：登记={group["registered"]} 实际发送={group["sent"]} '
                                          f'首次登记={iso_ms(group.get("first_registration_ms"))} '
                                          f'首次发送={iso_ms(sent) if sent is not None else "无"} '
                                          f'最近状态={group.get("latest_status") or "待确认"} '
-                                         f'单号={group.get("latest_id")}')
+                                         f'单号={group.get("latest_id")}'
+                                         + (f' 成交量={qty}' if qty is not None else '')
+                                         + (f' 撤销/终结原因={ENTRY_END_REASONS.get(reason, reason)}' if reason else ''))
                             error = group.get('last_error')
                             if error:
                                 block.append(f'        最近异常={iso_ms(error.get("submit_error_epoch_ms"))} '
@@ -514,15 +529,11 @@ class TradeTerminalView:
                     else:
                         block.append('      该笔signal尚无匹配的下单时间记录；不使用其他入场bar的记录代填。')
                     if latest:
-                        reasons = {'order_bar_expired': '入场bar结束', 'entry_gap_too_far': '距离超过撤单门槛',
-                                   'replaced_by_closer': '被更近候选替换', 'position_capacity_full': '持仓容量已满',
-                                   'position_capacity_full_cancel_all': '持仓容量已满',
-                                   'signal_follow_ended': 'signal持仓结束'}
                         reason = latest.get('cancel_reason') or latest.get('retired_reason') or ''
                         block.append(f'      委托跟踪：已登记={attempts.get("registered", 0)} 实际发送={attempts.get("sent", 0)} '
                                      f'最近状态={latest.get("status") or "待确认"} '
                                      f'累计成交量={latest.get("executed_qty", "未确认")} '
-                                     f'撤销/终结原因={reasons.get(reason, reason) or "尚未记录"}')
+                                     f'撤销/终结原因={ENTRY_END_REASONS.get(reason, reason) or "尚未记录"}')
                     current = row.get('same_symbol_trade')
                     if current:
                         reason = ('入场bar不同' if current.get('mismatch_reason') == 'different_entry_bar'
