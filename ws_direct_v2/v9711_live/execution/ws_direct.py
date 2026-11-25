@@ -328,7 +328,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         snapshot = dict(snapshot)
         snapshot['_signal_snapshot_valid'] = status == 'valid'
         if status == 'valid':
-            if not self.market.healthy():
+            # WS events are already generation/age-validated, and candidate
+            # prices are checked per symbol below. Avoid an O(universe) scan
+            # on each actionable event in the single state-owner thread.
+            if not self._fast_tick and not self.market.healthy():
                 status = 'ws_not_ready'
             elif not self._account_send_allowed():
                 status = 'account_not_ready'

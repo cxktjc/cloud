@@ -125,6 +125,12 @@ class HotOwnedQuotesTests(unittest.TestCase):
     refresh_quotes = fixtures.FlashOwnerTests.refresh_quotes
     publish, held = fixtures.FlashOwnerTests.publish, fixtures.FlashOwnerTests.held
 
+    def test_ws_entry_path_skips_full_universe_health_scan(self):
+        self.plans(1)
+        with patch.object(self.trade.market, 'healthy', side_effect=AssertionError('universe scan on WS path')):
+            self.event('N0USDT', 1.01)
+        self.assertIn('N0USDT', self.trade.tracked)
+
     def test_definitively_blocked_best_candidate_does_not_repeat_planner(self):
         self.plans(9)
         self.event('N0USDT', 1.01)
