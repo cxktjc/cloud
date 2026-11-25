@@ -12,6 +12,20 @@ def tick(symbol, price, number=0, source='tick'):
 
 
 class QuoteQueueTests(unittest.TestCase):
+    def test_duplicate_notifications_leave_room_for_crossing_and_rearm_after_take(self):
+        events = QuoteQueue(maxsize=2)
+        for _ in range(100):
+            events.notify_owner()
+        crossing = tick('A', .99)
+        events.put_nowait(crossing)
+        self.assertIsNone(events.get_nowait())
+        events.notify_owner()  # new completion during the first wake's handler
+        self.assertIs(events.get_nowait(), crossing)
+        self.assertIsNone(events.get_nowait())
+        for _ in range(3):
+            events.task_done()
+        self.assertEqual(events.unfinished_tasks, 0)
+
     def test_deep_crossing_overtakes_unrelated_near_updates_but_not_its_own_predecessor(self):
         events = self.make()
         events.enable_ingress_screening()

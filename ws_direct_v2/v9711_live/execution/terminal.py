@@ -118,6 +118,18 @@ def entry_timing_lines(timing):
                            '（跨币仅唤醒评估，不参与本币比价）']
         if 'quote_age_at_wake' in delays:
             quote_lines.append(f'      本币报价在唤醒时已存在={delays["quote_age_at_wake"]:.3f}ms（报价年龄，非排队耗时）')
+    # Exchange and host wall clocks may differ. Queue residence uses the
+    # local monotonic trigger stamps, even when admission uses a later quote.
+    for label, exchange, received in (
+            ('触发事件', 'trigger_exchange_time_ms', 'event_received_epoch_ms'),
+            ('依据报价', 'exchange_time_ms', 'received_epoch_ms')):
+        sent, local = timing.get(exchange), timing.get(received)
+        if isinstance(sent, (int, float)) and isinstance(local, (int, float)) and sent > 0 and local > 0:
+            quote_lines.append(f'      {label}: 交易所={iso_ms(sent)} 本机接收={iso_ms(local)} '
+                               f'两端时钟差值={local-sent:+.3f}ms')
+    if 'queue_wait' in delays:
+        quote_lines.append(f'      本机触发事件接收→出队={delays["queue_wait"]:.3f}ms '
+                           '（单调时钟，不含交易所传输）')
     save_parts = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
         ('journal_prepare', '准备'), ('journal_write', '写入'),
         ('journal_sync', '同步'), ('journal_receipt', '回执')) if key in delays)

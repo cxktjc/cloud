@@ -86,10 +86,7 @@ class DirectMarket:
         self._volume_bars = {}
 
     def _wake(self):
-        try:
-            self.events.put_nowait(None)
-        except queue.Full:
-            pass
+        self.events.notify_owner()
 
     def group_connected(self, index):
         with self._lock:

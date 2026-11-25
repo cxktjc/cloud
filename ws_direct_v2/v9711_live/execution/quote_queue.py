@@ -41,6 +41,17 @@ class QuoteQueue(queue.Queue):
         with self.mutex:
             self._screen_ingress = True
 
+    def notify_owner(self):
+        # Notifications carry no payload: flags and exact results stay in their
+        # respective stores. One pending wake suffices; a wake after dequeue
+        # creates a new ticket even while the owner handles the previous one.
+        with self.not_full:
+            if None in self.queue or (self.maxsize > 0 and self._length >= self.maxsize):
+                return
+            self._put(None)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
     def put_quote(self, item, complete_far, *, price=None):
         """Stateless comparison, atomic with policy and symbol ownership.
 
