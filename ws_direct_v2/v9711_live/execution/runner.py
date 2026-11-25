@@ -1164,7 +1164,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                     raw['_rotation_origin'] = dict(self.ledger.state.get('pending_rotation') or {})
                     origin = raw['_rotation_origin']
                     raw['entry_gap_ceiling'] = min(cfg.CANCEL_GAP, self._finite(origin.get('victim_gap'))
-                        - GapPolicy().minimum_improvement(int(self._finite(origin.get('original_order_count')))))
+                        - self._finite(origin.get('minimum_improvement'),
+                            GapPolicy().minimum_improvement(int(self._finite(origin.get('original_order_count'))))))
                 self._place_order(raw)
         # The new entries have been registered and dispatched. The existing
         # paced cancel lane retains its 1.5s interval and exact-ID recovery.

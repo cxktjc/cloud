@@ -210,11 +210,13 @@ def select_physical_orders(
 
     def replacement_candidates(pending):
         count = int(_finite(pending.get('original_order_count')))
+        improvement = pending.get('minimum_improvement')
         return sorted((r for r in rows.values()
             if r.symbol not in tracked and r.symbol != pending.get('victim')
             and r.order_bar_open_ms == int(_finite(pending.get('order_bar_open_ms')))
             and policy.replacement_allowed(_finite(pending.get('victim_gap'), float('nan')), r.gap,
-                ceiling=policy.rotation_gap(count, max_orders), count=count)), key=lambda r: (r.gap, r.symbol))
+                ceiling=policy.rotation_gap(count, max_orders), count=count,
+                minimum_improvement=improvement)), key=lambda r: (r.gap, r.symbol))
 
     if slots == 0:
         return result(state='clear' if pending_rotation else rotation_action)
@@ -259,9 +261,13 @@ def select_physical_orders(
         ceiling = policy.rotation_gap(original_count, max_orders)
         old_gap = _finite(pending_rotation.get('victim_gap'), float('nan'))
         bar = int(_finite(pending_rotation.get('order_bar_open_ms')))
+        other_gaps = [item.gap for symbol, item in ranked.items() if symbol != victim]
+        improvement = _finite(pending_rotation.get('minimum_improvement'),
+                              policy.rotation_improvement(old_gap, original_count, other_gaps)[0])
         challengers = sorted((r for r in rows.values()
             if r.symbol not in tracked and r.symbol != victim and r.order_bar_open_ms == bar
-            and policy.replacement_allowed(old_gap, r.gap, ceiling=ceiling, count=original_count)),
+            and policy.replacement_allowed(old_gap, r.gap, ceiling=ceiling, count=original_count,
+                minimum_improvement=improvement)),
             key=lambda r: (r.gap, r.symbol))
         if challengers:
             best = challengers[0]
@@ -282,14 +288,21 @@ def select_physical_orders(
     if active_kept and len(ranked) == len(active_kept):
         worst = max(active_kept, key=lambda s: (ranked[s].gap, s))
         ceiling = policy.rotation_gap(count, max_orders)
+        other_gaps = [item.gap for symbol, item in ranked.items() if symbol != worst]
+        minimum_improvement, similar_order_rule = policy.rotation_improvement(
+            ranked[worst].gap, count, other_gaps)
         best = next((r for r in challengers if policy.replacement_allowed(
-            ranked[worst].gap, r.gap, ceiling=ceiling, count=count)), None)
+            ranked[worst].gap, r.gap, ceiling=ceiling, count=count,
+            minimum_improvement=minimum_improvement)), None)
         if best is not None:
             old = tracked[worst]
             rotation = dict(victim=worst, victim_client_order_id=str(old.get('client_order_id') or ''),
                 victim_order_id=old.get('order_id'), victim_gap=ranked[worst].gap,
                 challenger=best.symbol, original_order_count=count, admission_gap=ceiling,
-                minimum_improvement=policy.minimum_improvement(count), policy_version=7,
+                minimum_improvement=minimum_improvement, base_minimum_improvement=policy.minimum_improvement(count),
+                similar_order_rule=similar_order_rule, similar_order_band=policy.similar_order_band,
+                similar_order_gaps=other_gaps, challenger_gap=best.gap,
+                improvement_observed=ranked[worst].gap-best.gap, policy_version=8,
                 order_bar_open_ms=best.order_bar_open_ms,
                 expires_at_ms=best.order_bar_open_ms + cfg.BAR_MS,
                 victim_terminal=False, victim_filled=False)

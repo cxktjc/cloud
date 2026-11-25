@@ -599,8 +599,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                for s, r in ordinary.items()):
             return False
         prices = self.market.entry_prices(ordinary)
-        gaps = [(prices[s]-float(r['limit_price']))/float(r['limit_price'])
-                for s, r in ordinary.items() if s in prices and float(r.get('limit_price') or 0) > 0]
+        gap_rows = [(s, (prices[s]-float(r['limit_price']))/float(r['limit_price']))
+                    for s, r in ordinary.items()
+                    if s in prices and float(r.get('limit_price') or 0) > 0]
+        gaps = [gap for _, gap in gap_rows]
         self._quote_route = 'full_far_order'
         if (gaps and not at_most(max(gaps), cfg.CANCEL_GAP)):
             return False
@@ -616,8 +618,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             # entire planner on every nonqualifying event.
             if count >= cfg.MAX_PENDING_ORDERS:
                 return True
+            minimum_improvement = pending.get('minimum_improvement')
             if policy.replacement_allowed(self._finite(pending.get('victim_gap'), float('nan')), best,
-                    ceiling=cfg.CANCEL_GAP, count=int(self._finite(pending.get('original_order_count')))):
+                    ceiling=cfg.CANCEL_GAP, count=int(self._finite(pending.get('original_order_count'))),
+                    minimum_improvement=minimum_improvement):
                 return False
             return not at_most(best, policy.admission_gap(count))
         self._quote_route = 'full_vacancy'
@@ -629,8 +633,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         # Replanning every healthy quote during an unrelated outage creates
         # a backlog; still evaluate genuine vacancies and recovery crossings.
         self._quote_route = 'full_competitive_replacement'
-        return not (len(gaps) == len(ordinary) and gaps and policy.replacement_allowed(max(gaps), best,
-                    ceiling=cfg.CANCEL_GAP, count=count))
+        worst_symbol = max(gap_rows, key=lambda item: item[1])[0] if gap_rows else ''
+        worst_gap = max(gaps) if gaps else float('nan')
+        other_gaps = [gap for symbol, gap in gap_rows if symbol != worst_symbol]
+        return not (len(gaps) == len(ordinary) and gaps and policy.replacement_allowed(worst_gap, best,
+                    ceiling=cfg.CANCEL_GAP, count=count, other_gaps=other_gaps))
 
     def on_tick(self, tick):
         started = self._quote_mark = time.perf_counter_ns()

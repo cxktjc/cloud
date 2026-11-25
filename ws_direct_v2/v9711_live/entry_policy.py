@@ -28,13 +28,17 @@ class GapPolicy:
     bootstrap_orders: int = cfg.BOOTSTRAP_PENDING_ORDERS
     improvement: float = cfg.SWITCH_TOLERANCE
     crowded_improvement: float = cfg.CROWDED_SWITCH_TOLERANCE
+    similar_order_band: float = cfg.CROWDED_SWITCH_TOLERANCE
+    similar_order_improvement: float = 0.001
     cancel_gap: float = cfg.CANCEL_GAP
 
     def __post_init__(self):
         if not (all(math.isfinite(v) for v in (self.bootstrap_gap, self.fill_gap,
-                 self.strict_gap, self.improvement, self.crowded_improvement, self.cancel_gap))
+                 self.strict_gap, self.improvement, self.crowded_improvement,
+                 self.similar_order_band, self.similar_order_improvement, self.cancel_gap))
                 and 0 <= self.strict_gap <= self.fill_gap <= self.bootstrap_gap < 1
-                and 0 <= self.crowded_improvement <= self.improvement < 1
+                and 0 <= self.similar_order_improvement <= self.crowded_improvement <= self.improvement < 1
+                and 0 <= self.similar_order_band < 1
                 and self.bootstrap_gap <= self.cancel_gap < 1 and self.bootstrap_orders >= 1):
             raise ValueError('Invalid tiered pending-order policy')
 
@@ -48,13 +52,24 @@ class GapPolicy:
     def minimum_improvement(self, count: int) -> float:
         return self.crowded_improvement if count >= self.bootstrap_orders else self.improvement
 
-    def beats(self, old_gap: float, new_gap: float, *, count: int = 0) -> bool:
+    def rotation_improvement(self, old_gap: float, count: int, other_gaps=()) -> tuple[float, bool]:
+        """Use the relaxed margin when another active order is similarly priced."""
+        base = self.minimum_improvement(count)
+        similar = any(math.isfinite(gap) and abs(gap - old_gap) <= self.similar_order_band
+                      for gap in other_gaps)
+        return (self.similar_order_improvement if similar and count >= self.bootstrap_orders else base,
+                similar and count >= self.bootstrap_orders)
+
+    def beats(self, old_gap: float, new_gap: float, *, count: int = 0, other_gaps=()) -> bool:
         # Inclusive 0.30pp at every count; inclusive 0.22pp with >=5 orders.
-        return at_most(self.minimum_improvement(count), old_gap - new_gap)
+        improvement, _ = self.rotation_improvement(old_gap, count, other_gaps)
+        return at_most(improvement, old_gap - new_gap)
 
     def replacement_allowed(self, old_gap: float, new_gap: float, *, ceiling: float,
-                            count: int = 0) -> bool:
-        return at_most(new_gap, ceiling) and self.beats(old_gap, new_gap, count=count)
+                            count: int = 0, other_gaps=(), minimum_improvement=None) -> bool:
+        improvement = (self.rotation_improvement(old_gap, count, other_gaps)[0]
+                       if minimum_improvement is None else minimum_improvement)
+        return at_most(new_gap, ceiling) and at_most(improvement, old_gap-new_gap)
 
     def describe(self) -> dict:
         return dict(version=7, bootstrap_order_count=self.bootstrap_orders,
@@ -62,6 +77,8 @@ class GapPolicy:
                     full_rotation_gap=self.cancel_gap,
                     improvement_at_least=self.improvement,
                     crowded_improvement_at_least=self.crowded_improvement,
+                    similar_order_band=self.similar_order_band,
+                    similar_order_improvement_at_least=self.similar_order_improvement,
                     cancel_gap=self.cancel_gap, cancel_gap_strict=True,
                     rotation_ignores_admission_tiers=True,
                     underfilled_rotation_before_vacancy_fill=True,

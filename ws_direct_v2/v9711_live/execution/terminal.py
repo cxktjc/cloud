@@ -58,6 +58,16 @@ def iso_ms(ms: Any) -> str:
     return datetime.fromtimestamp(float(ms)/1000, tz=timezone.utc).isoformat(timespec='milliseconds')
 
 
+def number(value, *, percent=False):
+    try:
+        value = float(value)
+        if math.isfinite(value) and (percent or value > 0):
+            return f'{value:+.4%}' if percent else f'{value:.10g}'
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return '未记录'
+
+
 def entry_timing_lines(timing):
     timing = timing or {}
     cross_symbol = bool(timing.get('trigger_symbol') and timing['trigger_symbol'] != timing.get('symbol'))
@@ -96,14 +106,6 @@ def entry_timing_lines(timing):
         trigger = f'评估唤醒={timing["trigger_symbol"]}/{timing.get("trigger_source")} '
     quote_lines = []
     if timing and ('order_limit_price' in timing or 'trigger_price' in timing):
-        def number(value, *, percent=False):
-            try:
-                value = float(value)
-                if math.isfinite(value) and (percent or value > 0):
-                    return f'{value:+.4%}' if percent else f'{value:.10g}'
-            except (TypeError, ValueError, OverflowError):
-                pass
-            return '未记录'
         trigger_gap = number(timing.get('trigger_gap'), percent=True)
         quote_lines = [f'      报价与挂单: {trigger}触发价={number(timing.get("trigger_price"))} '
                        f'挂单价={number(timing.get("order_limit_price"))} 触发价差={trigger_gap} '
@@ -598,6 +600,10 @@ class TradeTerminalView:
         if rotation:
             lines.insert(-1, f'换单保留名额: 撤{rotation.get("victim")} → {rotation.get("challenger")} '
                          f'原挂单数={rotation.get("original_order_count")} '
+                         f'旧/新价差={number(rotation.get("victim_gap"), percent=True)}/'
+                         f'{number(rotation.get("challenger_gap"), percent=True)} '
+                         f'改善要求={number(rotation.get("minimum_improvement"), percent=True)} '
+                         f'相近订单放宽={rotation.get("similar_order_rule", False)} '
                          f'旧单终态确认={rotation.get("victim_terminal", False)}；确认前不另占空位。')
         io = f.get('network_io') or {}
         if io.get('enabled'):

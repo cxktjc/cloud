@@ -44,8 +44,22 @@ class EntryTierTests(unittest.TestCase):
                 self.assertEqual(len(plan.cancel), 1)
                 self.assertEqual([r.symbol for r in plan.place], ['NEW'])
                 self.assertEqual(plan.rotation['admission_gap'], .021)
-                self.assertAlmostEqual(plan.rotation['minimum_improvement'], .0022)
-                self.assertFalse(select(count, .021, .018801).cancel)
+                self.assertAlmostEqual(plan.rotation['minimum_improvement'], .001)
+                self.assertTrue(plan.rotation['similar_order_rule'])
+                self.assertFalse(select(count, .021, .020001).cancel)
+
+    def test_crowded_rotation_only_relaxes_when_another_order_is_similar(self):
+        tracked = {f'OLD{i}': row(f'OLD{i}', .01) for i in range(8)}
+        tracked['OLD7'] = row('OLD7', .020)
+        tracked['OLD6'] = row('OLD6', .0195)
+        plan = select_physical_orders([*tracked.values(), row('NEW', .019)], tracked)
+        self.assertEqual(plan.cancel, ('OLD7',))
+        self.assertEqual(plan.rotation['minimum_improvement'], .001)
+        self.assertTrue(plan.rotation['similar_order_rule'])
+        isolated = {f'OLD{i}': row(f'OLD{i}', .005+i*.002) for i in range(8)}
+        isolated['OLD7'] = row('OLD7', .020)
+        strict = select_physical_orders([*isolated.values(), row('NEW', .018)], isolated)
+        self.assertFalse(strict.cancel)
 
     def test_sparse_margin_is_0p30pp_not_0p22pp(self):
         for count in range(1, 5):
@@ -56,7 +70,6 @@ class EntryTierTests(unittest.TestCase):
     def test_old_exception_no_longer_overrides_minimum_improvement(self):
         policy = GapPolicy()
         self.assertFalse(policy.beats(.01651, .01449, count=8))
-        self.assertFalse(select(8, .01651, .01449).cancel)
 
     def test_full_rotation_sends_before_cancel_terminal_and_keeps_original_count(self):
         tracked = {f'OLD{i}': row(f'OLD{i}', .01) for i in range(8)}

@@ -37,8 +37,15 @@ class PendingRotationMixin:
             # Durable reservation must precede the first cancel request/ACK.
             self.ledger.save()
             row = plan.rotation
-            LOG.info('reserve pending rotation old=%s new=%s count=%s max_new_gap=%.4f%%',
-                     row['victim'], row['challenger'], row['original_order_count'],
+            LOG.info('reserve pending rotation old=%s new=%s old_gap=%.4f%% new_gap=%.4f%% '
+                     'count=%s base_improvement=%.4fpp selected_improvement=%.4fpp '
+                     'similar_order_rule=%s similar_order_band=%.4fpp max_new_gap=%.4f%%',
+                     row['victim'], row['challenger'],
+                     row.get('victim_gap', float('nan')) * 100,
+                     row.get('challenger_gap', float('nan')) * 100,
+                     row['original_order_count'], row.get('base_minimum_improvement', 0) * 100,
+                     row.get('minimum_improvement', 0) * 100,
+                     row.get('similar_order_rule', False), row.get('similar_order_band', 0) * 100,
                      row['admission_gap'] * 100)
 
     def _note_rotation_terminal(self, symbol: str, row: Mapping[str, Any], reason: str) -> None:
