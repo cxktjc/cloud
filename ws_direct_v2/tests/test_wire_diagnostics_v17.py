@@ -20,6 +20,28 @@ from v9711_live.exchange.binance_futures_trade_ws import BinanceFuturesTradeWS, 
 
 
 class ActivityTests(unittest.TestCase):
+    def test_bar_pressure_correlates_actual_members_and_drops_across_utc_boundary(self):
+        stats = RequestActivity()
+        with patch('time.time', return_value=179.99):
+            token = stats.begin('entry', members=8, transport='REST_BATCH')
+            stats.finish(token)
+            stats.begin('query')
+        with patch('time.time', return_value=180.):
+            token = stats.begin('cancel', members=6)
+            stats.finish(token)
+            stats.begin('entry', members=4)
+            stats.market_pressure('overload_discarded')
+            stats.market_pressure('queue_expired', age_ms=510)
+            stats.entry_outcome('local_not_sent', 'quote_gate')
+            bars = stats.snapshot(queue_peaks={0: 14, 180: 8192})['bars_3m']
+        assert bars['previous']['entry'] == 8 and 'query' not in bars['previous']
+        assert bars['current']['entry_cancel_total'] == 10
+        assert bars['current']['mutation_requests_peak_second'] == 2
+        assert bars['current']['queue_delay_max_ms'] == 510
+        assert bars['current']['not_sent_quote_gate'] == 1
+        assert bars['peaks']['entry']['utc_start'] == 0
+        assert bars['peaks']['overload_discarded']['queue_peak'] == 8192
+
     def test_windows_expire_on_monotonic_time_and_keep_lifetime_counts(self):
         stats = RequestActivity()
         with patch('time.monotonic', return_value=100.2):
@@ -192,8 +214,16 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         timings = EntryTimings()
         timings.register('XUSDT', 'cid', dict(limit_price=1.))
         probe = EntrySendProbe(lambda: None, timings, 'cid')
+        entered = asyncio.Event()
+        stage = probe.stage
+        def record_stage(name):
+            stage(name)
+            if name == 'socket_entered':
+                entered.set()
+        probe.stage = record_stage
         await self.broker._lock.acquire()
         work = asyncio.create_task(self.broker._request('order.place', {}, signed=True, before_send=probe))
+        await asyncio.wait_for(entered.wait(), timeout=1.)
         await asyncio.sleep(.03)
         self.broker._lock.release()
         await work

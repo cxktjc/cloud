@@ -12,6 +12,14 @@ def tick(symbol, price, number=0, source='tick'):
 
 
 class QuoteQueueTests(unittest.TestCase):
+    def test_deep_crossing_overtakes_unrelated_near_updates_but_not_its_own_predecessor(self):
+        events = self.make()
+        events.enable_ingress_screening()
+        first, predecessor, crossing = tick('A', 1.01), tick('B', 1.04), tick('B', .99)
+        for item in (first, predecessor, crossing):
+            events.put(item)
+        self.assertEqual(self.drain(events), [predecessor, crossing, first])
+
     def test_batch_takes_only_distinct_near_heads_and_leaves_rebound_and_wake_in_order(self):
         events = self.make()
         a, b, rebound = tick('A', .99), tick('B', .98), tick('B', 1.1)

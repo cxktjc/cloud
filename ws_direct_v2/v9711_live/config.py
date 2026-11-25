@@ -203,4 +203,7 @@ class TradeViewConfig(ViewConfig):
 WS_DIRECT_MODE = "ws_direct_v2"
 WS_MIRROR_SECONDS = env_float("V9711_WS_MIRROR_SECONDS", 0.1)
 WS_MAX_QUEUE_AGE_SECONDS = env_float("V9711_WS_MAX_QUEUE_AGE_SECONDS", 0.5)
+# Separate the age of ordinary-order evidence from market/mirror backlog policy.
+WS_ENTRY_QUOTE_MAX_AGE_SECONDS = min(WS_MAX_QUEUE_AGE_SECONDS, max(.01,
+    env_float("V9711_WS_ENTRY_QUOTE_MAX_AGE_SECONDS", .150)))
 WS_QUEUE_SIZE = env_int("V9711_WS_QUEUE_SIZE", 8192)

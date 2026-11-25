@@ -84,10 +84,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._servicing_quotes = False
         self._maintenance_mark = None
         self._last_presentation_mono = None
+        self._shortlist_maintenance = False
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261125-entry-cancel-audit-v26', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261125-market-throughput-bar-v27', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self.market.request_activity = self.market.book.request_activity = self.client.request_activity
@@ -107,6 +108,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         if self.client.enabled and not self.client.dry_run:
             self.ledger.enable_background(incremental=True)
             self.market.events.enable_ingress_screening()
+            self.market.coalesce_equal_trades = True
             if self._previous_switch_interval is None:
                 # CPython's default 5ms GIL interval can be paid repeatedly
                 # between the quote owner, disk writer and socket loop.
@@ -206,6 +208,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def step(self, *, now=None):
         started = self._maintenance_mark = time.perf_counter_ns()
         self._maintenance_segments = {}
+        self._shortlist_maintenance = False
         try:
             stamp = time.time() if now is None else now
             health = self._stream_health()
@@ -256,6 +259,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         # Presentation is optional work, not exact accounting or close timers.
         # Give a burst a chance to drain before another full feedback scan;
         # continuous load still receives at least one update per second.
+        if self._shortlist_maintenance:
+            self._deferred_presentations += 1
+            return False
         now = time.monotonic()
         if (not self.once and self.market.events.qsize() > 32
                 and self._last_presentation_mono is not None
@@ -267,6 +273,20 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def _execute_entries(self, snapshot, status, **kwargs):
         with self.ledger.dispatch_group(), self.ledger.batch_saves():
+            if (self._maintenance_mark is not None and not self._fast_tick and self._network_io is not None
+                    and not self.once and status == 'valid' and snapshot.get('signal_ready')
+                    and self._last_presentation_mono is not None
+                    and time.monotonic()-self._last_presentation_mono < 1):
+                # Keep the exact reconciliation/exit cadence. Between full
+                # universe audits, use the same ranked shortlist as WS admission.
+                previous_symbols = self._active_price_symbols
+                working = self._fast_snapshot(snapshot, None, kwargs['now'])
+                self._shortlist_maintenance = self._fast_tick = True
+                try:
+                    return self._execute_entries_batched(working, status, **kwargs)
+                finally:
+                    self._fast_tick = False
+                    self._active_price_symbols = previous_symbols
             return self._execute_entries_batched(snapshot, status, **kwargs)
 
     def _execute_entries_batched(self, snapshot, status, **kwargs):
@@ -363,7 +383,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         detail['entry_quote_policy'] = 'tiered_admission'
         return super()._place_order(dict(row, **detail, _entry_timing_context=context))
 
-    def desired_snapshot(self, *, now):
+    def desired_snapshot(self, *, now, quote_turn=False):
         payload, status = super().desired_snapshot(now=now)
         if status != 'valid':
             return payload, status
@@ -371,7 +391,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             return self._fresh_fallback(), 'incompatible_ws_direct_contract'
         payload['signal_discovery_desired'] = payload.get('desired') or []
         payload['desired'] = payload['candidate_templates']
-        if self._template_file_revision != self._desired_reader.revision:
+        revision_changed = self._template_file_revision != self._desired_reader.revision
+        if revision_changed:
             templates = {row['symbol']:dict(row) for row in payload['candidate_templates']
                          if isinstance(row, dict) and row.get('symbol')}
             if templates != self._templates:
@@ -379,13 +400,17 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 self._eligible.clear()
                 self._rank_heap.clear()
                 for symbol, price in self.market.entry_prices().items():
-                    self._update_rank(symbol, price)
+                    self._update_rank(symbol, price, publish_watch=False)
                 self._template_revision += 1
             self._template_file_revision = self._desired_reader.revision
-        self._queue_targets = frozenset(self._target_positions(payload))
-        self.market.events.set_policy(self._templates,
-            set(self._eligible) | set(self.tracked) | set(self.positions) | self._queue_targets)
-        self._promote_signal_follow_orders(payload, now=now)
+        if revision_changed or not quote_turn:
+            self._queue_targets = frozenset(self._target_positions(payload))
+            self.market.events.set_policy(self._templates,
+                set(self._eligible) | set(self.tracked) | set(self.positions) | self._queue_targets)
+        # Same-revision quote turns publish changed ranks individually;
+        # exact order/position transitions publish the full watch policy.
+        if self._queue_targets and self.tracked:
+            self._promote_signal_follow_orders(payload, now=now)
         return payload, status
 
     def refresh_prices(self, *, now=None):
@@ -411,7 +436,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         finally:
             self._io_signal = snapshot, status
 
-    def _update_rank(self, symbol, price):
+    def _update_rank(self, symbol, price, *, publish_watch=True):
         row = self._templates.get(symbol)
         version = self._quote_versions.get(symbol, 0)+1
         self._quote_versions[symbol] = version
@@ -425,8 +450,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         if len(self._rank_heap) > max(64, 4*len(self._eligible)):
             self._rank_heap = list(self._eligible.values())
             heapq.heapify(self._rank_heap)
-        self.market.events.watch(symbol, symbol in self._eligible or symbol in self.tracked
-                                 or symbol in self.positions or symbol in self._queue_targets)
+        if publish_watch:
+            self.market.events.watch(symbol, symbol in self._eligible or symbol in self.tracked
+                                     or symbol in self.positions or symbol in self._queue_targets)
 
     def _unowned_rank_blocked(self, symbol, now):
         if symbol in self.tracked or symbol in self.positions:
@@ -441,8 +467,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         return self.market.admission_price(symbol, event=self._admission_events.get(symbol))
 
     def _fast_snapshot(self, snapshot, tick, now):
-        sampled = {tick.symbol: self._rank_price(tick.symbol)}
-        self._update_rank(tick.symbol, sampled[tick.symbol] or float('inf'))
+        sampled = {}
+        if tick is not None:
+            sampled[tick.symbol] = self._rank_price(tick.symbol)
+            self._update_rank(tick.symbol, sampled[tick.symbol] or float('inf'))
         target_symbols = set(self._target_positions(snapshot))
         selected, restore = set(self.tracked) | target_symbols, []
         valid = 0
@@ -580,8 +608,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         if pending:
             self._quote_route = 'full_reserved_replacement'
             excluded.add(str(pending.get('victim') or ''))
-        best = self._best_unowned_gap(excluded)
         policy, count = GapPolicy(), len(ordinary)
+        best = self._best_unowned_gap(excluded)
         if pending:
             # A rejected replacement may leave a durable reservation while
             # quotes rebound. Retain its original gate without running the
@@ -661,7 +689,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
     def _on_tick(self, tick):
         now = time.time()
         previous_revision = self._template_file_revision
-        snapshot, status = self.desired_snapshot(now=now)
+        snapshot, status = self.desired_snapshot(now=now, quote_turn=True)
         self._quote_checkpoint('signal')
         self._io_signal = snapshot, status
         completed = self._drain_network()
@@ -743,7 +771,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._entry_diagnostics['ws_direct']['quote_routes'] = dict(self._quote_routes)
         self._entry_diagnostics['ws_direct']['runtime'] = self._runtime_source
         self._entry_diagnostics['ws_direct']['entry_latency'] = self.session_entries.timings.summary()
-        self._entry_diagnostics['ws_direct']['request_activity'] = self.client.request_activity.snapshot()
+        self._entry_diagnostics['ws_direct']['request_activity'] = self.client.request_activity.snapshot(
+            queue_peaks=self.market.events.bar_peaks(), market_load=self.market.diagnostics_bar_load())
         if self.ledger._background is not None:
             self._entry_diagnostics['ws_direct']['durability_writer'] = self.ledger._background.health()
             self._entry_diagnostics['ws_direct']['durability_writer']['gil_switch_ms'] = sys.getswitchinterval()*1000

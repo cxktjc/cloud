@@ -370,6 +370,33 @@ class TradeTerminalView:
                              f'接收循环延迟最大={minute.get("loop_lag_max_ms", 0)}ms '
                              f'请求最多币对={minute.get("top_symbols", {})} '
                              f'累计socket故障={ws.get("socket_failures", {})}')
+                bars = activity.get('bars_3m') or {}
+                if bars:
+                    peaks = bars.get('peaks', {})
+                    def bar_time(row):
+                        return iso_ms(row['utc_start']*1000)[:16].replace('T', ' ')
+                    def bar_line(row):
+                        return (f'{bar_time(row)} 挂/撤/平={row.get("entry", 0)}/{row.get("cancel", 0)}/{row.get("close", 0)} '
+                                f'行情tick/depth={row.get("tick_received", 0)}/{row.get("depth_received", 0)} '
+                                f'挂撤平请求峰={row.get("mutation_requests_peak_second", 0)}/s '
+                                f'队列峰={row.get("queue_peak", 0)} ≥10ms排队={row.get("queue_over_10ms", 0)} '
+                                f'最久排队={row.get("queue_delay_max_ms", 0)}ms 丢弃/过期/失效代={row.get("overload_discarded", 0)}/'
+                                f'{row.get("queue_expired", 0)}/{row.get("generation_revoked", 0)} '
+                                f'本地未发/交易所拒绝/限频={row.get("local_not_sent", 0)}/'
+                                f'{row.get("exchange_rejected", 0)}/{row.get("rate_limited", 0)}')
+                    lines.insert(-1, '3m bar（UTC，实际发送尝试）: 当前 '+bar_line(bars['current']))
+                    lines.insert(-1, '  上一根 '+bar_line(bars['previous']))
+                    lines.insert(-1, '  最近至多60根单bar峰值: '+' / '.join(
+                        f'{label}={peaks[key].get(key, 0)} @{bar_time(peaks[key])}'
+                        for key, label in (('entry', '挂'), ('cancel', '撤'), ('entry_cancel_total', '同bar挂+撤'))))
+                    if peaks['overload_discarded'].get('overload_discarded'):
+                        lines.insert(-1, '  丢弃最多的bar '+bar_line(peaks['overload_discarded']))
+                    worst_delay = peaks['queue_delay_max_ms']
+                    if (worst_delay.get('queue_delay_max_ms', 0) >= 100
+                            and worst_delay['utc_start'] not in (bars['current']['utc_start'], bars['previous']['utc_start'])
+                            and (not peaks['overload_discarded'].get('overload_discarded')
+                                 or worst_delay['utc_start'] != peaks['overload_discarded']['utc_start'])):
+                        lines.insert(-1, '  排队最久的bar '+bar_line(worst_delay))
             if work:
                 quote, maintenance = work.get('quote') or {}, work.get('maintenance') or {}
                 lines.insert(-1, f'处理耗时P95/最大(ms): 行情={quote.get("p95_ms", 0):.3f}/{quote.get("max_ms", 0):.3f} '

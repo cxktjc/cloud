@@ -569,8 +569,12 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             prev = self._entry_gate_retries.get(symbol)
             failures = min(5, prev[1] + 1) if prev and prev[0] == bar_ms else 0
             self._entry_gate_retries[symbol] = (bar_ms, failures, time.monotonic() + .25 * 2**failures)
-        self.session_entries.timings.outcome(cid, status='SUBMIT_REJECTED', retryable=retryable,
-            **submission_diagnostic(exc, rejected=True, disabled=isinstance(exc, DisabledExchange)))
+        diagnostic = submission_diagnostic(exc, rejected=True, disabled=isinstance(exc, DisabledExchange))
+        self.session_entries.timings.outcome(cid, status='SUBMIT_REJECTED', retryable=retryable, **diagnostic)
+        activity = getattr(self.client, 'request_activity', None)
+        if activity is not None:
+            activity.entry_outcome(diagnostic['submit_error_category'],
+                                   diagnostic.get('submit_error_reason'))
         if current and str(current.get('client_order_id') or '') == cid:
             self._note_rotation_terminal(symbol, current, 'confirmed_submission_rejected')
             origin = current.get('rotation_origin')
@@ -980,8 +984,12 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         self._publish_entry_gate()
         for symbol in list(self.positions):
             self._reconcile_position_close(symbol, now=now)
+        checkpoint('positions_close')
+        admission_turn()
         self._reconcile_forced_exits(now=now)
         self._reconcile_manual_flats(now=now)
+        checkpoint('manual_flats')
+        admission_turn()
         # Admission turns can observe a new signal file. Never apply an older
         # local snapshot over the newer worker gate/targets after resuming.
         snapshot, status = self.desired_snapshot(now=now)

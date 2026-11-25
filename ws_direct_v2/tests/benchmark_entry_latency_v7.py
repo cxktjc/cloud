@@ -59,7 +59,7 @@ def restrict_cpus(count):
 
 def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=False,
         pressure_rate=0, interval=1., changing=False, disk_delay_ms=0, ingress_burst_ms=0,
-        rounds=1, round_seconds=15., timing_history=0, near_symbols=0):
+        rounds=1, round_seconds=15., timing_history=0, near_symbols=0, live_cancel_pressure=False):
     case = DualAdmissionTests('test_tick_only_qualifies')
     case.setUp()
     read_started, release_read = threading.Event(), threading.Event()
@@ -69,7 +69,9 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
     try:
         case.symbols = [f'N{i}USDT' for i in range(800)]
         # Avoid per-frame Mock call recording in the pressure producer.
-        case.stack.enter_context(patch('time.time', lambda: case.now))
+        clock_anchor = time.perf_counter()
+        case.stack.enter_context(patch('time.time', lambda: case.now + (time.perf_counter()-clock_anchor
+                                                                     if live_cancel_pressure else 0.)))
         if pressure_rate:
             # Python 3.10 Windows monotonic_ns can tick in ~16ms units. All
             # event and stage clocks use the same high-resolution source here.
@@ -131,6 +133,11 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             reference_bar_open_ms=case.bar-cfg.BAR_MS, exit_due_epoch=case.now+900,
             exit_due_ms=int((case.now+900)*1000)) for s in case.symbols]
         case.publish()
+        if live_cancel_pressure:
+            # Keep this test within one bar, with the real 15s minimum cancel
+            # age and 1.5s spacing. Maintain a valid signal throughout.
+            case.payload['expires_at_epoch'] = case.bar/1000+179
+            cfg.DESIRED_FILE.write_text(json.dumps(case.payload))
         trade.step(now=case.now)
         for i in range(history):
             trade.ledger.intents['c:historical-'+str(i)] = dict(symbol='OLDUSDT', kind='entry',
@@ -174,6 +181,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             from websockets.protocol import State
             from v9711_live.exchange import trade_ws_lifecycle as lifecycle
             from v9711_live.exchange.binance_futures_trade_ws import BinanceWSBroker
+            by_order_id, cancel_sends = {}, []
             class Socket:
                 def __init__(self):
                     self.state = State.OPEN
@@ -182,13 +190,22 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                     sent = time.perf_counter_ns()
                     payload = json.loads(wire)
                     params = payload['params']
-                    assert payload['method'] == 'order.place' and params['apiKey'] == 'offline-key'
+                    assert params['apiKey'] == 'offline-key'
                     assert len(params['signature']) == 64
+                    if live_cancel_pressure and payload['method'] == 'order.cancel':
+                        cid, placed_at = by_order_id[str(params['orderId'])]
+                        cancel_sends.append((sent, (sent-placed_at)/1e9))
+                        result = dict(case.orders[cid], status='CANCELED')
+                        case.orders[cid] = result
+                        self.responses.put_nowait(json.dumps(dict(id=payload['id'], status=200, result=result)))
+                        return
+                    assert payload['method'] == 'order.place'
                     symbol, cid = params['symbol'], params['newClientOrderId']
                     record_send(symbol, cid, sent)
                     result = dict(symbol=symbol, clientOrderId=cid, orderId=str(len(sends)+len(background_sends)),
                                   status='NEW', executedQty='0', avgPrice='0', origQty=params['quantity'])
                     case.orders[cid] = result
+                    by_order_id[result['orderId']] = (cid, sent)
                     self.responses.put_nowait(json.dumps(dict(id=payload['id'], status=200, result=result)))
                 async def recv(self):
                     return await self.responses.get()
@@ -205,6 +222,8 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             case.stack.enter_context(patch.object(ExchangeClient, '_require_broker', require_broker))
             del trade.client.__dict__['_broker_call']
             del trade.client.__dict__['warm_worker_transport']
+            if live_cancel_pressure:
+                del trade.client.__dict__['cancel']
         # Avoid wrapping the default fixture's unused/missing database.
         trade.client.stream = SimpleNamespace()
         trade.client.enabled, trade.client.dry_run = True, False
@@ -230,7 +249,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             while len(sends) < count and time.perf_counter() < deadline:
                 if pressure_rate and time.perf_counter() >= maintenance:
                     trade._service_pending_quotes()
-                    trade.step(now=case.now)
+                    trade.step(now=time.time())
                     cycles += 1
                     maintenance = time.perf_counter()+.25
                 try:
@@ -267,11 +286,18 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             def produce_pressure():
                 index, triggered = 0, 0
                 rebounded = set()
+                next_signal = 5.
                 try:
                     while not pressure_stop.is_set():
                         elapsed = time.perf_counter()-started
                         if elapsed >= duration:
                             break
+                        if live_cancel_pressure and elapsed >= next_signal:
+                            path = cfg.DESIRED_FILE.with_suffix('.next')
+                            case.payload['generated_at_epoch'] = time.time()
+                            path.write_text(json.dumps(case.payload))
+                            os.replace(path, cfg.DESIRED_FILE)
+                            next_signal += 5.
                         round_index = int(elapsed/round_seconds) if rounds > 1 else 0
                         phase = elapsed-round_index*round_seconds
                         due = min(total_samples, round_index*samples + min(samples,
@@ -286,24 +312,26 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                         for item in opportunities:
                             symbol = item['symbol']
                             if symbol not in rebounded and time.perf_counter_ns()-item['received_ns'] >= 1_000_000_000:
-                                market.update(symbol, '1.03', int(case.now*1000))
+                                market.update(symbol, '1.03', int(time.time()*1000))
                                 rebounded.add(symbol)
                         # Same mean rate, but whole network batches arrive at
                         # once. Unlike smooth 1ms pacing, this exercises FIFO
                         # head-of-line delay without coalescing any price.
                         delivered = (int(elapsed/(ingress_burst_ms/1000))+1)*(ingress_burst_ms/1000) if ingress_burst_ms else elapsed
                         target = int(min(delivered, duration)*pressure_rate)
+                        epoch_ms = int(time.time()*1000)
                         while index < target:
                             symbol = background[index % len(background)]
                             # 5/32 tick + 27/32 stable bid frames gives 15.625%
                             # effective events after initial book population.
                             change = index//len(background) % 2 if changing else 0
                             message = json.loads(wires[symbol, change])  # Decode on the client under the GIL.
+                            stamp = epoch_ms if live_cancel_pressure else message['E']
                             try:
                                 if index % 32 < 5:
-                                    market.update(message['s'], message['p'], message['E'])
+                                    market.update(message['s'], message['p'], stamp)
                                 else:
-                                    market.update_book(message['s'], message['p'], '2', message['E'], index+2)
+                                    market.update_book(message['s'], message['p'], '2', stamp, index+2)
                             except BufferError:
                                 pass  # Explicit production overflow counters remain visible.
                             index += 1
@@ -317,7 +345,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             while not pressure_stop.is_set() or not market.events.empty():
                 if time.perf_counter() >= maintenance:
                     trade._service_pending_quotes()
-                    trade.step(now=case.now)
+                    trade.step(now=time.time())
                     cycles += 1
                     maintenance = time.perf_counter()+.25
                 try:
@@ -346,7 +374,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 achieved_raw_rate=round((final.get('received', 0)-initial.get('received', 0))/duration, 1),
                 achieved_effective_rate=round((final.get('enqueued', 0)-initial.get('enqueued', 0))/duration, 1),
                 counters={k: final.get(k, 0)-initial.get(k, 0) for k in
-                          (*keys, 'screened_far', 'screened_replayed', 'unchanged')},
+                          (*keys, 'screened_far', 'screened_replayed', 'compacted_far', 'unchanged')},
                 queue_peak=final.get('queue_peak'), final_queue=market.events.qsize(),
                 opportunities=len(opportunities), sent_symbols=len({s['symbol'] for s in sends}),
                 unsent_symbols=[item['symbol'] for item in opportunities if item['symbol'] not in {s['symbol'] for s in sends}],
@@ -382,7 +410,14 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                 send['admission_recheck_gap'] = audit.get('entry_recheck_gap')
             pressure['sent_check_counts'] = {key: sum(s.get('send_quote_check') == key for s in sends+background_sends)
                 for key in ('near_skipped', 'far_passed', 'far_rejected', 'follow_skipped')}
-            pressure['request_activity'] = trade.client.request_activity.snapshot()
+            pressure['request_activity'] = trade.client.request_activity.snapshot(
+                **({'queue_peaks': market.events.bar_peaks(), 'market_load': market.diagnostics_bar_load()}
+                   if hasattr(market, 'diagnostics_bar_load') else {}))
+            if live_cancel_pressure:
+                pressure['paced_cancel_wire'] = dict(sent=len(cancel_sends),
+                    minimum_rest_seconds=min((age for _, age in cancel_sends), default=None),
+                    minimum_wire_interval_seconds=min(((b[0]-a[0])/1e9 for a, b in zip(cancel_sends, cancel_sends[1:])),
+                                                       default=None))
             values = [s['ms'] for s in sends]
         elif blocked:
             # One resting exact order is queried while another symbol crosses.
@@ -487,6 +522,8 @@ if __name__ == '__main__':
     parser.add_argument('--timing-history', type=int, default=0)
     parser.add_argument('--require-ms', type=float)
     parser.add_argument('--near-symbols', type=int, default=0)
+    parser.add_argument('--live-cancel-pressure', action='store_true',
+                        help='Run the 15s rest timer and signed offline cancel/ACK under pressure')
     args = parser.parse_args()
     if not 1 <= args.samples <= 800 or args.history < 0:
         parser.error('samples in 1..800 and nonnegative history required')
@@ -506,10 +543,13 @@ if __name__ == '__main__':
         parser.error('soak requires pressure, burst and round-seconds >=15 for real paced cancellations')
     if not 0 <= args.near_symbols <= 800-args.rounds*args.samples or (args.near_symbols and not args.pressure_rate):
         parser.error('near-symbols must fit the background universe and requires pressure')
+    if args.live_cancel_pressure and (not args.signed_socket or not args.pressure_rate or not args.burst
+            or not 18 <= args.rounds * args.round_seconds <= 120 or args.rounds < 2):
+        parser.error('live-cancel-pressure requires signed pressure burst, >=2 rounds, 18..120 seconds')
     affinity = restrict_cpus(args.cpus) if args.cpus else None
     result = run(args.samples, args.history, args.blocked_account, args.signed_socket, args.burst,
                  args.pressure_rate, args.interval, args.changing, args.disk_delay_ms, args.ingress_burst_ms,
-                 args.rounds, args.round_seconds, args.timing_history, args.near_symbols)
+                 args.rounds, args.round_seconds, args.timing_history, args.near_symbols, args.live_cancel_pressure)
     result['latency_target_ms'] = args.require_ms
     result['latency_target_passed'] = (args.require_ms is None or
         result['latency']['samples'] == args.samples*args.rounds

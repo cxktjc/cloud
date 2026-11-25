@@ -60,6 +60,9 @@ class DirectMarket:
         self._recovered_since = {}
         self._overflow_groups = set()
         self.latest_ingress = {}
+        self._price_run_start = {}
+        self._last_tick_wake = {}
+        self.coalesce_equal_trades = False
         self.processed = {}  # owner thread only
         self.committed = {}
         self.committed_receipts = {}
@@ -79,6 +82,8 @@ class DirectMarket:
         self._last_wire_ns = 0
         self.request_activity = None
         self.socket_failures = 0
+        self._volume_bar = self._volume_bar_base = 0
+        self._volume_bars = {}
 
     def _wake(self):
         try:
@@ -165,9 +170,19 @@ class DirectMarket:
             if old and stamp < old.exchange_ms:
                 self.counts['rejected_old'] += 1
                 return False
+            if self.request_activity is not None and not self._volume_bar <= now < self._volume_bar+180:
+                bar = int(now)//180*180
+                if self._volume_bar:
+                    self._volume_bars[self._volume_bar] = self.counts['received']-self._volume_bar_base
+                self._volume_bars = {k: v for k, v in self._volume_bars.items() if k >= bar-59*180}
+                self._volume_bar, self._volume_bar_base = bar, self.counts['received']
             self.counts['received'] += 1
             tick = Tick(symbol, str(price), stamp, received_ns, group, generation, self.source, valid, quantity,
                         received_epoch_ms, self.counts['received'])
+            unchanged = (old is not None and old.generation == generation and old.valid == valid
+                         and old.price == tick.price)
+            if not unchanged:
+                self._price_run_start[symbol] = tick.receive_seq
             self.latest_ingress[symbol] = tick
             if group in self._overflow_groups:
                 # The explicit overflow has revoked ALL queued prices of this
@@ -175,6 +190,8 @@ class DirectMarket:
                 watermark = min(256, self.events.maxsize//4) if self.events.maxsize else 256
                 if self.events.qsize() > watermark:
                     self.counts['overload_discarded'] += 1
+                    if self.request_activity is not None:
+                        self.request_activity.market_pressure('overload_discarded', now=now)
                     return True
                 self._overflow_groups.discard(group)
                 old = None  # the recovery quote must reach the owner
@@ -187,19 +204,27 @@ class DirectMarket:
                 self._recovered_since.setdefault(group, receipt_time)
             self.receipts[group] = (receipt_time, now)
             self.errors.pop(group, None)
-            if (self.dedupe_unchanged and not self.overloaded and old and old.generation == generation
-                    and old.valid == valid and float(old.price) == value
-                    and (received_ns-old.received_ns)/1e9 <= cfg.WS_MAX_QUEUE_AGE_SECONDS):
+            if (self.dedupe_unchanged and not self.overloaded and old and unchanged
+                    and (received_ns-old.received_ns)/1e9 <= cfg.WS_ENTRY_QUOTE_MAX_AGE_SECONDS):
                 # An identical quote after a gap can make a stale entry eligible again.
                 # A->B->A is always three events; zero quantity is a change.
                 self.counts['unchanged'] += 1
                 return True
+            if self.coalesce_equal_trades:
+                if (unchanged and old is not None and not self.overloaded and valid
+                        and received_ns-self._last_tick_wake.get(symbol, 0) < 50_000_000
+                        and (received_ns-old.received_ns)/1e9 <= cfg.WS_ENTRY_QUOTE_MAX_AGE_SECONDS):
+                    self.counts['unchanged'] += 1
+                    return True
+                self._last_tick_wake[symbol] = received_ns
         try:
-            enqueued = self.events.put_quote(tick, self._complete_far)
+            enqueued = self.events.put_quote(tick, self._complete_far, price=value)
         except queue.Full:
             with self._lock:
                 self.counts['overflow'] += 1
                 self.counts['overload_discarded'] += 1
+                if self.request_activity is not None:
+                    self.request_activity.market_pressure('overload_discarded', now=now)
                 self.generation[group] += 1
                 self._overflow_groups.add(group)
                 self.group_failed(group, 'WS owner queue overflow; old generation revoked; socket kept open')
@@ -207,7 +232,6 @@ class DirectMarket:
         if not enqueued:
             return True
         self.counts['enqueued'] += 1
-        self.queue_peak = max(self.queue_peak, self.events.qsize())
         return True
 
     def _complete_far(self, tick):
@@ -225,8 +249,9 @@ class DirectMarket:
     def quote_tick(self, symbol, tick):
         """Refresh unchanged book timestamps without publishing a new price."""
         latest = self.latest_ingress.get(symbol)
-        if (self.dedupe_unchanged and latest and tick and latest.generation == tick.generation
-                and latest.valid == tick.valid and float(latest.price) == float(tick.price)):
+        if ((self.dedupe_unchanged or self.coalesce_equal_trades) and latest and tick
+                and latest.generation == tick.generation and latest.valid == tick.valid
+                and latest.price == tick.price and tick.receive_seq >= self._price_run_start.get(symbol, 0)):
             return latest
         return tick
 
@@ -273,15 +298,23 @@ class DirectMarket:
             return False
         # Owner-only boundary, immediately after the caller takes the event.
         # Keep lock validation/screening out of the queue-wait measurement.
-        self._dequeued_context = (tick, time.monotonic_ns(), time.time()*1000)
+        dequeue_ns, dequeue_epoch = time.monotonic_ns(), time.time()
+        self._dequeued_context = (tick, dequeue_ns, dequeue_epoch*1000)
+        queued_ms = (dequeue_ns-tick.received_ns)/1e6
         with self._lock:
             if tick.generation != self.generation[tick.group]:
                 self.counts['rejected_old'] += 1
+                if self.request_activity is not None:
+                    self.request_activity.market_pressure('generation_revoked', now=dequeue_epoch)
                 return False
-        if (time.monotonic_ns()-tick.received_ns)/1e9 > cfg.WS_MAX_QUEUE_AGE_SECONDS:
+        if queued_ms > cfg.WS_MAX_QUEUE_AGE_SECONDS*1000:
             self.counts['rejected_backlog'] += 1
             self.overloaded = True
+            if self.request_activity is not None:
+                self.request_activity.market_pressure('queue_expired', age_ms=queued_ms, now=dequeue_epoch)
             return False
+        if queued_ms >= 10 and self.request_activity is not None:
+            self.request_activity.market_pressure('queue_over_10ms', age_ms=queued_ms, now=dequeue_epoch)
         self.overloaded = False
         with self._lock:
             if tick.valid:
@@ -326,6 +359,13 @@ class DirectMarket:
 
     def write_mirror(self):
         atomic_write_json(self.output, self.snapshot())
+
+    def bar_volume(self):
+        with self._lock:
+            rows = dict(self._volume_bars)
+            if self._volume_bar:
+                rows[self._volume_bar] = self.counts['received']-self._volume_bar_base
+            return rows
 
     def metrics(self, *, fresh_prices=None, decision_percentiles=True):
         with self._lock:
@@ -469,6 +509,11 @@ class DualMarket(DirectMarket):
         self._book_ids = {}
         self._entry_reject_cutoffs = {}  # Owner-only, process-local; never a valuation cutoff.
 
+    def diagnostics_bar_load(self):
+        ticks, bids = self.bar_volume(), self.book.bar_volume()
+        return {bar: dict(tick_received=ticks.get(bar, 0), depth_received=bids.get(bar, 0))
+                for bar in ticks.keys() | bids.keys()}
+
     def reject_entry_quotes(self, symbol, watermarks=None):
         """Require evidence newer than the ingress view that rejected a send."""
         if watermarks is None:
@@ -513,19 +558,24 @@ class DualMarket(DirectMarket):
         return time.monotonic(), time.time(), time.monotonic_ns()
 
     def _quote(self, feed, symbol, tick=None, *, clock=None, refresh=True):
-        mono, epoch, nano = self._quote_clock() if clock is None else clock
+        clock = self._quote_clock() if clock is None else clock
         with feed._lock:
             tick = feed.processed.get(symbol) if tick is None else tick
             if refresh:
                 tick = feed.quote_tick(symbol, tick)
-            if (self._closing.is_set() or feed.overloaded or -1 in self.errors or not tick or not tick.valid
-                    or tick.group in feed.errors or tick.group not in feed.receipts
-                    or tick.generation != feed.generation[tick.group]
-                    or mono-feed.receipts[tick.group][0] > ticker_ws.MAX_SILENCE_SECONDS
-                    or not -5 <= epoch-tick.exchange_ms/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS
-                    or (nano-tick.received_ns)/1e9 > cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS):
-                return None
-            return float(tick.price)
+            return self._locked_quote_price(feed, tick, clock)
+
+    def _locked_quote_price(self, feed, tick, clock):
+        mono, epoch, nano = clock
+        if self._closing.is_set() or feed.overloaded or -1 in self.errors or not tick or not tick.valid:
+            return None
+        receipt = feed.receipts.get(tick.group)
+        if (receipt is None or tick.group in feed.errors or tick.generation != feed.generation[tick.group]
+                or mono-receipt[0] > ticker_ws.MAX_SILENCE_SECONDS
+                or not -5 <= epoch-tick.exchange_ms/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS
+                or (nano-tick.received_ns)/1e9 > cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS):
+            return None
+        return float(tick.price)
 
     def healthy(self):
         clock = self._quote_clock()
@@ -606,8 +656,8 @@ class DualMarket(DirectMarket):
             with feed._lock:
                 latest = feed.latest_ingress.get(symbol)
                 watermarks[source] = latest.receive_seq if latest else 0
-                price = self._quote(feed, symbol, latest, clock=clock) if latest is not None else None
-                if latest is not None and (clock[2]-latest.received_ns)/1e9 > cfg.WS_MAX_QUEUE_AGE_SECONDS:
+                price = self._locked_quote_price(feed, latest, clock)
+                if latest is not None and (clock[2]-latest.received_ns)/1e9 > cfg.WS_ENTRY_QUOTE_MAX_AGE_SECONDS:
                     price = None
                 prices[source] = price
                 if source == 'bid0' and price is not None:
@@ -621,14 +671,14 @@ class DualMarket(DirectMarket):
             latest = feed.latest_ingress.get(symbol)
             if (event is not None and event.symbol == symbol and event.source == feed.source and event.receive_seq > cutoff
                     and event.generation == feed.generation[event.group]
-                    and (clock[2]-event.received_ns)/1e9 <= cfg.WS_MAX_QUEUE_AGE_SECONDS):
+                    and (clock[2]-event.received_ns)/1e9 <= cfg.WS_ENTRY_QUOTE_MAX_AGE_SECONDS):
                 # Preserve fresh ordered crossings even if a later rebound is
                 # already waiting on ingress. Keep the chosen price and clock paired.
                 latest = feed.quote_tick(symbol, event)
             if latest is None or latest.receive_seq <= cutoff:
                 return None, None, False
-            price = self._quote(feed, symbol, latest, clock=clock, refresh=False)
-            if price is not None and (clock[2]-latest.received_ns)/1e9 > cfg.WS_MAX_QUEUE_AGE_SECONDS:
+            price = self._locked_quote_price(feed, latest, clock)
+            if price is not None and (clock[2]-latest.received_ns)/1e9 > cfg.WS_ENTRY_QUOTE_MAX_AGE_SECONDS:
                 return None, None, True
             return price, latest, False
 
@@ -720,6 +770,7 @@ class DualMarket(DirectMarket):
                     'enqueued', 'unchanged', 'overload_discarded', 'screened_far'):
             result[key] += book_metrics[key]
         result['queue_peak'] = max(self.queue_peak, self.book.queue_peak, self.events.peak)
+        result['compacted_far'] = self.events.compacted_far
         for key in ('receive_per_second', 'decide_per_second', 'enqueue_per_second', 'unchanged_per_second',
                     'expired_per_second', 'old_per_second', 'discarded_per_second'):
             result[key] += book_metrics[key]
