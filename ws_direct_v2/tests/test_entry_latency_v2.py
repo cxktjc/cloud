@@ -36,6 +36,20 @@ class EntryLatencyTests(unittest.TestCase):
         self.assertEqual(result['max_ms'], 1)
         self.assertEqual(timing.order('0')['latencies_ms']['quote_to_send'], 9999)
 
+    def test_history_evicts_oldest_across_plans_and_late_ack_does_not_resurrect_it(self):
+        timing = EntryTimings()
+        for index in range(4100):
+            bar = 1 if index % 2 else index + 2
+            timing.register('X', str(index), dict(order_bar_open_ms=bar), session_id='s')
+            timing.register('X', str(index), {}, session_id='duplicate')
+        timing.outcome('0', status='FILLED')
+        self.assertFalse(timing.order('0'))
+        self.assertEqual(list(timing._rows), list(map(str, range(2052, 4100))))
+        self.assertEqual(list(timing._recent), list(map(str, range(3588, 4100))))
+        self.assertEqual(len(timing._plans), 1025)
+        entry = dict(symbol='X', entry_bar_open_ms=1, signal_session_id='s', position_id='')
+        self.assertEqual(timing.first_for(entry)['client_order_id'], '2053')
+
     def setUp(self):
         self.bar = 1800000
         self.now = self.bar/1000+39

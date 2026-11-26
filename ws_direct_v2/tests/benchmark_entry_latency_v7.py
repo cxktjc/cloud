@@ -551,19 +551,28 @@ if __name__ == '__main__':
                  args.pressure_rate, args.interval, args.changing, args.disk_delay_ms, args.ingress_burst_ms,
                  args.rounds, args.round_seconds, args.timing_history, args.near_symbols, args.live_cancel_pressure)
     result['latency_target_ms'] = args.require_ms
-    result['latency_target_passed'] = (args.require_ms is None or
-        result['latency']['samples'] == args.samples*args.rounds
-        and result['all_orders_latency']['max_ms'] <= args.require_ms)
+    # For a cross-symbol wake the selected quote can be newer OR older than
+    # the wake. Check both, including background sends. Keep opportunity
+    # integrity separate so a lost slow order can never turn a run green.
+    orders = result['sends'] + result['background_sends']
+    bounds = [max(s['ms'], *(s.get('stages_ms', {}).get(k, 0.) for k in
+                 ('trigger_to_send', 'quote_to_send'))) for s in orders]
+    evidence = result['pressure']
+    integrity_failed = bool(evidence and (evidence['errors'] or evidence['unsent_symbols']
+        or evidence['duplicate_symbols'] or evidence['duplicate_client_ids']
+        or any(evidence['counters'][k] for k in ('overflow', 'overload_discarded', 'rejected_backlog'))
+        or evidence['achieved_raw_rate'] < .9*args.pressure_rate))
+    result['integrity_passed'] = not integrity_failed
+    result['all_orders_both_clocks'] = summary(bounds)
+    result['orders_over_budget'] = (sum(ms > args.require_ms for ms in bounds)
+                                    if args.require_ms is not None else None)
+    result['latency_target_passed'] = (args.require_ms is None or not integrity_failed
+        and result['latency']['samples'] == args.samples*args.rounds
+        and bool(bounds) and max(bounds) <= args.require_ms)
     result['cpu_affinity'] = affinity
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')
     print(json.dumps(result['latency']))
     if result['pressure']:
-        evidence = result['pressure']
-        integrity_failed = bool(evidence['errors'] or evidence['unsent_symbols'] or evidence['duplicate_symbols']
-            or evidence.get('duplicate_client_ids')
-            or evidence['counters']['overflow'] or evidence['counters']['overload_discarded']
-            or evidence['counters']['rejected_backlog']
-            or evidence['achieved_raw_rate'] < .9*args.pressure_rate)
         raise SystemExit(1 if integrity_failed else 2 if not result['latency_target_passed'] else 0)

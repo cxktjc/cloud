@@ -74,7 +74,7 @@ class NetworkIO(EntryCancelPacing):
         self._owner = threading.get_ident()
         self._condition = threading.Condition()
         self._jobs: dict[tuple, _Job] = {}
-        self._watched_ready = set()
+        self._watched_ready = {}  # receipt -> number of dependent jobs
         self._aliases: dict[tuple, tuple] = {}
         self._heap: list[tuple[int, int, tuple]] = []
         self._sequence = itertools.count()
@@ -134,18 +134,21 @@ class NetworkIO(EntryCancelPacing):
             # creates avoidable GIL/condition contention during a burst.
             if ready is None or ready.done():
                 self._condition.notify(1)
-            elif ready not in self._watched_ready:
-                # A durable write does not occupy a network worker. The
-                # writer signals readiness without touching owner accounting.
-                self._watched_ready.add(ready)
-                ready.add_done_callback(self._job_ready)
+            else:
+                count = self._watched_ready.get(ready, 0)
+                self._watched_ready[ready] = count + 1
+                if not count:
+                    ready.add_done_callback(self._job_ready)
         return True
 
     def _job_ready(self, future):
         with self._condition:
-            self._watched_ready.discard(future)
-            if not self._closed:
-                self._wake_queued()
+            count = self._watched_ready.pop(future, 0)
+            if count and not self._closed:
+                # Runs on the journal writer. Signal dependents without doing
+                # a global scheduling pass before the next write can begin.
+                # Workers still select under the same symbol/cancel/query gates.
+                self._condition.notify(min(count, self.worker_count))
 
     def poll(self, key: tuple, work: Callable[[], Any], *, priority: int = 20) -> Any:
         self._assert_owner()
@@ -284,12 +287,15 @@ class NetworkIO(EntryCancelPacing):
         if self.worker_count == 1 and any(
                 j.state == 'done' and j.done is not None for j in self._jobs.values()):
             return None
+        if not self._heap:
+            return None
         busy = set().union(*(j.symbols for j in self._jobs.values()
             if j.state == 'running' or j.state == 'done' and j.done is not None
             or j.state == 'queued' and j.ready is not None and not j.ready.done()))
         deferred = []
         selected = None
-        next_cancel = self._next_entry_cancel()
+        cancel_checked = False
+        next_cancel = None
         query_slots = self._query_workers-sum(j.key[0] == 'query' and j.state == 'running'
                                             for j in self._jobs.values())
         while self._heap:
@@ -303,9 +309,13 @@ class NetworkIO(EntryCancelPacing):
             if job.key[0] == 'query' and query_slots <= 0:
                 deferred.append(ticket)
                 continue
-            if job.entry_cancel and job is not next_cancel:
-                deferred.append(ticket)
-                continue
+            if job.entry_cancel:
+                if not cancel_checked:
+                    next_cancel = self._next_entry_cancel()
+                    cancel_checked = True
+                if job is not next_cancel:
+                    deferred.append(ticket)
+                    continue
             if job.symbols & busy:
                 deferred.append(ticket)
                 continue

@@ -88,7 +88,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261126-signal-gap-ws-wait', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261126-entry-hotpath-v2', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self.market.request_activity = self.market.book.request_activity = self.client.request_activity
@@ -446,15 +446,18 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def _update_rank(self, symbol, price, *, publish_watch=True):
         row = self._templates.get(symbol)
-        version = self._quote_versions.get(symbol, 0)+1
-        self._quote_versions[symbol] = version
         limit = self._finite((row or {}).get('limit_price'))
         gap = (price-limit)/limit if limit > 0 else float('inf')
-        self._eligible.pop(symbol, None)
         if row and gap <= cfg.CANCEL_GAP and not self._unowned_rank_blocked(symbol, time.time()):
-            item = (gap, symbol, version)
-            self._eligible[symbol] = item
-            heapq.heappush(self._rank_heap, item)
+            previous = self._eligible.get(symbol)
+            if previous is None or previous[0] != gap:
+                version = self._quote_versions.get(symbol, 0)+1
+                self._quote_versions[symbol] = version
+                item = (gap, symbol, version)
+                self._eligible[symbol] = item
+                heapq.heappush(self._rank_heap, item)
+        else:
+            self._eligible.pop(symbol, None)
         if len(self._rank_heap) > max(64, 4*len(self._eligible)):
             self._rank_heap = list(self._eligible.values())
             heapq.heapify(self._rank_heap)
@@ -467,7 +470,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             return False
         row = self._templates.get(symbol)
         return bool(row and (now < self._finite(self.ledger.state['reopen_until_epoch'].get(symbol))
-                            or self._entry_submission_blocked(self._entry_sizing_row(row))))
+                            or self._entry_submission_blocked(row, needs_sizing=True)))
 
     def _rank_price(self, symbol):
         if symbol in self.tracked or symbol in self.positions or symbol in self._queue_targets:

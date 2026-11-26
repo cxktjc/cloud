@@ -499,10 +499,16 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                    if record.get('symbol') == symbol
                    and int(self._finite(record.get('order_bar_open_ms'))) == bar)
 
-    def _entry_submission_blocked(self, row: Mapping[str, Any]) -> bool:
+    def _entry_submission_blocked(self, row: Mapping[str, Any], *, needs_sizing=False) -> bool:
         symbol = str(row.get('symbol') or '').upper()
         if self._forced_entry_blocked(symbol, now=time.time()):
             return True
+        state = self.ledger.state
+        if (symbol not in self._entry_gate_retries and not state['entry_recovery']
+                and not state['entry_submit_rejections'] and not state['rotated_out_plans']):
+            return False  # No plan identity to compare; forced blocks were checked above.
+        if needs_sizing:
+            row = self._entry_sizing_row(row)
         signature = self._entry_plan_signature(row)
         if row.get('signal_follow'):
             # Follow entries already advance their own durable generation and

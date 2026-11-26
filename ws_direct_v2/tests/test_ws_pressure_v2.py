@@ -80,12 +80,18 @@ class IngressPressureTests(unittest.TestCase):
         old_generation = self.market.book.generation[1]
         for uid in range(2, 6):
             self.bid(1+uid/100, uid)
-        with self.assertRaises(BufferError):
+        events = self.market.events
+        original_wake = events.notify_owner
+        def wake_outside_feed_lock():
+            self.assertFalse(self.market.book._lock._is_owned())
+            original_wake()
+        with patch.object(events, 'notify_owner', wake_outside_feed_lock), self.assertRaises(BufferError):
             self.bid(1.01, 6)
         self.assertEqual(self.market.book.generation[1], old_generation+1)
         self.assertIsNone(self.market.entry_quote('XUSDT')['bid0'])
         self.assertEqual(self.market.entry_quote('XUSDT')['tick'], 1.04)
-        self.bid(.9, 7)
+        with patch.object(events, 'qsize', side_effect=AssertionError('queue lock under feed lock')):
+            self.bid(.9, 7)
         self.assertEqual(self.market.book.counts['overload_discarded'], 2)
         self.assertIsNone(self.market.entry_quote('XUSDT')['bid0'])
         self.drain(lambda event: self.fail('revoked generation ran decision'))

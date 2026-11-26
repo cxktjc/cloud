@@ -106,25 +106,28 @@ class DirectMarket:
             context = dict(context['windows']['10'], inflight=context['inflight'], queue=self.events.qsize())
             LOG.warning('WS failure context source=%s group=%s prior10s=%s', self.source, index, context)
         with self._lock:
-            if socket_failure:
-                self.socket_failures += 1
-            self.receipts.pop(index, None)
-            self._recovered_since.pop(index, None)
-            self.errors[index] = str(message)
-            if message not in ('scheduled reconnect', 'collector stopped'):
-                detail = str(message)[:700]
-                previous = next((row for row in self.error_history
-                                 if row['group'] == index and row['error'] == detail), None)
-                if previous is not None:
-                    self.error_history.remove(previous)
-                else:
-                    previous = dict(group=index, error=detail, count=0, first_epoch=time.time())
-                previous.update(count=previous['count']+1, last_epoch=time.time())
-                if context is not None:
-                    previous['activity_before_failure'] = context
-                self.error_history.append(previous)
-                del self.error_history[:-5]
+            self._record_failure_locked(index, message, socket_failure, context)
         self._wake()
+
+    def _record_failure_locked(self, index, message, socket_failure, context=None):
+        if socket_failure:
+            self.socket_failures += 1
+        self.receipts.pop(index, None)
+        self._recovered_since.pop(index, None)
+        self.errors[index] = str(message)
+        if message not in ('scheduled reconnect', 'collector stopped'):
+            detail = str(message)[:700]
+            previous = next((row for row in self.error_history
+                             if row['group'] == index and row['error'] == detail), None)
+            if previous is not None:
+                self.error_history.remove(previous)
+            else:
+                previous = dict(group=index, error=detail, count=0, first_epoch=time.time())
+            previous.update(count=previous['count']+1, last_epoch=time.time())
+            if context is not None:
+                previous['activity_before_failure'] = context
+            self.error_history.append(previous)
+            del self.error_history[:-5]
 
     def recent_errors(self):
         with self._lock:
@@ -185,7 +188,7 @@ class DirectMarket:
                 # The explicit overflow has revoked ALL queued prices of this
                 # generation. Keep the socket draining, but admit no old work.
                 watermark = min(256, self.events.maxsize//4) if self.events.maxsize else 256
-                if self.events.qsize() > watermark:
+                if self.events.depth_hint() > watermark:
                     self.counts['overload_discarded'] += 1
                     if self.request_activity is not None:
                         self.request_activity.market_pressure('overload_discarded', now=now)
@@ -224,7 +227,8 @@ class DirectMarket:
                     self.request_activity.market_pressure('overload_discarded', now=now)
                 self.generation[group] += 1
                 self._overflow_groups.add(group)
-                self.group_failed(group, 'WS owner queue overflow; old generation revoked; socket kept open')
+                self._record_failure_locked(group, 'WS owner queue overflow; old generation revoked; socket kept open', False)
+            self._wake()
             raise BufferError('WS decision queue overflow; old generation revoked; draining without reconnect')
         if not enqueued:
             return True

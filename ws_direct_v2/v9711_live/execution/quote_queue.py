@@ -114,6 +114,12 @@ class QuoteQueue(queue.Queue):
             self.replayed[item.source] += 1
             self.not_empty.notify()
 
+    def depth_hint(self):
+        # Watermark hint only. Never acquire queue.mutex while holding a feed
+        # lock: ingress screening takes them in the opposite order. put_quote
+        # still enforces the exact capacity under the queue mutex.
+        return self._length
+
     def _qsize(self):
         return self._length
 

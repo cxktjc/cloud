@@ -131,6 +131,23 @@ class HotOwnedQuotesTests(unittest.TestCase):
             self.event('N0USDT', 1.01)
         self.assertIn('N0USDT', self.trade.tracked)
 
+    def test_equal_price_rechecks_gate_without_accumulating_heap_tickets(self):
+        self.plans(9)
+        self.event('N0USDT', 1.01)
+        symbol = 'N8USDT'
+        with patch.object(self.trade, '_entry_sizing_row', side_effect=AssertionError('empty blocker maps')):
+            self.trade._update_rank(symbol, .99)
+            size = len(self.trade._rank_heap)
+            for _ in range(50):
+                self.trade._update_rank(symbol, .99)
+            self.assertEqual(len(self.trade._rank_heap), size)
+            self.trade.ledger.state.setdefault('forced_close_cleanup', {})[symbol] = {'reason': 'test'}
+            self.trade._update_rank(symbol, .99)
+            self.assertNotIn(symbol, self.trade._eligible)
+            del self.trade.ledger.state['forced_close_cleanup'][symbol]
+            self.trade._update_rank(symbol, .99)
+            self.assertIn(symbol, self.trade._eligible)
+
     def test_definitively_blocked_best_candidate_does_not_repeat_planner(self):
         self.plans(9)
         self.event('N0USDT', 1.01)
