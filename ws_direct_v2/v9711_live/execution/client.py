@@ -715,7 +715,7 @@ class ExchangeClient(BatchEntryMixin):
             'place_order', symbol.upper(), 'BUY', qty_text,
             price=price_text, position_side='LONG',
             client_order_id=client_order_id,
-            before_send=EntrySendProbe(check_bar, self.entry_timings, client_order_id))
+            before_send=EntrySendProbe(check_bar, self.entry_timings, client_order_id, self.request_activity))
         self._log_entry_quote(symbol.upper(), client_order_id, send_quote)
         return dict(result, _entry_send_quote=send_quote) if send_quote and isinstance(result, Mapping) else result
 

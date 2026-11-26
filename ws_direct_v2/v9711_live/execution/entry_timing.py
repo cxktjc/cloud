@@ -146,6 +146,10 @@ class EntryTimings:
             row = self._rows.get(cid)
             return self._public(row) if row else {}
 
+    def received_monotonic_ns(self, cid):
+        with self._lock:
+            return (self._rows.get(cid) or {}).get('_received_ns')
+
     def first_for(self, entry):
         with self._lock:
             matches = self._matches(entry)
@@ -286,8 +290,8 @@ class EntryTimings:
 
 class EntrySendProbe:
     """Callable guard plus hooks invoked at the actual checked WS transport."""
-    def __init__(self, guard, timings, cid):
-        self.guard, self.timings, self.cid = guard, timings, cid
+    def __init__(self, guard, timings, cid, activity=None):
+        self.guard, self.timings, self.cid, self.activity = guard, timings, cid, activity
 
     def __call__(self):
         return self.guard()
@@ -297,8 +301,18 @@ class EntrySendProbe:
             self.timings.mark(self.cid, name)
 
     def wire_sent(self):
+        stamp_ns, epoch_ms = time.monotonic_ns(), time.time()*1000
+        row = {}
         if self.timings is not None:
-            self.timings.mark(self.cid, 'send', transport='WS')
+            self.timings.mark_at(self.cid, 'send', stamp_ns, epoch_ms, transport='WS')
+            row = self.timings.order(self.cid)
+            received_ns = self.timings.received_monotonic_ns(self.cid)
+        else:
+            received_ns = None
+        latency_ms = ((stamp_ns-received_ns)/1e6
+                      if received_ns is not None and stamp_ns >= received_ns else None)
+        if self.activity is not None:
+            self.activity.entry_wire_send(row.get('symbol', ''), latency_ms, now=epoch_ms/1000)
 
     def reply_received(self):
         if self.timings is not None:

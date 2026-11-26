@@ -62,6 +62,7 @@ class DirectMarket:
         self.latest_ingress = {}
         self._price_run_start = {}
         self._last_tick_wake = {}
+        self._entry_recheck_symbols = set()
         self.coalesce_equal_trades = False
         self.processed = {}  # owner thread only
         self.committed = {}
@@ -164,6 +165,9 @@ class DirectMarket:
         if symbol not in self.group_for or not math.isfinite(value) or (valid and value <= 0) or not -5 <= now-stamp/1000 <= cfg.PRICE_EXCHANGE_MAX_AGE_SECONDS:
             return False
         group = self.group_for[symbol]
+        book_feed = getattr(self, 'book', None)
+        retry_wake = (symbol in self._entry_recheck_symbols
+                      or book_feed is not None and symbol in book_feed._entry_recheck_symbols)
         with self._lock:
             generation = self.generation[group]
             old = self.latest_ingress.get(symbol)
@@ -205,6 +209,7 @@ class DirectMarket:
             self.receipts[group] = (receipt_time, now)
             self.errors.pop(group, None)
             if (self.dedupe_unchanged and not self.overloaded and old and unchanged
+                    and not retry_wake
                     and (received_ns-old.received_ns)/1e9 <= cfg.WS_ENTRY_QUOTE_MAX_AGE_SECONDS):
                 # An identical quote after a gap can make a stale entry eligible again.
                 # A->B->A is always three events; zero quantity is a change.
@@ -212,11 +217,15 @@ class DirectMarket:
                 return True
             if self.coalesce_equal_trades:
                 if (unchanged and old is not None and not self.overloaded and valid
+                        and not retry_wake
                         and received_ns-self._last_tick_wake.get(symbol, 0) < 50_000_000
                         and (received_ns-old.received_ns)/1e9 <= cfg.WS_ENTRY_QUOTE_MAX_AGE_SECONDS):
                     self.counts['unchanged'] += 1
                     return True
                 self._last_tick_wake[symbol] = received_ns
+            self._entry_recheck_symbols.discard(symbol)
+            if book_feed is not None:
+                book_feed._entry_recheck_symbols.discard(symbol)
         try:
             enqueued = self.events.put_quote(tick, self._complete_far, price=value)
         except queue.Full:
@@ -527,6 +536,8 @@ class DualMarket(DirectMarket):
         self._entry_reject_cutoffs[symbol] = {
             source: max(previous.get(source, 0), int(watermarks.get(source) or 0))
             for source in ('tick', 'bid0')}
+        self._entry_recheck_symbols.add(symbol)
+        self.book._entry_recheck_symbols.add(symbol)
 
     def _post_rejection_price(self, feed, symbol, price, cutoff):
         if price is not None:

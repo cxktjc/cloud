@@ -74,6 +74,23 @@ class AdmissionFreshnessTests(unittest.TestCase):
         timing = self.trade.session_entries.timings.order(row['client_order_id'])
         self.assertEqual(timing['received_epoch_ms'], new_bid.received_epoch_ms)
 
+    def test_rejected_unchanged_bid_gets_one_owner_wake_for_retry(self):
+        self.tick_ingress(1.04)
+        self.drain_only()
+        before = self.bid_ingress(1.009, 1)
+        self.drain_only()
+        self.market.reject_entry_quotes(self.symbol, {'tick': 0, 'bid0': before.receive_seq-1})
+        retry = self.bid_ingress(1.009, 2)
+        self.assertEqual(retry.price, before.price)
+        self.assertEqual(self.market.events.qsize(), 1)
+        self.market.decide(self.market.events.get_nowait(), self.trade.on_tick)
+        self.market.events.task_done()
+        self.assertIn(self.symbol, self.trade.tracked)
+        row = self.trade.tracked[self.symbol]
+        timing = self.trade.session_entries.timings.order(row['client_order_id'])
+        self.assertEqual(timing['received_epoch_ms'], retry.received_epoch_ms)
+        self.assertLess(timing['latencies_ms']['quote_to_decision'], 25)
+
     def test_uses_latest_unprocessed_prices_and_matching_timestamp(self):
         self.tick_ingress(1.03)
         self.drain_only()

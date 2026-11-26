@@ -64,6 +64,19 @@ class RequestActivity:
             if age_ms is not None:
                 row['queue_delay_max_ms'] = max(row['queue_delay_max_ms'], round(age_ms, 3))
 
+    def entry_wire_send(self, symbol, quote_to_send_ms=None, *, now=None):
+        with self._lock:
+            row = self._bar(time.time() if now is None else now)
+            row['entry_wire_sends'] += 1
+            if quote_to_send_ms is None:
+                row['entry_quote_to_send_missing_clock'] += 1
+                return
+            row['entry_quote_to_send_over_20ms'] += quote_to_send_ms > 20
+            row['entry_quote_to_send_over_25ms'] += quote_to_send_ms > 25
+            if quote_to_send_ms >= row['entry_quote_to_send_max_ms']:
+                row['entry_quote_to_send_max_ms'] = round(quote_to_send_ms, 3)
+                row['entry_quote_to_send_max_symbol'] = symbol
+
     def entry_outcome(self, category, reason=None):
         with self._lock:
             row = self._bar(time.time())
@@ -79,10 +92,9 @@ class RequestActivity:
                 continue
             row = dict(self._bars.get(bar, {}), **market_load.get(bar, {}),
                        utc_start=bar, queue_peak=queue_peaks.get(bar, 0))
-            row['entry_cancel_total'] = row.get('entry', 0)+row.get('cancel', 0)
             rows.append(row)
         peaks = {key: max(rows, key=lambda row: (row.get(key, 0), row['utc_start']))
-                 for key in ('entry', 'cancel', 'entry_cancel_total', 'queue_peak', 'queue_delay_max_ms', 'overload_discarded')}
+                 for key in ('entry', 'entry_wire_sends', 'entry_quote_to_send_max_ms')}
         return dict(current=rows[-1], previous=rows[-2], peaks=peaks, recent=rows,
                     retained_bar_count=60, process_local=True)
 

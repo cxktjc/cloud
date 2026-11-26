@@ -35,12 +35,15 @@ class ActivityTests(unittest.TestCase):
             stats.entry_outcome('local_not_sent', 'quote_gate')
             bars = stats.snapshot(queue_peaks={0: 14, 180: 8192})['bars_3m']
         assert bars['previous']['entry'] == 8 and 'query' not in bars['previous']
-        assert bars['current']['entry_cancel_total'] == 10
-        assert bars['current']['mutation_requests_peak_second'] == 2
+        assert 'entry_cancel_total' not in bars['current']
         assert bars['current']['queue_delay_max_ms'] == 510
+        assert bars['current']['cancel'] == 6
+        self.assertNotIn('queue_delay_max_ms', bars['peaks'])
+        self.assertNotIn('cancel', bars['peaks'])
         assert bars['current']['not_sent_quote_gate'] == 1
         assert bars['peaks']['entry']['utc_start'] == 0
-        assert bars['peaks']['overload_discarded']['queue_peak'] == 8192
+        self.assertEqual(bars['peaks']['entry_wire_sends'].get('entry_wire_sends', 0), 0)
+        self.assertEqual(bars['peaks']['entry_quote_to_send_max_ms'].get('entry_quote_to_send_max_ms', 0), 0)
 
     def test_windows_expire_on_monotonic_time_and_keep_lifetime_counts(self):
         stats = RequestActivity()
@@ -59,6 +62,32 @@ class ActivityTests(unittest.TestCase):
         with patch('time.monotonic', return_value=161.):
             self.assertNotIn('entry', stats.snapshot()['windows']['60'])
             self.assertEqual(stats.snapshot()['totals']['entry'], 1)
+
+    def test_bar_entry_latency_counts_only_actual_entry_wire_sends(self):
+        stats = RequestActivity()
+        with patch('time.time', return_value=180.):
+            stats.begin('cancel', 'XUSDT')
+            stats.market_pressure('queue_expired', age_ms=900)
+            stats.entry_wire_send('AUSDT', 12.5)
+            stats.entry_wire_send('BUSDT', 27.)
+            row = stats.snapshot()['bars_3m']['current']
+        self.assertEqual(row['entry_wire_sends'], 2)
+        self.assertEqual(row['entry_quote_to_send_over_20ms'], 1)
+        self.assertEqual(row['entry_quote_to_send_over_25ms'], 1)
+        self.assertEqual(row['entry_quote_to_send_max_ms'], 27.)
+        self.assertEqual(row['entry_quote_to_send_max_symbol'], 'BUSDT')
+
+    def test_entry_send_probe_records_quote_age_at_wire_hook(self):
+        stats, timings = RequestActivity(), EntryTimings()
+        timings.register('XUSDT', 'cid', dict(order_bar_open_ms=180_000,
+                                               _entry_timing_context={'_received_ns': 1_000_000}))
+        probe = EntrySendProbe(lambda: None, timings, 'cid', stats)
+        with patch('time.time', return_value=180.), patch('time.monotonic_ns', side_effect=[13_500_000, 13_500_000]):
+            probe.wire_sent()
+        row = stats.snapshot()['bars_3m']['current']
+        self.assertEqual(stats._bars[180]['entry_wire_sends'], 1)
+        self.assertEqual(stats._bars[180]['entry_quote_to_send_over_20ms'], 0)
+        self.assertEqual(stats._bars[180]['entry_quote_to_send_max_ms'], 12.5)
 
     def test_batch_counts_one_wire_request_and_independent_order_members(self):
         stats = RequestActivity()
