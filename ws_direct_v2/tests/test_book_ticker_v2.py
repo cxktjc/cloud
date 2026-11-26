@@ -639,6 +639,8 @@ class BookReceiverTests(unittest.IsolatedAsyncioTestCase):
             calls = []
             async def consume(group, state, **kw):
                 self.assertIs(kw['subscribe'], True)
+                self.assertIsNone(kw['read_timeout'])
+                self.assertIsNone(kw['reconnect_before'])
                 calls.append((kw['stream_kind'], tuple(group), kw['base']))
                 kw['startup_done'].set()
                 if len(calls) == 14:

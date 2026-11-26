@@ -103,7 +103,8 @@ class EntryTimings:
 
     def quote_check(self, cid, detail):
         """Worker-only quote audit; no status, fills or execution-ledger writes."""
-        fields = {key: detail[key] for key in ('entry_send_check', 'entry_recheck_gap', 'entry_recheck_threshold')
+        fields = {key: detail[key] for key in ('entry_send_check', 'entry_recheck_gap', 'entry_recheck_threshold',
+                                                'entry_check_signal_limit')
                   if key in detail}
         if detail.get('entry_quote_policy') == 'distance_rechecked':
             fields.update(entry_recheck_tick_gap=detail.get('entry_tick_gap'),

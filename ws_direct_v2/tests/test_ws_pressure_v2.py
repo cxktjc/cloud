@@ -176,6 +176,50 @@ class ReceiverRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(frames), 2)
         state.group_failed.assert_not_called()
 
+    async def test_trade_retries_quickly_after_data_but_backs_off_on_failures(self):
+        stop, state = asyncio.Event(), Mock()
+        delays = []
+        class Socket:
+            async def __aenter__(inner): return inner
+            async def __aexit__(inner, *args): pass
+            async def recv(inner):
+                if len(delays) == 3 and not getattr(inner, 'sent', False):
+                    inner.sent = True
+                    return self.frame()
+                raise ConnectionResetError('peer reset')
+        async def backoff(seconds):
+            delays.append(seconds)
+            if len(delays) == 6:
+                stop.set()
+        with patch.object(ticker_ws.websockets, 'connect', side_effect=lambda *a, **k: Socket()), \
+                patch.object(ticker_ws.asyncio, 'sleep', side_effect=backoff):
+            await ticker_ws.consume_group(['XUSDT'], state, base=ticker_ws.BOOK_WS_BASE,
+                stream_kind='bookTicker', ping_interval=30, ping_timeout=20, read_timeout=None,
+                reconnect_before=None, stop=stop, group_index=1)
+        self.assertEqual(delays, [1., 2., 4., 1., 1., 2.])
+
+    async def test_trade_waits_for_first_and_subsequent_quotes_on_same_socket(self):
+        stop, state = asyncio.Event(), Mock()
+        reads = []
+        class Socket:
+            async def __aenter__(inner): return inner
+            async def __aexit__(inner, *args): pass
+            async def recv(inner):
+                await asyncio.sleep(.02)  # exceeds both shortened legacy watchdogs
+                reads.append(1)
+                if len(reads) == 2:
+                    stop.set()
+                return self.frame()
+        with patch.object(ticker_ws, 'FIRST_DATA_TIMEOUT', .001), \
+                patch.object(ticker_ws, 'MAX_SILENCE_SECONDS', .001), \
+                patch.object(ticker_ws.websockets, 'connect', return_value=Socket()) as connect:
+            await asyncio.wait_for(ticker_ws.consume_group(['XUSDT'], state, base=ticker_ws.BOOK_WS_BASE,
+                stream_kind='bookTicker', ping_interval=30, ping_timeout=20, read_timeout=None,
+                reconnect_before=None, stop=stop, group_index=1), 1)
+        connect.assert_called_once()
+        state.group_failed.assert_not_called()
+        self.assertEqual(state.group_received.call_count, 2)
+
     async def test_repeated_short_connections_use_exponential_backoff(self):
         await self.check_backoff(stable_second=False, expected=[1., 2., 4.])
 

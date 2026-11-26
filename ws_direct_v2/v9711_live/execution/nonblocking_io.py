@@ -446,7 +446,7 @@ class NetworkTradeMixin:
                               for row in self.tracked.values() if not row.get('signal_follow')},
             admitted_entry_quotes={str(row.get('client_order_id')):
                 dict(symbol=symbol, signal_follow=bool(row.get('signal_follow')),
-                     submitted_limit_price=row.get('submitted_limit_price', row.get('limit_price')),
+                     signal_limit_price=row.get('limit_price'),
                      **{key: row[key] for key in QUOTE_FIELDS if key in row})
                 for symbol, row in self.tracked.items()},
             # Only the owner reads positions. Workers receive a normalized,

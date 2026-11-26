@@ -141,6 +141,9 @@ def entry_timing_lines(timing):
               'far_rejected': '准入距离>1.5%，二次行情检查拒绝'}
     check = timing.get('entry_send_check')
     check_lines = [f'      发送检查: {checks.get(check, check)}'] if check else []
+    if check_lines and check != 'follow_skipped' and timing.get('entry_check_signal_limit'):
+        check_lines[0] += (f'；检查基准=信号限价 {number(timing["entry_check_signal_limit"])}'
+                           f'，首次准入距信号价={number(timing.get("entry_recheck_gap"), percent=True)}')
     prepare = ' '.join(f'{label}={delays[key]:.3f}ms' for key, label in (
         ('durable_to_socket', '续发→socket协程'), ('socket_wait', 'socket等待/连接'),
         ('send_guard', '发送检查'), ('sign_encode', '签名编码'), ('encoded_to_send', '编码后→发送')) if key in delays)

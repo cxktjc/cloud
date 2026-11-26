@@ -20,10 +20,10 @@ class TieredQuoteTests(unittest.TestCase):
         self.trade = self.case.trade
         self.index = 0
 
-    def seed(self, tick=1.018, bid=None, *, actual_limit=1., ceiling=.0185, following=False, symbol='N0USDT'):
+    def seed(self, tick=1.018, bid=None, *, signal_limit=1., ceiling=.0185, following=False, symbol='N0USDT'):
         self.index += 1
         cid = f'test-{self.index}'
-        detail = dict(symbol=symbol, submitted_limit_price=actual_limit,
+        detail = dict(symbol=symbol, signal_limit_price=signal_limit,
             entry_tick=tick, entry_bid0=bid, entry_qualified_by='signal_follow' if following else 'tick',
             entry_tick_gap=None, entry_depth_gap=None, entry_gap_ceiling=ceiling,
             entry_quote_source='tick', entry_quote_policy='tiered_admission')
@@ -79,11 +79,17 @@ class TieredQuoteTests(unittest.TestCase):
                 self.assertEqual(audit['entry_send_check'], 'far_rejected')
                 self.assertIn('二次行情检查拒绝', '\n'.join(entry_timing_lines(audit)))
 
-    def test_exchange_rounded_limit_controls_1p5_tier(self):
-        cid = self.seed(1.01501, actual_limit=1.)
-        with patch.object(self.trade.market, 'send_quote', return_value=dict(tick=1.0186, bid0=None, source='tick')) as read:
-            self.assertEqual(self.trade._entry_quote_send_snapshot('N0USDT', cid, 1.0001)['entry_send_check'], 'far_rejected')
-        read.assert_called_once()
+    def test_signal_limit_controls_1p5_tier_even_if_wire_limit_would_recheck(self):
+        cid = self.seed(1.01501, signal_limit=1.0001)
+        with patch.object(self.trade.market, 'send_quote', side_effect=AssertionError('near WS read')):
+            self.assertEqual(self.trade._entry_quote_send_snapshot('N0USDT', cid, 1.)['entry_send_check'], 'near_skipped')
+
+    def test_aixbt_tick_rounding_does_not_reject_unchanged_bid(self):
+        cid = self.seed(None, .01279, signal_limit=.012558)
+        with patch.object(self.trade.market, 'send_quote', return_value=dict(tick=None, bid0=.01279, source='bid0')):
+            result = self.trade._entry_quote_send_snapshot('N0USDT', cid, .01255)
+        self.assertEqual(result['entry_send_check'], 'far_passed')
+        self.assertAlmostEqual(result['entry_depth_gap'], .01279/.012558-1)
 
     def test_far_replacement_uses_its_saved_ceiling_not_ordinary_fill_ceiling(self):
         cid = self.seed(1.0188, ceiling=.0188)

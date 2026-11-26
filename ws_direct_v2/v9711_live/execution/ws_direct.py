@@ -88,7 +88,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261125-owner-wake-timing-v28', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261126-signal-gap-ws-wait', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self.market.request_activity = self.market.book.request_activity = self.client.request_activity
@@ -175,7 +175,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         if (not detail or detail.get('symbol') != symbol
                 or detail.get('entry_qualified_by') not in {'tick', 'depth', 'all', 'signal_follow'}):
             raise ConfirmedSubmitRejection('exact entry admission missing before send')
-        limit = self._finite(detail.get('submitted_limit_price'), limit)
+        # Both the 1.5% tier and its OR ceiling use the same frozen signal
+        # limit as admission, even when the broker rounds the wire price.
+        limit = self._finite(detail.get('signal_limit_price'))
+        if limit <= 0:
+            raise ConfirmedSubmitRejection('signal limit missing before send')
         gap = admission_gap(detail, limit)
         following = cid in gate.get('follow_entries', {}) or detail['entry_qualified_by'] == 'signal_follow'
         if following or gap is not None and at_most(gap, SEND_RECHECK_GAP):
@@ -192,7 +196,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 entry_send_check='far_passed' if result['entry_qualified_by'] != 'none' else 'far_rejected')
             if result['entry_qualified_by'] == 'none':
                 result['entry_recheck_watermarks'] = live_quote.get('observed_watermarks')
-        result.update(entry_recheck_gap=gap, entry_recheck_threshold=SEND_RECHECK_GAP)
+        result.update(entry_recheck_gap=gap, entry_recheck_threshold=SEND_RECHECK_GAP,
+                      entry_check_signal_limit=limit)
         self.session_entries.timings.quote_check(cid, result)
         return result
 

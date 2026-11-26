@@ -412,8 +412,8 @@ class DirectMarket:
                 break
             startup_done = asyncio.Event()
             tasks.append(asyncio.create_task(ticker_ws.consume_group(group, feed,
-                base=base, stream_kind=stream, ping_interval=30, ping_timeout=20, read_timeout=30,
-                reconnect_before=23*3600, stop=self._async_stop, group_index=index,
+                base=base, stream_kind=stream, ping_interval=30, ping_timeout=20, read_timeout=None,
+                reconnect_before=None, stop=self._async_stop, group_index=index,
                 subscribe=True, startup_done=startup_done)))
             await startup_done.wait()
             if offset+1 < len(specs) and not self._async_stop.is_set():

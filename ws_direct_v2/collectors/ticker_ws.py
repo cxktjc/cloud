@@ -214,7 +214,7 @@ class SnapshotState:
 
 async def consume_group(
     group: list[str], state: SnapshotState, *, base: str, ping_interval: float,
-    ping_timeout: float, read_timeout: float, reconnect_before: float,
+    ping_timeout: float, read_timeout: float | None, reconnect_before: float | None,
     stop: asyncio.Event, group_index: int, stream_kind='aggTrade', subscribe=False,
     startup_done: asyncio.Event | None = None,
 ) -> None:
@@ -261,26 +261,31 @@ async def consume_group(
                         if stop.is_set():
                             break
                     now_mono = time.monotonic()
-                    if now_mono - connected_at >= reconnect_before:
+                    if reconnect_before is not None and now_mono - connected_at >= reconnect_before:
                         state.group_failed(group_index, "scheduled reconnect")
                         break
-                    deadline = (last_data_at + min(read_timeout, MAX_SILENCE_SECONDS)
-                                if received else connected_at + FIRST_DATA_TIMEOUT)
-                    remaining = deadline - now_mono
-                    if remaining <= 0:
-                        raise TimeoutError(f"no valid {stream_kind}; received_messages={raw_count} valid={valid_count} rejected={rejected}")
-                    try:
-                        if hasattr(asyncio, 'timeout'):
-                            # Python 3.11+: avoid creating a separate Task for
-                            # every frame on high-rate bookTicker connections.
-                            async with asyncio.timeout(remaining):
-                                raw = await socket.recv()
-                        else:
-                            raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
-                    except asyncio.TimeoutError as exc:
-                        raise TimeoutError(
-                            f"no valid {stream_kind}; endpoint={selected_base} received_messages={raw_count} "
-                            f"valid={valid_count} rejected={rejected} waiting_for={'next_data' if received else 'first_data'}") from exc
+                    if read_timeout is None:
+                        # Trade: a quiet market is not a transport failure. The feed
+                        # checks quote age separately; shutdown cancels this task.
+                        raw = await socket.recv()
+                    else:
+                        deadline = (last_data_at + min(read_timeout, MAX_SILENCE_SECONDS)
+                                    if received else connected_at + FIRST_DATA_TIMEOUT)
+                        remaining = deadline - now_mono
+                        if remaining <= 0:
+                            raise TimeoutError(f"no valid {stream_kind}; received_messages={raw_count} valid={valid_count} rejected={rejected}")
+                        try:
+                            if hasattr(asyncio, 'timeout'):
+                                # Python 3.11+: avoid creating a separate Task for
+                                # every frame on high-rate bookTicker connections.
+                                async with asyncio.timeout(remaining):
+                                    raw = await socket.recv()
+                            else:
+                                raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
+                        except asyncio.TimeoutError as exc:
+                            raise TimeoutError(
+                                f"no valid {stream_kind}; endpoint={selected_base} received_messages={raw_count} "
+                                f"valid={valid_count} rejected={rejected} waiting_for={'next_data' if received else 'first_data'}") from exc
                     wire_ns = time.monotonic_ns()
                     raw_count += 1
                     message = json.loads(raw)
@@ -345,7 +350,7 @@ async def consume_group(
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"[:700]
             lifetime = time.monotonic()-connected_at if connected_at is not None else 0.
-            if received and lifetime >= STABLE_CONNECTION_SECONDS:
+            if received and (read_timeout is None or lifetime >= STABLE_CONNECTION_SECONDS):
                 retry = 1.0
             slot = ((group_index - 1) * 2 + int(stream_kind != 'bookTicker')) % 32
             delay = retry + slot / 32
@@ -358,7 +363,7 @@ async def consume_group(
             if not received:
                 endpoint_index += 1
             await asyncio.sleep(delay)
-            retry = min(retry * 2.0, 30.0)
+            retry = 1.0 if received and read_timeout is None else min(retry * 2.0, 30.0)
 
 
 async def publish_loop(state: SnapshotState, interval: float, stop: asyncio.Event) -> None:
