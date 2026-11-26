@@ -565,6 +565,26 @@ class OwnerDurabilityTests(unittest.TestCase):
         self.wait_done()
         self.assertFalse(self.sent)
 
+    def test_owner_can_observe_stalled_precision_reader_without_waiting_for_disk(self):
+        self.trade.enable_signal_reader()
+        reader = self.trade._precision_reader
+        reading, release = threading.Event(), threading.Event()
+        original = reader.source.read
+        def stalled():
+            reading.set()
+            if not release.wait(2):
+                raise AssertionError('owner waited on precision disk read')
+            return original()
+        try:
+            with patch.object(reader.source, 'read', side_effect=stalled):
+                self.assertTrue(reading.wait(1))
+                reader._max_age = 0
+                self.trade._refresh_precision_readiness()
+                self.assertFalse(self.trade._precision_ready)
+                self.assertIsNone(self.trade.client._metadata_publication[0][0])
+        finally:
+            release.set()
+
     def test_stalled_background_signal_read_cannot_send_after_publication_expires(self):
         self.case.templates = self.case.templates[:1]
         self.case.publish()

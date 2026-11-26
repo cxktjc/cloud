@@ -523,7 +523,12 @@ class ExchangeClient(BatchEntryMixin):
         # Do not hold the worker's precision lock across stat/open/JSON reads.
         # Until the read completes, senders use the last coherent publication.
         payload = self._metadata_reader.read()
-        revision = self._metadata_reader.revision
+        return self.publish_metadata_snapshot(payload, self._metadata_reader.revision)
+
+    def publish_metadata_snapshot(self, payload, revision):
+        # Invalidate per-lane caches even if a stalled reader becomes unavailable
+        # and later recovers with the SAME source revision.
+        revision = (revision, payload is not None)
         with self._metadata_lock:
             self._metadata_publication[0] = (payload, revision)
             self._metadata_payload = payload

@@ -50,6 +50,19 @@ class DualMarketTests(unittest.TestCase):
         self.assertEqual(float(self.market.snapshot()['prices']['XUSDT']['price']), 1.03)
         self.assertEqual(self.market.entry_quote('XUSDT')['bid_quantity'], 2)
 
+    def test_small_incumbent_view_matches_full_after_reject_and_reconnect(self):
+        def compare(expected):
+            self.assertEqual(self.market.entry_prices({'XUSDT': {}}), expected)
+            self.assertEqual(self.market.price_maps()[2], expected)
+        self.quote()
+        compare({'XUSDT': 1.01})
+        self.market.reject_entry_quotes('XUSDT')
+        compare({})
+        self.quote(tick=None, bid=1.02, update_id=2)
+        compare({'XUSDT': 1.02})
+        self.market.book.group_connected(1)
+        compare({})
+
     def test_single_feed_disconnect_does_not_block_the_other(self):
         self.quote()
         self.market.group_failed(1, 'tick disconnected')

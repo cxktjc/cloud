@@ -282,6 +282,20 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
             wires = {(symbol, change): json.dumps(dict(s=symbol, p=str((1.017 if symbol in nearby else 1.03)+.0001*change),
                 E=int(case.now*1000))) for symbol in background for change in (0, 1)}
             opportunities = []
+            crossing_trace = {}
+            # Only mark scheduled target crossings. Captures direct AND owner-batched
+            # decisions; no tracing or allocation for ordinary background frames.
+            original_decide = market.decide
+            def trace_decide(tick, callback):
+                if tick is None or tick.symbol not in received or float(tick.price) != .99:
+                    return original_decide(tick, callback)
+                trace = crossing_trace.setdefault(tick.symbol, {})
+                trace['queue_ms'] = (time.perf_counter_ns()-tick.received_ns)/1e6
+                trace['owner_accepted'] = original_decide(tick, callback)
+                trace['signal_status'] = trade._io_signal[1]
+                trace['route'] = trade._quote_route
+                return trace['owner_accepted']
+            market.decide = trace_decide
             started = time.perf_counter()
             def produce_pressure():
                 index, triggered = 0, 0
@@ -307,7 +321,7 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                             symbol = case.symbols[triggered]
                             received[symbol] = time.perf_counter_ns()
                             opportunities.append(dict(symbol=symbol, received_ns=received[symbol]))
-                            market.update(symbol, '.99', int(case.now*1000))
+                            opportunities[-1]['ingress_accepted'] = market.update(symbol, '.99', int(case.now*1000))
                             triggered += 1
                         for item in opportunities:
                             symbol = item['symbol']
@@ -399,6 +413,11 @@ def run(samples=40, history=1000, blocked=False, signed_socket=False, burst=Fals
                                                'registered_to_worker', 'worker_to_durable', 'registered_to_persisted',
                                                'journal_prepare', 'journal_write', 'journal_sync', 'journal_receipt',
                                                'persisted_to_durable', 'durable_to_send', 'worker_to_send')})
+            pressure['missing_evidence'] = {item['symbol']: dict(ingress_accepted=item['ingress_accepted'],
+                crossing=crossing_trace.get(item['symbol']), attempts=trade.session_entries.timings.attempts_for(dict(
+                    symbol=item['symbol'], entry_bar_open_ms=case.bar, position_id='',
+                    signal_session_id=str(case.payload.get('signal_session_id') or ''))))
+                for item in opportunities if item['symbol'] in pressure['unsent_symbols']}
             # Timing rows survive retirement, use their exact CIDs for all sends.
             pressure['stages'] = {name: summary([row['latencies_ms'][name]
                 for row in (trade.session_entries.timings.order(s['client_order_id']) for s in sends)

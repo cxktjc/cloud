@@ -29,6 +29,7 @@ class PendingRotationMixin:
             self.ledger.state['pending_rotation'] = dict(plan.rotation)
             victim = self.tracked[plan.rotation['victim']]
             cid = str(victim.get('client_order_id') or '')
+            self._plan_evidence_indexes.pop('rotated_out_plans', None)
             self.ledger.state.setdefault('rotated_out_plans', {})[cid] = dict(
                 symbol=plan.rotation['victim'], client_order_id=cid,
                 order_bar_open_ms=int(self._finite(victim.get('order_bar_open_ms'))),

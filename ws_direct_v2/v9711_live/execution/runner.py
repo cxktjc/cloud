@@ -85,6 +85,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             path=cfg.EXECUTION_INTENT_FILE,
             state_path=cfg.EXECUTION_LEDGER_FILE)
         self.ledger.state.setdefault('entry_submit_rejections', {})
+        self._plan_evidence_indexes = {}
         self._entry_gate_retries: dict[str, tuple[int, int, float]] = {}
         self.ledger.state.setdefault('entry_recovery', {})
         self.ledger.state.setdefault('pending_rotation', None)
@@ -491,11 +492,25 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                      'and capacity allow symbol=%s id=%s retry=%d/%d',
                      symbol, cid, count, cfg.ENTRY_RECOVERY_MAX_RETRIES)
 
+    def _plan_evidence_index(self, name):
+        # Process-local derived index. Exact ledger maps stay authoritative;
+        # only index CIDs so retryable/signature/absence edits are read live.
+        records = self.ledger.state[name]
+        cache = self._plan_evidence_indexes
+        entry = cache.get(name)
+        if entry is None or entry[0] is not records or entry[1] != len(records):
+            by_symbol = {}
+            for cid, record in records.items():
+                by_symbol.setdefault(record.get('symbol'), []).append(cid)
+            entry = cache[name] = (records, len(records), by_symbol)
+        return entry[2]
+
     def _entry_recovery_count(self, row: Mapping[str, Any]) -> int:
         symbol = str(row.get('symbol') or '').upper()
         bar = int(self._finite(row.get('order_bar_open_ms')))
         return sum(int(self._finite(record.get('confirmed_absences')))
-                   for record in self.ledger.state['entry_recovery'].values()
+                   for cid in self._plan_evidence_index('entry_recovery').get(symbol, ())
+                   for record in (self.ledger.state['entry_recovery'][cid],)
                    if record.get('symbol') == symbol
                    and int(self._finite(record.get('order_bar_open_ms'))) == bar)
 
@@ -504,9 +519,11 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
         if self._forced_entry_blocked(symbol, now=time.time()):
             return True
         state = self.ledger.state
-        if (symbol not in self._entry_gate_retries and not state['entry_recovery']
-                and not state['entry_submit_rejections'] and not state['rotated_out_plans']):
-            return False  # No plan identity to compare; forced blocks were checked above.
+        if (not row.get('signal_follow') and symbol not in self._entry_gate_retries
+                and not (state['rotated_out_plans'] and symbol in self._plan_evidence_index('rotated_out_plans'))
+                and not (state['entry_submit_rejections'] and symbol in self._plan_evidence_index('entry_submit_rejections'))
+                and not (state['entry_recovery'] and symbol in self._plan_evidence_index('entry_recovery'))):
+            return False
         if needs_sizing:
             row = self._entry_sizing_row(row)
         signature = self._entry_plan_signature(row)
@@ -535,7 +552,8 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 return True
             cache.pop(symbol, None)
         for name in ('rotated_out_plans', 'entry_submit_rejections'):
-            for key, record in self.ledger.state.get(name, {}).items():
+            for key in self._plan_evidence_index(name).get(symbol, ()):
+                record = state[name][key]
                 if not record.get('retryable') and record.get('symbol') == symbol and record.get('plan_signature') == signature:
                     cache[symbol] = (name, key, record)
                     return True
@@ -554,6 +572,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
                 for cid, record in list(records.items()):
                     if int(self._finite(record.get('order_bar_open_ms'))) < bar_ms:
                         records.pop(cid, None)
+                        self._plan_evidence_indexes.pop(name, None)
 
     def _reject_entry_submission(self, row: Mapping[str, Any], cid: str,
                                  exc: BaseException) -> None:
@@ -592,6 +611,7 @@ class LiveTrade(ManualCloseMixin, ForcedCloseMixin, PendingRotationMixin, CloseL
             retry_rejected = getattr(self, '_entry_retry_rejected', None)
             if retry_rejected is not None:
                 retry_rejected(symbol, exc)
+        self._plan_evidence_indexes.pop('entry_submit_rejections', None)
         self.ledger.state['entry_submit_rejections'][cid] = {
             'symbol': symbol, 'client_order_id': cid,
             'order_bar_open_ms': bar_ms,

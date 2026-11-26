@@ -69,6 +69,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._active_price_symbols = None
         self._cycle_price_maps = None
         self._cycle_admission_quotes = {}
+        self._gap_policy = GapPolicy()
+        self._precision_reader = None
         self._quote_signal_gate = None
         self._submit_skip_reasons = {}
         self._skipped_far_events = 0
@@ -88,7 +90,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261126-entry-hotpath-v2', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261126-owner-hotpath-v3', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self.market.request_activity = self.market.book.request_activity = self.client.request_activity
@@ -131,9 +133,15 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         if self._signal_reader is None:
             self._signal_reader = BackgroundSignal(self._desired_reader, owner_wake=self._signal_read_wake)
             self._desired_reader = self._signal_reader
+            # Only the reader thread touches the metadata file after startup.
+            # Maintenance publishes its last completed read to the sizing lanes.
+            self._precision_reader = BackgroundSignal(self.client._metadata_reader, interval=.05,
+                                                       max_age=.25, name='v9711-precision-reader')
 
     def shutdown_io(self):
         try:
+            if self._precision_reader is not None:
+                self._precision_reader.close()
             if self._signal_reader is not None:
                 self._signal_reader.close()
             super().shutdown_io()
@@ -158,7 +166,11 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def _refresh_precision_readiness(self):
         # Only startup/maintenance reads the cache; no extra file read per tick.
-        metadata = self.client.refresh_metadata_snapshot()
+        if self._precision_reader is None:
+            metadata = self.client.refresh_metadata_snapshot()
+        else:
+            metadata = self.client.publish_metadata_snapshot(self._precision_reader.read(),
+                                                              self._precision_reader.revision)
         self._precision_ready = isinstance(metadata, dict) and bool(metadata.get('symbols'))
 
     def _account_send_allowed(self):
@@ -523,7 +535,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._active_price_symbols = selected
         return working
 
-    def _best_unowned_gap(self, excluded):
+    def _best_unowned_gap(self, targets, victim):
         """Peek a fresh challenger, keeping owned ranks for later retirement.
 
         A low-priced incumbent cannot replace another incumbent. Including it
@@ -537,7 +549,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 if self._eligible.get(symbol) != item:
                     heapq.heappop(self._rank_heap)
                     continue
-                if symbol in excluded:
+                if symbol in self.tracked or symbol in self.positions or symbol in targets or symbol == victim:
                     restore.append(heapq.heappop(self._rank_heap))
                     continue
                 if self._unowned_rank_blocked(symbol, time.time()):
@@ -617,12 +629,10 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._quote_route = 'full_far_order'
         if (gaps and not at_most(max(gaps), cfg.CANCEL_GAP)):
             return False
-        excluded = set(self.tracked) | set(self.positions) | set(targets)
         if pending:
             self._quote_route = 'full_reserved_replacement'
-            excluded.add(str(pending.get('victim') or ''))
-        policy, count = GapPolicy(), len(ordinary)
-        best = self._best_unowned_gap(excluded)
+        policy, count = self._gap_policy, len(ordinary)
+        best = self._best_unowned_gap(targets, victim if pending else None)
         if pending:
             # A rejected replacement may leave a durable reservation while
             # quotes rebound. Retain its original gate without running the
@@ -725,7 +735,6 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
             # and periodic maintenance, not on every unrelated market event.
             self._quote_route = 'signal_not_ready'
             return False
-        previous_ids = {row.get('client_order_id') for row in self.tracked.values()}
         targets = self._target_positions(snapshot)
         # A new far quote cannot enter the shortlist, change any incumbent's
         # distance, or become a follow order. Still process every crossing and
@@ -753,6 +762,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         # immutable worker gate for it cannot change admission; workers still
         # check identity/account/TTL/capacity plus the distance-tiered quote policy.
         # Maintenance and every state-changing path continue publishing it.
+        previous_ids = {row.get('client_order_id') for row in self.tracked.values()}
         self._quote_checkpoint('screening')
         self._collect_distinct_candidates(tick)
         self._publish_entry_gate()

@@ -4,7 +4,7 @@ import time
 
 
 class BackgroundSignal:
-    def __init__(self, source, *, owner_wake=None, interval=.005, max_age=.1):
+    def __init__(self, source, *, owner_wake=None, interval=.005, max_age=.1, name='v9711-signal-reader'):
         self.source = source
         self.path = source.path
         self.revision = 0  # Revision consumed by the owner, paired with read().
@@ -13,7 +13,7 @@ class BackgroundSignal:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._published = (None, 0, None)
-        self._thread = threading.Thread(target=self._loop, name='v9711-signal-reader', daemon=True)
+        self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
         self._thread.start()
 
     def read(self):

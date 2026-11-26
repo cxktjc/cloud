@@ -174,6 +174,21 @@ class HotOwnedQuotesTests(unittest.TestCase):
         self.event('N8USDT', .99)
         self.assertIn('N8USDT', self.trade.tracked)
 
+    def test_unrelated_rotations_do_not_recompute_candidate_identity(self):
+        self.plans(9)
+        records = self.trade.ledger.state['rotated_out_plans']
+        for i in range(500):
+            records[str(i)] = dict(symbol='OTHER'+str(i), order_bar_open_ms=self.bar)
+        candidate = self.templates[8]
+        with patch.object(self.trade, '_entry_plan_signature', side_effect=AssertionError('unrelated evidence')):
+            self.assertFalse(self.trade._entry_submission_blocked(candidate, needs_sizing=True))
+        sized = self.trade._entry_sizing_row(candidate)
+        records['own'] = dict(symbol=sized['symbol'], order_bar_open_ms=self.bar,
+                              plan_signature=self.trade._entry_plan_signature(sized))
+        self.assertTrue(self.trade._entry_submission_blocked(candidate, needs_sizing=True))
+        self.trade._prune_entry_rejections(self.bar+cfg.BAR_MS)
+        self.assertFalse(self.trade._entry_submission_blocked(candidate, needs_sizing=True))
+
     def test_block_cache_rechecks_record_mutation_and_sizing_plan(self):
         self.plans(9)
         self.event('N0USDT', 1.01)

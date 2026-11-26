@@ -19,3 +19,15 @@ python -B -m tests.benchmark_entry_latency_v7 --samples 8 --rounds 20 --round-se
 ```
 
 The pressure harness freezes wall time unless using the separate `--live-cancel-pressure` scenario. Do not use it to infer live wall-clock cancel timing. In the local validation directory, `20261126_tail_before.json`, `20261126_tail_final.json` and `20261126_tail_soak.json` contain full per-order timing evidence.
+
+## Follow-up: owner hot path and per-symbol plan evidence
+
+Same five-minute command, two logical CPUs and changing prices. Raw results are in `var/validation_v2`. Each row is one run, not a deterministic bound.
+
+|Result JSON|Target sends|All sends|P50 / P95 / max (ms, both clocks)|Over 20ms|Queue peak|Expired|
+|---|---:|---:|---|---:|---:|---:|
+|20261126_tail_soak.json (prior build)|159/160|264|70.364 / 398.601 / 509.133|248|5942|41910|
+|20261126_owner_v3_soak.json (owner changes)|160/160|265|42.992 / 182.914 / 463.512|260|4140|0|
+|20261126_owner_v3_index.json (owner + indexed evidence)|160/160|265|30.483 / 78.521 / 109.732|225|2357|0|
+
+Final: 35,997.9 raw frames/s, 2,193,940 queued and decided, zero overflow, zero duplicate client IDs or target symbols. Integrity passed; latency failed. N239USDT: queue 45.172ms, select 1.077ms, decision-to-send 63.483ms; journal write-start wait 15.153ms, sync 47.678ms. Real sync alone exceeded the budget. Missing targets now include per-crossing ingress/owner observations and exact plan attempts, not just symbol names. The original N151USDT miss cannot be retroactively attributed from these traces. Production policy, freshness, minimum cancel age, capacity and durability gates are unchanged. The metadata reader now revokes an unavailable/stalled publication; tests cover same-revision recovery. Production Linux storage and scheduling have not been benchmarked here.

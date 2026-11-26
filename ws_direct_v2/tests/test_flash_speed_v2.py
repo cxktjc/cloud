@@ -88,6 +88,17 @@ class PrecisionSnapshotTests(unittest.TestCase):
             self.assertGreater(float(self.client.prepare_limit('XUSDT', .0179, 10)['qty']),
                                float(self.client.prepare_limit('XUSDT', .0179, 5)['qty']))
 
+    def test_stalled_publication_revokes_and_recovers_existing_worker_same_revision(self):
+        payload = self.client.refresh_metadata_snapshot()
+        revision = self.client._metadata_reader.revision
+        lane = self.client._worker_transport()
+        self.assertEqual(lane.prepare_limit('XUSDT', .0179, 5)['price'], '0.017')
+        self.client.publish_metadata_snapshot(None, revision)
+        with self.assertRaisesRegex(ValueError, 'metadata missing'):
+            lane.prepare_limit('XUSDT', .0179, 5)
+        self.client.publish_metadata_snapshot(payload, revision)
+        self.assertEqual(lane.prepare_limit('XUSDT', .0179, 5)['price'], '0.017')
+
     def test_metadata_revision_and_unreadable_snapshot_invalidate_cache(self):
         self.client.refresh_metadata_snapshot()
         self.assertEqual(self.client.prepare_limit('XUSDT', .0179, 5)['price'], '0.017')

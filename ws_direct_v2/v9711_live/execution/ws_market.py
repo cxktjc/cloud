@@ -721,7 +721,22 @@ class DualMarket(DirectMarket):
                     missing_reason=reason)
 
     def entry_prices(self, symbols=None):
-        return self.price_maps(symbols)[2]
+        if symbols is None or not hasattr(symbols, '__len__') or len(symbols) > 8:
+            return self.price_maps(symbols)[2]
+        # At most eight incumbents: take each feed lock once, never nest
+        # them. Rejection watermarks and prices refer to the very same tick.
+        clock, entries = self._quote_clock(), {}
+        for feed in (self, self.book):
+            with feed._lock:
+                for symbol in symbols:
+                    tick = feed.quote_tick(symbol, feed.processed.get(symbol))
+                    cutoffs = self._entry_reject_cutoffs.get(symbol)
+                    if tick is None or (cutoffs and tick.receive_seq <= cutoffs[feed.source]):
+                        continue
+                    value = self._locked_quote_price(feed, tick, clock)
+                    if value is not None and (symbol not in entries or value < entries[symbol]):
+                        entries[symbol] = value
+        return entries
 
     def entry_timing(self, symbol, source):
         feed = self.book if source == 'bid0' else self
