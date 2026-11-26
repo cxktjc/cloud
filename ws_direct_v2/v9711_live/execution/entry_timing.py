@@ -256,7 +256,7 @@ class EntryTimings:
             if worst_cid is not None:
                 detail = self.order(worst_cid)
                 metrics['max_order'] = {key: detail[key] for key in (
-                    'symbol', 'client_order_id', 'signal_follow', 'trigger_symbol', 'trigger_source',
+                    'symbol', 'client_order_id', 'signal_follow', 'evaluation_source', 'trigger_symbol', 'trigger_source',
                     'quote_source', 'received_epoch_ms', 'send_epoch_ms', 'latencies_ms') if key in detail}
             return metrics
         result = summarize('received', identify_max=True)

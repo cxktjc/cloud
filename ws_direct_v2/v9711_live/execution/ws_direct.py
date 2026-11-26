@@ -90,7 +90,7 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
         self._deferred_presentations = 0
         self._previous_switch_interval = None
         self._live_switch_interval = None
-        self._runtime_source = dict(build='20261126-entry-wake-wire-metrics-v4', source=str(Path(__file__).resolve()),
+        self._runtime_source = dict(build='20261126-event-only-ordinary-entry-v5', source=str(Path(__file__).resolve()),
                                     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12])
         super().__init__(**kwargs)
         self.market.request_activity = self.market.book.request_activity = self.client.request_activity
@@ -290,6 +290,12 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
 
     def _execute_entries(self, snapshot, status, **kwargs):
         with self.ledger.dispatch_group(), self.ledger.batch_saves():
+            maintenance_turn = self._maintenance_mark is not None and not self._fast_tick
+            if maintenance_turn:
+                snapshot = dict(snapshot)
+                snapshot['desired'] = [row for row in snapshot.get('desired', [])
+                    if row.get('signal_follow')
+                    or str(row.get('symbol') or '').upper() in self.tracked]
             if (self._maintenance_mark is not None and not self._fast_tick and self._network_io is not None
                     and not self.once and status == 'valid' and snapshot.get('signal_ready')
                     and self._last_presentation_mono is not None
@@ -298,6 +304,9 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 # universe audits, use the same ranked shortlist as WS admission.
                 previous_symbols = self._active_price_symbols
                 working = self._fast_snapshot(snapshot, None, kwargs['now'])
+                working['desired'] = [row for row in working.get('desired', [])
+                                      if row.get('signal_follow')
+                                      or str(row.get('symbol') or '').upper() in self.tracked]
                 self._shortlist_maintenance = self._fast_tick = True
                 try:
                     return self._execute_entries_batched(working, status, **kwargs)
@@ -394,6 +403,8 @@ class DirectTrade(SignalFollowMixin, CountSizingMixin, LiveTrade):
                 symbol, event=self._admission_events.get(symbol))
             context.update(quote['timing'])
         context.update(self._batch_event_contexts.get(symbol) or getattr(self, '_event_timing_context', {}) or {})
+        context['evaluation_source'] = ('ws_event' if context.get('_event_received_ns') is not None
+                                        else 'maintenance')
         context['admission_price'] = quote.get('selected')
         detail = qualify_quote(quote, self._finite(row.get('limit_price')), ceiling,
                                following=following)

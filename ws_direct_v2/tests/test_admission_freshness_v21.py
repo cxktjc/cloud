@@ -91,6 +91,21 @@ class AdmissionFreshnessTests(unittest.TestCase):
         self.assertEqual(timing['received_epoch_ms'], retry.received_epoch_ms)
         self.assertLess(timing['latencies_ms']['quote_to_decision'], 25)
 
+    def test_maintenance_shortlist_cannot_start_cached_ordinary_entry(self):
+        from unittest.mock import Mock
+
+        ordinary = dict(symbol='N0USDT')
+        follow = dict(symbol='AUSDT', signal_follow=True)
+        self.trade._maintenance_mark = 1
+        self.trade._network_io = object()
+        self.trade._last_presentation_mono = time.monotonic()
+        self.trade._fast_snapshot = Mock(return_value={'desired': [ordinary, follow]})
+        self.trade._execute_entries_batched = Mock(return_value=None)
+        self.trade._execute_entries({'signal_ready': True, 'desired': []}, 'valid',
+                                    now=time.time(), targets={}, final_exit_bar=False)
+        working = self.trade._execute_entries_batched.call_args.args[0]
+        self.assertEqual(working['desired'], [follow])
+
     def test_uses_latest_unprocessed_prices_and_matching_timestamp(self):
         self.tick_ingress(1.03)
         self.drain_only()
